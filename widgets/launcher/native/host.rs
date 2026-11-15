@@ -3301,6 +3301,7 @@ pub fn run() -> Result<(), String> {
         app.borrow_mut().general.take();
         app.borrow_mut().packages.shutdown();
         drop(app);
+        crate::gpu::shutdown();
         if context != INVALID_HANDLE_VALUE {
             if activation_cookie != 0 {
                 DeactivateActCtx(0, activation_cookie);

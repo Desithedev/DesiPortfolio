@@ -964,6 +964,16 @@ pub fn remove_surface(hwnd: HWND) {
     });
 }
 
+/// Release D3D11/DXGI/DirectComposition resources before process TLS teardown.
+pub fn shutdown() {
+    GPU_COMPOSITOR.with(|cell| {
+        if let Some(mut comp) = cell.borrow_mut().take() {
+            comp.surfaces.clear();
+            comp.device.take();
+        }
+    });
+}
+
 unsafe fn compile_shader(entry: &str, target: &str) -> Option<ComPtr> {
     let mut blob = null_mut();
     let hr = D3DCompile(
