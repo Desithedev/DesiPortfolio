@@ -46,7 +46,7 @@ impl Default for State {
             smooth_scroll: Default::default(),
             scroll_clock: None,
             frame_queued: false,
-            expanded: false,
+            expanded: true,
             hits: vec![],
             dragging: None,
             scrollbar_drag: None,

@@ -21,11 +21,11 @@ impl State {
             Row::choices(106, "Surface palette", &self.config.palette, crate::settings_ui::palette_choices()),
             Row::section("Layout"),
             Row::choices(201, "Music design", &self.config.design, vec![
-                Choice::new("coverflow", "Coverflow", Some(0x6c4952)),
-                Choice::new("compact", "Compact", Some(0x4b3349)),
-                Choice::new("turntable", "Turntable", Some(0x8eabbd)),
-                Choice::new("orbit", "Orbit", Some(0xd7d5d2)),
-                Choice::new("disc", "Disc", Some(0xf0eeed)),
+                Choice::new("coverflow", "Coverflow", None),
+                Choice::new("compact", "Compact", None),
+                Choice::new("turntable", "Turntable", None),
+                Choice::new("orbit", "Orbit", None),
+                Choice::new("disc", "Disc", None),
             ]),
 
             Row::note("Themes scale down in place before switching to the pocket player. Minimum size: 168 × 104 DIP. Playback follows the web player."),

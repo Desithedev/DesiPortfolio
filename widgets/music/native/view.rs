@@ -95,6 +95,7 @@ pub(super) fn layout_plan(design: &str, w: f32, h: f32, _queue: bool) -> Option<
 impl State {
     pub unsafe fn content(&mut self, dc: HDC, w: f32, h: f32) {
         self.buttons.clear();
+        self.seek_track = None;
         self.control_plates.clear();
         if self.config.design != "coverflow" {
             self.content_scale = 1.;
@@ -441,11 +442,14 @@ impl State {
     }
     pub(super) unsafe fn timeline(&mut self, c: &Canvas, r: [f32; 4], times: bool) {
         let y = (r[1] + r[3]) / 2.;
+        let scrubbing = self.pressed == Some(Action::Seek);
+        let hovered = self.playback.can_seek && (self.hover == Some(Action::Seek) || scrubbing);
+        let half_h = if hovered { 2. } else { 1.5 };
         c.round(
-            [r[0], y - 1.5, r[2], y + 1.5],
-            1.5,
+            [r[0], y - half_h, r[2], y + half_h],
+            half_h,
             self.ink,
-            38,
+            if hovered { 54 } else { 38 },
             false,
             false,
         );
@@ -456,17 +460,30 @@ impl State {
         };
         if fraction > 0. {
             c.round(
-                [r[0], y - 1.5, r[0] + (r[2] - r[0]) * fraction, y + 1.5],
-                1.5,
+                [r[0], y - half_h, r[0] + (r[2] - r[0]) * fraction, y + half_h],
+                half_h,
                 self.ink,
                 230,
                 false,
                 false,
             );
         }
+        if hovered {
+            let hx = r[0] + (r[2] - r[0]) * fraction;
+            let radius = if scrubbing { 5.5 } else { 4.5 };
+            c.round(
+                [hx - radius, y - radius, hx + radius, y + radius],
+                radius,
+                self.ink,
+                255,
+                false,
+                false,
+            );
+        }
         if self.playback.can_seek {
+            self.seek_track = Some(r);
             self.buttons.push(Button {
-                rect: r,
+                rect: [r[0] - 6., (y - 8.).min(r[1]), r[2] + 6., (y + 8.).max(r[3])],
                 action: Action::Seek,
             });
         }

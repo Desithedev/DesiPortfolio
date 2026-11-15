@@ -61,6 +61,7 @@ const WALLPAPER_READY: u32 = WM_APP + 20;
 const SEARCH_ID: usize = 100;
 const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
+const UPDATE_CHECK_TIMER: usize = 3;
 const CMD_ADD: u32 = 10;
 const CMD_PC: u32 = 11;
 const CMD_BIN: u32 = 12;
@@ -238,7 +239,7 @@ impl App {
             }
         }
     }
-    unsafe fn show_general(&mut self) {
+    unsafe fn ensure_general(&mut self) -> Option<&mut crate::general::Host> {
         if self.general.is_none() {
             match crate::general::Host::create(
                 self.hwnd,
@@ -253,9 +254,15 @@ impl App {
                 Err(error) => {
                     self.status = error;
                     InvalidateRect(self.hwnd, null(), 0);
-                    return;
+                    return None;
                 }
             }
+        }
+        self.general.as_mut()
+    }
+    unsafe fn show_general(&mut self) {
+        if self.ensure_general().is_none() {
+            return;
         }
         self.refresh_manager();
         if let Some(host) = &mut self.general {
@@ -2202,6 +2209,9 @@ unsafe extern "system" fn wndproc(
             SetTimer(hwnd, PIN_TIMER, 1000, None);
             if app.smoke {
                 SetTimer(hwnd, SMOKE_TIMER, 5000, None);
+            } else {
+                // One-shot update check ~5 minutes after startup or restart.
+                SetTimer(hwnd, UPDATE_CHECK_TIMER, 5 * 60 * 1000, None);
             }
             0
         }
@@ -2282,6 +2292,29 @@ unsafe extern "system" fn wndproc(
             }
             if action == 8 || action == 9 {
                 app.show_general();
+            }
+            if action == 11 {
+                KillTimer(hwnd, UPDATE_CHECK_TIMER);
+                let actions = if let Some(host) = app.ensure_general() {
+                    if host.has_update() {
+                        host.trigger_update_now()
+                    } else {
+                        host.start_update_check();
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                for act in actions {
+                    if let Err(error) = app.manage(act) {
+                        if let Some(host) = &mut app.general {
+                            host.report_error(&error);
+                        }
+                    }
+                }
+            }
+            if action == 10 {
+                crate::logger::open_and_copy_log(hwnd, &app.root);
             }
             if action == 3 {
                 PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -2759,10 +2792,33 @@ unsafe extern "system" fn wndproc(
             InvalidateRect(hwnd, null(), 0);
             0
         }
+        WM_TIMER if wparam == UPDATE_CHECK_TIMER => {
+            KillTimer(hwnd, UPDATE_CHECK_TIMER);
+            if !app.smoke {
+                if let Some(host) = app.ensure_general() {
+                    if !host.has_update() {
+                        host.start_update_check();
+                    }
+                }
+            }
+            0
+        }
         WM_TIMER if wparam == PIN_TIMER => {
             app.sync_desktop_items(hwnd);
-            if let Some(host) = &mut app.general {
-                host.poll_update();
+            let (update_actions, has_update) = if let Some(host) = &mut app.general {
+                (host.poll_update(), host.has_update())
+            } else {
+                (Vec::new(), false)
+            };
+            if let Some(tray) = &mut app.tray {
+                tray.set_update_available(has_update);
+            }
+            for action in update_actions {
+                if let Err(error) = app.manage(action) {
+                    if let Some(host) = &mut app.general {
+                        host.report_error(&error);
+                    }
+                }
             }
             app.refresh_manager();
             app.packages.tick();

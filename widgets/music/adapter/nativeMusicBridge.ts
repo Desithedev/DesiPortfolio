@@ -13,7 +13,26 @@ fs.mkdirSync(cache, { recursive: true })
 const emit = (value: unknown) => process.stdout.write(JSON.stringify(value) + '\n')
 const artwork = new Map<string, string>()
 const pending = new Set<string>()
+const MAX_ART_FILES = 10
 let stopping = false
+
+function pruneArtCache(): void {
+  try {
+    const entries = fs.readdirSync(cache, { withFileTypes: true })
+      .filter(entry => entry.isFile() && /^[a-f0-9]{64}\.img$/i.test(entry.name))
+      .map(entry => {
+        const full = path.join(cache, entry.name)
+        return { name: entry.name, full, mtime: fs.statSync(full).mtimeMs }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+    for (const stale of entries.slice(MAX_ART_FILES)) {
+      fs.unlinkSync(stale.full)
+      for (const [url, file] of artwork) {
+        if (file === stale.name) artwork.delete(url)
+      }
+    }
+  } catch { /* best-effort cleanup */ }
+}
 
 // Only fetch artwork URLs supplied by the owned page, with bounded downloads.
 async function art(url: string): Promise<void> {
@@ -25,7 +44,12 @@ async function art(url: string): Promise<void> {
   try {
     const name = createHash('sha256').update(url).digest('hex') + '.img'
     const destination = path.join(cache, name)
-    if (!fs.existsSync(destination)) {
+    if (fs.existsSync(destination)) {
+      try {
+        const now = new Date()
+        fs.utimesSync?.(destination, now, now)
+      } catch { /* ignore in mocked fs */ }
+    } else {
       const response = await fetch(target, { redirect: 'error', headers: { Accept: 'image/jpeg,image/png' }, signal: AbortSignal.timeout(8000) })
       if (!response.ok || !response.headers.get('content-type')?.startsWith('image/')) return
       let size = 0
@@ -37,6 +61,7 @@ async function art(url: string): Promise<void> {
       }
       fs.writeFileSync(destination + '.tmp', Buffer.concat(chunks))
       fs.renameSync(destination + '.tmp', destination)
+      pruneArtCache()
     }
     artwork.set(url, name)
     if (!stopping) emit({ type: 'art', url, file: name })
@@ -50,12 +75,13 @@ const player = new MusicPlayer(directory, (state, error) => {
     const currentIndex = state.queue.findIndex(item => item.videoId === state.videoId)
     const selected = currentIndex >= 0 ? currentIndex : state.queue.findIndex(item => item.selected)
     const visible = selected < 0 ? [] : state.queue.slice(Math.max(0, selected - 2), selected + 3)
-    for (const url of [state.art, ...visible.map(item => item.thumb), ...state.queue.slice(0, 20).map(item => item.thumb)]) if (url) void art(url)
+    for (const url of [state.art, ...visible.map(item => item.thumb), ...state.queue.slice(0, 10).map(item => item.thumb)]) if (url) void art(url)
   }
 }, (pid) => createMusicWindowHost(pid))
 let chain = Promise.resolve()
 async function command(message: { action: string; value?: number; videoId?: string }) {
   if (stopping) return
+  console.error(`[music-bridge] action=${message.action}`)
   switch (message.action) {
     case 'browse': await player.open(); break
     case 'library': await player.open('https://music.youtube.com/library'); break
@@ -75,11 +101,16 @@ input.on('line', line => {
   let message: { action: string }
   try { message = JSON.parse(line) } catch { return }
   if (message.action === 'quit') { shutdown(); return }
-  chain = chain.then(() => command(message)).catch(error => { if (!stopping) emit({ type: 'error', error: String(error?.message || error) }) })
+  chain = chain.then(() => command(message)).catch(error => {
+    const msg = String(error?.message || error)
+    console.error(`[music-bridge] error: ${msg}`)
+    if (!stopping) emit({ type: 'error', error: msg })
+  })
 })
 function shutdown() {
   if (stopping) return
   stopping = true
+  console.error('[music-bridge] shutting down')
   player.stop()
   input.close()
   setTimeout(() => process.exit(0), 1500).unref()

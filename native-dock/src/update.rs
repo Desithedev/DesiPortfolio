@@ -613,10 +613,20 @@ pub fn restart(root: &Path) -> Result<()> {
     Ok(())
 }
 pub unsafe fn open_releases() {
+    open_download(RELEASES);
+}
+pub unsafe fn open_download(url: &str) {
+    let target = if url.starts_with("https://github.com/nhatnguyends/Lumen/releases")
+        && !url.bytes().any(|c| c <= 32 || c == 127)
+    {
+        url
+    } else {
+        RELEASES
+    };
     ShellExecuteW(
         null_mut(),
         wide("open").as_ptr(),
-        wide(RELEASES).as_ptr(),
+        wide(target).as_ptr(),
         null(),
         null(),
         SW_SHOWNORMAL,

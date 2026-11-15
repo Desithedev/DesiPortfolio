@@ -11,6 +11,7 @@ mod fusion;
 mod general;
 mod geometry;
 mod glass;
+mod logger;
 mod model;
 mod motion;
 include!(concat!(env!("OUT_DIR"), "/widget_modules.rs"));
@@ -39,7 +40,9 @@ fn main() {
     if update::dispatch() {
         return;
     }
+    logger::init(&model::root());
     if let Err(error) = window::run() {
+        logger::error("app", &error);
         eprintln!("{error}");
         if std::env::args().any(|arg| arg == "--smoke-test") {
             std::process::exit(1);

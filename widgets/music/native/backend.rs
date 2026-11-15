@@ -21,26 +21,48 @@ impl Backend {
             root.join("native-dock/target/debug/music-bridge.cjs")
         };
         if !script.exists() {
-            return Err(
-                "Music adapter is missing. Run python run_native_dock.py --music to build it."
-                    .into(),
-            );
+            let msg = "Music adapter is missing. Run python run_native_dock.py --music to build it.";
+            crate::logger::error("music", msg);
+            return Err(msg.into());
         }
-        let mut child = Command::new(if portable_node.is_file() {
+        let runtime = if portable_node.is_file() {
             portable_node.as_os_str()
         } else {
             std::ffi::OsStr::new("node")
-        })
+        };
+        crate::logger::info(
+            "music",
+            format!(
+                "starting adapter: runtime={}, script={}",
+                Path::new(runtime).display(),
+                script.display()
+            ),
+        );
+        let mut child = Command::new(runtime)
         .arg(script)
         .current_dir(root)
         .creation_flags(0x08000000)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Cannot start Music adapter: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("Cannot start Music adapter: {e}");
+            crate::logger::error("music", &msg);
+            msg
+        })?;
         let input = child.stdin.take();
         let output = child.stdout.take().ok_or("Music adapter stdout missing")?;
+        if let Some(err_out) = child.stderr.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(err_out).lines() {
+                    let Ok(line) = line else { break };
+                    if !line.trim().is_empty() {
+                        crate::logger::info("music-adapter", &line);
+                    }
+                }
+            });
+        }
         let (tx, events) = mpsc::channel();
         std::thread::spawn(move || {
             // The owned adapter emits bounded metadata; no renderer objects cross threads.
@@ -55,6 +77,7 @@ impl Backend {
                     }
                 }
             }
+            crate::logger::warn("music", "Music adapter stdout closed (disconnected)");
             let _ = tx.send(serde_json::json!({"type":"error","error":"Music adapter disconnected. Reopen Music to reconnect."}));
         });
         Ok(Self {

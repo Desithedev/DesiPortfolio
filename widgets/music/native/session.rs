@@ -11,10 +11,33 @@ pub(super) struct Snapshot {
     pub art_files: BTreeMap<String, String>,
     pub last_cover: Option<String>,
 }
+pub(super) const MAX_ART_FILES: usize = 10;
+
 pub(super) fn valid_file(file: &str) -> bool {
     file.len() == 68
         && file.ends_with(".img")
         && file.as_bytes()[..64].iter().all(u8::is_ascii_hexdigit)
+}
+
+pub(super) fn prune_art_dir(art_dir: &Path, max_files: usize) {
+    let Ok(entries) = fs::read_dir(art_dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| valid_file(&entry.file_name().to_string_lossy()))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if files.len() <= max_files {
+        return;
+    }
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, path) in files.into_iter().skip(max_files) {
+        let _ = fs::remove_file(path);
+    }
 }
 impl Snapshot {
     pub fn load(root: &Path) -> Option<Self> {
@@ -99,11 +122,13 @@ impl Snapshot {
         result.playback.can_previous = false;
         result.playback.can_seek = false;
         result.playback.error = None;
+        prune_art_dir(&dir.join("art"), MAX_ART_FILES);
         Some(result)
     }
     fn save(&self, root: &Path) -> Result<(), String> {
         let dir = root.join("config/native-music-player");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        prune_art_dir(&dir.join("art"), MAX_ART_FILES);
         let file = dir.join("last-view.json");
         let tmp = dir.join("last-view.json.tmp");
         fs::write(&tmp, serde_json::to_vec(self).map_err(|e| e.to_string())?)
@@ -136,7 +161,7 @@ impl State {
         }
         let seeking = self
             .last_seek
-            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(900));
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(2500));
         // Loading/disconnection must not erase the previous session's artwork
         // or metadata. Transport capabilities always describe the live player.
         if !next.available && !self.playback.title.is_empty() {
@@ -149,6 +174,19 @@ impl State {
             self.playback.can_next = false;
             self.playback.can_previous = false;
             return;
+        }
+        let same_track =
+            next.video_id == self.playback.video_id && next.title == self.playback.title;
+        if self.pressed == Some(Action::Seek) && same_track {
+            next.position = self.playback.position;
+        } else if seeking && same_track {
+            // Keep the seeked position while the player buffers/applies the seek,
+            // and release the hold as soon as the reported position catches up.
+            if (next.position - self.playback.position).abs() > 2.5 {
+                next.position = self.playback.position;
+            } else {
+                self.last_seek = None;
+            }
         }
         if seeking && next.video_id == self.playback.video_id {
             next.playing = next.playing || self.playback.playing;

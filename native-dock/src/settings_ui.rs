@@ -89,6 +89,10 @@ pub enum Row {
         color: Option<u32>,
     },
     Note(String),
+    HighlightNote {
+        text: String,
+        color: u32,
+    },
 }
 impl Row {
     pub fn section(label: impl Into<String>) -> Self {
@@ -148,6 +152,12 @@ impl Row {
     }
     pub fn note(text: impl Into<String>) -> Self {
         Self::Note(text.into())
+    }
+    pub fn highlight_note(text: impl Into<String>, color: u32) -> Self {
+        Self::HighlightNote {
+            text: text.into(),
+            color,
+        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,6 +411,7 @@ fn height(row: &Row, columns: usize) -> f32 {
         Row::Choices { options, .. } => 34. + options.len().div_ceil(columns) as f32 * 36.,
         Row::Button { .. } => 40.,
         Row::Note(_) => 30.,
+        Row::HighlightNote { .. } => 38.,
     }
 }
 /// Shared geometry drives painting, scrolling and hit regions, including odd grid tails.
@@ -988,21 +999,28 @@ impl State {
                         let x = 28. + (i % cols) as f32 * cell;
                         let yy = y + 32. + (i / cols) as f32 * 36.;
                         let r = shift([x, yy, x + cell - 8., yy + 29.]);
-                        let color = option.color.unwrap_or(self.surface);
-                        let ink = if crate::contrast::luminance(color) > 0.42 {
-                            0x271e18
+                        if let Some(color) = option.color {
+                            let ink = if crate::contrast::luminance(color) > 0.42 {
+                                0x271e18
+                            } else {
+                                0xfdfaf8
+                            };
+                            c.round(r, 9., color, 255, false, false);
+                            crate::surface::swatch(&c, r, 9., &option.key, self.dpi);
+                            if option.key == *selected
+                                || (option.key == "custom"
+                                    && crate::surface::custom_color(selected).is_some())
+                            {
+                                c.round(r, 9., ink, 180, true, false);
+                            }
+                            c.text(&option.label, r, 10., option.key == *selected, ink, 1);
                         } else {
-                            0xfdfaf8
-                        };
-                        c.round(r, 9., color, 255, false, false);
-                        crate::surface::swatch(&c, r, 9., &option.key, self.dpi);
-                        if option.key == *selected
-                            || (option.key == "custom"
-                                && crate::surface::custom_color(selected).is_some())
-                        {
-                            c.round(r, 9., ink, 180, true, false);
+                            c.round(r, 9., white, 14, false, false);
+                            if option.key == *selected {
+                                c.round(r, 9., white, 180, true, false);
+                            }
+                            c.text(&option.label, r, 10., option.key == *selected, white, 1);
                         }
-                        c.text(&option.label, r, 10., option.key == *selected, ink, 1);
                         hits.push(Hit {
                             rect: r,
                             target: Target::Choice(*id, i),
@@ -1032,6 +1050,12 @@ impl State {
                     dim,
                     0,
                 ),
+                Row::HighlightNote { text, color } => {
+                    let r = shift([28., y + 4., w - 28., y + 34.]);
+                    c.round(r, 9., *color, 44, false, false);
+                    c.round(r, 9., *color, 170, true, false);
+                    c.text(text, r, 10.5, true, 0xffffff, 1);
+                }
             }
             if !matches!(
                 row,

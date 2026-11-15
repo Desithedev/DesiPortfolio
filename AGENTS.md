@@ -25,6 +25,10 @@ Rust portable ZIPs under `share/` are now in scope; keep packaging builds under
 - Preserve `config/`, including legacy settings used for first-run migration.
 - The optional Node/Chrome playback adapter belongs to `widgets/music/adapter`;
   it does not host widget UI or use Electron.
+- App-wide logging writes to `logs/lumen.log` (2 MB rotation) under the install/workspace
+  root (`native-dock/src/logger.rs`), capturing app/widget lifecycle, panics,
+  SMTC fallback (`widgets/music/native/smtc.rs`), and piped `music-adapter` stderr.
+- Always stop any running `lumen.exe` instance before rebuilding `native-dock/target/debug/lumen.exe`.
 
 ## 120Hz Every-Frame Scroll & Animation Standard
 

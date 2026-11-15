@@ -97,8 +97,14 @@ impl Registry {
                     {
                         manifests.push(m)
                     }
-                    Ok(m) => eprintln!("widget-package {} needs a source rebuild", m.id),
-                    Err(e) => eprintln!("widget-package: {e}"),
+                    Ok(m) => {
+                        crate::logger::warn("widgets", format!("{} needs a source rebuild", m.id));
+                        eprintln!("widget-package {} needs a source rebuild", m.id);
+                    }
+                    Err(e) => {
+                        crate::logger::error("widgets", &e);
+                        eprintln!("widget-package: {e}");
+                    }
                 }
             }
         }
@@ -118,6 +124,7 @@ impl Registry {
                 Err(e) => (HashMap::new(), Some(e.to_string())),
             };
         if let Some(error) = &visibility_error {
+            crate::logger::warn("widgets", error);
             eprintln!("widget-packages: {error}");
         }
         let show_messages = manifests
@@ -214,7 +221,12 @@ impl Registry {
             .definitions
             .get(id)
             .ok_or("Native package requires a source rebuild")?
-            .factory)(&self.root, glass, inspect, smoke)?;
+            .factory)(&self.root, glass, inspect, smoke)
+        .map_err(|e| {
+            crate::logger::error(id, format!("failed to start widget: {e}"));
+            e
+        })?;
+        crate::logger::info(id, "widget initialized");
         unsafe {
             crate::fusion::register_widget(host.hwnd());
         }

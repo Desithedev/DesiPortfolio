@@ -15,7 +15,90 @@ use windows_sys::{
 pub const MESSAGE: u32 = WM_APP + 9;
 pub struct Tray {
     data: NOTIFYICONDATAW,
-    icon: HICON,
+    icon_normal: HICON,
+    icon_badge: HICON,
+    update_available: bool,
+}
+unsafe fn create_hicon(rgba: &[u8]) -> Option<HICON> {
+    let mut pixels = rgba.to_vec();
+    let mut mask = vec![0u8; 32 * 4];
+    for (i, p) in pixels.chunks_exact_mut(4).enumerate() {
+        for c in 0..3 {
+            p[c] = ((p[c] as u32 * p[3] as u32 + 127) / 255) as u8;
+        }
+        p.swap(0, 2);
+        if p[3] == 0 {
+            mask[(i / 32) * 4 + (i % 32) / 8] |= 0x80 >> ((i % 32) % 8);
+        }
+    }
+    let mut info: BITMAPINFO = zeroed();
+    info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+    info.bmiHeader.biWidth = 32;
+    info.bmiHeader.biHeight = -32;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    let mut bits = null_mut();
+    let color = CreateDIBSection(null_mut(), &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if color.is_null() {
+        return None;
+    }
+    std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
+    let mask = CreateBitmap(32, 32, 1, 1, mask.as_ptr() as _);
+    let icon_info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask,
+        hbmColor: color,
+    };
+    let icon = CreateIconIndirect(&icon_info);
+    DeleteObject(color);
+    DeleteObject(mask);
+    if icon.is_null() {
+        None
+    } else {
+        Some(icon)
+    }
+}
+fn add_red_badge(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let cx = 25.0_f32;
+    let cy = 7.0_f32;
+    let r_outer = 6.2_f32;
+    let r_inner = 5.0_f32;
+    for y in 0..32 {
+        for x in 0..32 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let outer_a = (r_outer - dist + 0.5).clamp(0.0, 1.0);
+            if outer_a <= 0.0 {
+                continue;
+            }
+            let inner_a = (r_inner - dist + 0.5).clamp(0.0, 1.0);
+            // Dark outline ring around a bright red dot for contrast on any taskbar theme.
+            let (sr, sg, sb) = (
+                20.0 + (239.0 - 20.0) * inner_a,
+                20.0 + (58.0 - 20.0) * inner_a,
+                24.0 + (68.0 - 24.0) * inner_a,
+            );
+            let idx = (y * 32 + x) * 4;
+            let da = out[idx + 3] as f32 / 255.0;
+            let out_a = outer_a + da * (1.0 - outer_a);
+            if out_a > 0.0 {
+                let dst = [out[idx] as f32, out[idx + 1] as f32, out[idx + 2] as f32];
+                let src = [sr, sg, sb];
+                for c in 0..3 {
+                    out[idx + c] =
+                        ((src[c] * outer_a + dst[c] * da * (1.0 - outer_a)) / out_a)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                }
+                out[idx + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
 }
 impl Tray {
     pub unsafe fn new(hwnd: HWND, root: &Path) -> Option<Self> {
@@ -23,60 +106,52 @@ impl Tray {
             .ok()?
             .into_rgba8();
         let image = image::imageops::resize(&rgba, 32, 32, image::imageops::FilterType::Lanczos3);
-        let mut pixels = image.into_raw();
-        let mut mask = vec![0u8; 32 * 4];
-        for (i, p) in pixels.chunks_exact_mut(4).enumerate() {
-            for c in 0..3 {
-                p[c] = ((p[c] as u32 * p[3] as u32 + 127) / 255) as u8;
+        let base_pixels = image.into_raw();
+        let icon_normal = create_hicon(&base_pixels)?;
+        let icon_badge = match create_hicon(&add_red_badge(&base_pixels)) {
+            Some(icon) => icon,
+            None => {
+                DestroyIcon(icon_normal);
+                return None;
             }
-            p.swap(0, 2);
-            if p[3] == 0 {
-                mask[(i / 32) * 4 + (i % 32) / 8] |= 0x80 >> ((i % 32) % 8);
-            }
-        }
-        let mut info: BITMAPINFO = zeroed();
-        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = 32;
-        info.bmiHeader.biHeight = -32;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        let mut bits = null_mut();
-        let color = CreateDIBSection(null_mut(), &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        if color.is_null() {
-            return None;
-        }
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
-        let mask = CreateBitmap(32, 32, 1, 1, mask.as_ptr() as _);
-        let icon_info = ICONINFO {
-            fIcon: 1,
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
         };
-        let icon = CreateIconIndirect(&icon_info);
-        DeleteObject(color);
-        DeleteObject(mask);
-        if icon.is_null() {
-            return None;
-        }
         let mut data: NOTIFYICONDATAW = zeroed();
         data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = hwnd;
         data.uID = 1;
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
         data.uCallbackMessage = MESSAGE;
-        data.hIcon = icon;
+        data.hIcon = icon_normal;
         data.guidItem = GUID::from_u128(0xc7c6f41d_f516_4c86_9f3e_8db41829601a);
         let tip = crate::model::wide("Lumen");
         data.szTip[..tip.len().min(127)].copy_from_slice(&tip[..tip.len().min(127)]);
-        let tray = Self { data, icon };
+        let tray = Self {
+            data,
+            icon_normal,
+            icon_badge,
+            update_available: false,
+        };
         if !tray.add() {
             return None;
         }
-        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
-        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon_normal as isize);
+        SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_normal as isize);
         Some(tray)
+    }
+    pub unsafe fn set_update_available(&mut self, available: bool) {
+        if self.update_available == available {
+            return;
+        }
+        self.update_available = available;
+        self.data.hIcon = if available {
+            self.icon_badge
+        } else {
+            self.icon_normal
+        };
+        self.data.szTip.fill(0);
+        let tip = crate::model::wide(if available { "Update available" } else { "Lumen" });
+        self.data.szTip[..tip.len().min(127)].copy_from_slice(&tip[..tip.len().min(127)]);
+        Shell_NotifyIconW(NIM_MODIFY, &self.data);
     }
     pub unsafe fn add(&self) -> bool {
         let added = Shell_NotifyIconW(NIM_ADD, &self.data) != 0;
@@ -85,7 +160,17 @@ impl Tray {
     }
     pub unsafe fn menu(&self) -> u32 {
         let menu = CreatePopupMenu();
-        for (id, label) in [(8, "General Settings / Widget Manager"), (3, "Quit Lumen")] {
+        let update_label = if self.update_available {
+            "Update now"
+        } else {
+            "Check for updates"
+        };
+        for (id, label) in [
+            (8, "General Settings / Widget Manager"),
+            (11, update_label),
+            (10, "Open Log"),
+            (3, "Quit Lumen"),
+        ] {
             AppendMenuW(menu, MF_STRING, id, crate::model::wide(label).as_ptr());
         }
         let mut point: POINT = zeroed();
@@ -109,7 +194,8 @@ impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
             Shell_NotifyIconW(NIM_DELETE, &self.data);
-            DestroyIcon(self.icon);
+            DestroyIcon(self.icon_normal);
+            DestroyIcon(self.icon_badge);
         }
     }
 }

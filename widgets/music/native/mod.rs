@@ -9,6 +9,7 @@ mod model;
 mod responsive;
 mod session;
 mod settings;
+mod smtc;
 mod themes;
 mod view;
 use crate::{
@@ -41,6 +42,10 @@ struct State {
     config: Config,
     glass: Rc<RefCell<Glass>>,
     backend: Option<backend::Backend>,
+    backend_live: bool,
+    smtc: Option<smtc::SmtcClient>,
+    latest_smtc: Option<smtc::SmtcState>,
+    smtc_active: bool,
     playback: Playback,
     last_cover: Option<String>,
     session_signature: String,
@@ -60,6 +65,7 @@ struct State {
     rounded_art: RefCell<HashMap<String, Image>>,
     art_files: HashMap<String, String>,
     buttons: Vec<Button>,
+    seek_track: Option<[f32; 4]>,
     control_plates: Vec<([f32; 4], f32)>,
     hover: Option<Action>,
     pressed: Option<Action>,
@@ -87,7 +93,7 @@ struct State {
 }
 impl State {
     fn position(&self) -> f64 {
-        let elapsed = if self.playback.playing {
+        let elapsed = if self.playback.playing && self.pressed != Some(Action::Seek) {
             self.received.elapsed().as_secs_f64().min(2.)
         } else {
             0.
@@ -95,6 +101,71 @@ impl State {
         (self.playback.position + elapsed)
             .max(0.)
             .min(self.playback.duration.max(0.))
+    }
+    fn scrub_to(&mut self, x: f32) -> Option<f64> {
+        let track = self
+            .seek_track
+            .or_else(|| self.buttons.iter().find(|b| b.action == Action::Seek).map(|b| b.rect))?;
+        let span = (track[2] - track[0]).max(1.);
+        let fraction = ((x - track[0]) / span).clamp(0., 1.) as f64;
+        let target = fraction * self.playback.duration;
+        self.playback.position = target;
+        self.received = Instant::now();
+        self.last_seek = Some(Instant::now());
+        Some(target)
+    }
+    fn commit_seek(&mut self, x: f32) {
+        if let Some(target) = self.scrub_to(x) {
+            if self.use_smtc() {
+                if let Some(smtc) = &self.smtc {
+                    smtc.send(smtc::SmtcCommand::Seek(target));
+                }
+            } else {
+                self.send(serde_json::json!({"action":"seek","value":target}));
+            }
+        }
+    }
+    fn use_smtc(&self) -> bool {
+        !self.backend_live
+            && self
+                .latest_smtc
+                .as_ref()
+                .is_some_and(|s| s.has_session && s.available)
+    }
+    fn accept_smtc(&mut self, smtc: &smtc::SmtcState) {
+        if let (Some(url), Some(file)) = (&smtc.art_url, &smtc.art_file) {
+            if session::valid_file(file) {
+                if self.art_files.len() > 32 {
+                    self.art_files.retain(|u, _| {
+                        self.last_cover.as_ref() == Some(u)
+                            || self.playback.art.as_ref() == Some(u)
+                            || self.playback.queue.iter().any(|t| t.thumb == *u)
+                    });
+                }
+                self.art_files.insert(url.clone(), file.clone());
+            }
+        }
+        let next = Playback {
+            signed_in: self.playback.signed_in,
+            auth_known: false,
+            album: smtc.album.clone(),
+            video_id: String::new(),
+            available: smtc.available,
+            playing: smtc.playing,
+            title: smtc.title.clone(),
+            artist: smtc.artist.clone(),
+            art: smtc.art_url.clone(),
+            position: smtc.position,
+            duration: smtc.duration,
+            can_next: smtc.can_next,
+            can_previous: smtc.can_previous,
+            can_seek: smtc.can_seek,
+            queue: Vec::new(),
+            error: None,
+        };
+        self.error.clear();
+        self.accept_playback(next);
+        self.smtc_active = true;
     }
     fn save(&self) {
         if !self.smoke {
@@ -104,7 +175,10 @@ impl State {
         }
     }
     fn send(&mut self, value: serde_json::Value) {
+        let action = value["action"].as_str().unwrap_or("unknown").to_owned();
+        crate::logger::info("music", format!("backend action={action}"));
         if self.backend.as_mut().is_some_and(|b| b.exited()) {
+            crate::logger::warn("music", "previous backend exited; restarting");
             self.backend.take();
         }
         if self.backend.is_none() {
@@ -114,12 +188,14 @@ impl State {
                     self.error.clear();
                 }
                 Err(e) => {
+                    crate::logger::error("music", format!("backend start failed: {e}"));
                     self.error = e;
                     return;
                 }
             }
         }
         if let Err(e) = self.backend.as_mut().unwrap().send(value) {
+            crate::logger::error("music", format!("backend send failed ({action}): {e}"));
             self.error = e;
         }
     }
@@ -168,35 +244,45 @@ impl State {
             Action::SignIn => self.send(serde_json::json!({"action":"signin"})),
             Action::Library => self.send(serde_json::json!({"action":"library"})),
             Action::Previous => {
-                self.send(serde_json::json!({"action":"previous"}));
+                if self.use_smtc() {
+                    if let Some(smtc) = &self.smtc {
+                        smtc.send(smtc::SmtcCommand::Previous);
+                    }
+                } else {
+                    self.send(serde_json::json!({"action":"previous"}));
+                }
                 if IsWindowVisible(self.hwnd) != 0 {
                     SetTimer(self.hwnd, 91, 16, None);
                 }
             }
             Action::Next => {
-                self.send(serde_json::json!({"action":"next"}));
+                if self.use_smtc() {
+                    if let Some(smtc) = &self.smtc {
+                        smtc.send(smtc::SmtcCommand::Next);
+                    }
+                } else {
+                    self.send(serde_json::json!({"action":"next"}));
+                }
                 if IsWindowVisible(self.hwnd) != 0 {
                     SetTimer(self.hwnd, 91, 16, None);
                 }
             }
             Action::Toggle => {
-                if !self.playback.available && self.playback.title.is_empty() {
+                if self.use_smtc() {
+                    if let Some(smtc) = &self.smtc {
+                        smtc.send(smtc::SmtcCommand::Toggle);
+                    }
+                    if IsWindowVisible(self.hwnd) != 0 {
+                        SetTimer(self.hwnd, 91, 80, None);
+                    }
+                } else if !self.playback.available && self.playback.title.is_empty() {
                     self.send(serde_json::json!({"action":"browse"}));
                 } else {
                     self.send(serde_json::json!({"action":"toggle"}));
                 }
             }
             Action::Track(id) => self.send(serde_json::json!({"action":"select","videoId":id})),
-            Action::Seek => {
-                if let Some(b) = self.buttons.iter().find(|b| b.action == Action::Seek) {
-                    let fraction = ((x - b.rect[0]) / (b.rect[2] - b.rect[0])).clamp(0., 1.) as f64;
-                    let target = fraction * self.playback.duration;
-                    self.playback.position = target;
-                    self.received = Instant::now();
-                    self.last_seek = Some(Instant::now());
-                    self.send(serde_json::json!({"action":"seek","value":target}));
-                }
-            }
+            Action::Seek => self.commit_seek(x),
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
@@ -223,6 +309,16 @@ impl State {
             match event["type"].as_str().unwrap_or("") {
                 "state" => {
                     if let Ok(state) = serde_json::from_value::<Playback>(event["state"].clone()) {
+                        let has_backend_session =
+                            state.available || !state.title.is_empty() || !state.queue.is_empty();
+                        let seeking = self.pressed == Some(Action::Seek)
+                            || self
+                                .last_seek
+                                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(2500));
+                        self.backend_live = has_backend_session || (self.backend_live && seeking);
+                        if self.backend_live {
+                            self.smtc_active = false;
+                        }
                         self.error = state.error.clone().unwrap_or_default();
                         self.accept_playback(state);
                         if IsWindowVisible(self.hwnd) != 0 {
@@ -239,6 +335,8 @@ impl State {
                         }
                     }
                     if let Some(error) = event["error"].as_str() {
+                        crate::logger::warn("music", format!("backend state error: {error}"));
+                        self.backend_live = false;
                         self.error = error.into();
                         self.playback.available = false;
                         self.playback.playing = false;
@@ -246,7 +344,10 @@ impl State {
                     dirty = true;
                 }
                 "error" => {
-                    self.error = event["error"].as_str().unwrap_or("Playback error").into();
+                    self.backend_live = false;
+                    let err = event["error"].as_str().unwrap_or("Playback error");
+                    crate::logger::error("music", format!("backend error: {err}"));
+                    self.error = err.into();
                     self.playback.playing = false;
                     dirty = true;
                 }
@@ -257,7 +358,7 @@ impl State {
                             && file.ends_with(".img")
                             && file.as_bytes()[..64].iter().all(|c| c.is_ascii_hexdigit())
                         {
-                            if self.art_files.len() > 160 {
+                            if self.art_files.len() > 32 {
                                 self.art_files.retain(|url, _| {
                                     self.last_cover.as_ref() == Some(url)
                                         || self.playback.art.as_ref() == Some(url)
@@ -270,6 +371,40 @@ impl State {
                     }
                 }
                 _ => {}
+            }
+        }
+        if self.backend.as_mut().is_some_and(|b| b.exited()) {
+            self.backend_live = false;
+        }
+        let smtc_updates: Vec<_> = self
+            .smtc
+            .as_ref()
+            .map(|s| s.updates.try_iter().take(16).collect())
+            .unwrap_or_default();
+        let smtc_changed = !smtc_updates.is_empty();
+        if let Some(latest) = smtc_updates.into_iter().last() {
+            self.latest_smtc = Some(latest);
+        }
+        if !self.backend_live && (smtc_changed || !self.smtc_active) {
+            if let Some(smtc_state) = self.latest_smtc.clone().filter(|s| s.has_session && s.available)
+            {
+                if !self.smtc_active {
+                    crate::logger::info(
+                        "music",
+                        format!("SMTC fallback active: {} - {}", smtc_state.title, smtc_state.artist),
+                    );
+                }
+                self.accept_smtc(&smtc_state);
+                dirty = true;
+            } else if self.smtc_active {
+                crate::logger::info("music", "SMTC fallback session ended");
+                self.smtc_active = false;
+                self.playback.available = false;
+                self.playback.playing = false;
+                self.playback.can_next = false;
+                self.playback.can_previous = false;
+                self.playback.can_seek = false;
+                dirty = true;
             }
         }
         if dirty || self.playback.playing {
@@ -530,6 +665,14 @@ impl Host {
             config,
             glass,
             backend: None,
+            backend_live: false,
+            smtc: if smoke {
+                None
+            } else {
+                Some(smtc::SmtcClient::start(root))
+            },
+            latest_smtc: None,
+            smtc_active: false,
             playback,
             last_cover,
             session_signature: String::new(),
@@ -549,6 +692,7 @@ impl Host {
             rounded_art: RefCell::new(HashMap::new()),
             art_files,
             buttons: Vec::new(),
+            seek_track: None,
             control_plates: Vec::new(),
             hover: None,
             pressed: None,
@@ -880,15 +1024,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_MOUSEMOVE => {
             let p = point(lp, s.dpi);
-            let hover = s
-                .buttons
-                .iter()
-                .rev()
-                .find(|b| view::contains(b.rect, p))
-                .map(|b| b.action.clone());
-            if s.hover != hover {
-                s.hover = hover;
+            if s.pressed == Some(Action::Seek) {
+                s.hover = Some(Action::Seek);
+                s.scrub_to(p[0]);
                 InvalidateRect(hwnd, null(), 0);
+            } else {
+                let hover = s
+                    .buttons
+                    .iter()
+                    .rev()
+                    .find(|b| view::contains(b.rect, p))
+                    .map(|b| b.action.clone());
+                if s.hover != hover {
+                    s.hover = hover;
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
             let mut track = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -900,8 +1050,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_MOUSELEAVE => {
-            s.hover = None;
-            InvalidateRect(hwnd, null(), 0);
+            if s.pressed != Some(Action::Seek) {
+                s.hover = None;
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_LBUTTONDOWN => {
@@ -912,6 +1064,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 .rev()
                 .find(|b| view::contains(b.rect, p))
                 .map(|b| b.action.clone());
+            if s.pressed == Some(Action::Seek) {
+                s.scrub_to(p[0]);
+            }
             SetCapture(hwnd);
             InvalidateRect(hwnd, null(), 0);
             0
@@ -926,7 +1081,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 .map(|b| b.action.clone());
             let pressed = s.pressed.take();
             ReleaseCapture();
-            if pressed.is_some() && pressed == action {
+            if pressed == Some(Action::Seek) {
+                s.commit_seek(p[0]);
+            } else if pressed.is_some() && pressed == action {
                 s.activate(action.unwrap(), p[0]);
             }
             InvalidateRect(hwnd, null(), 0);
@@ -1730,6 +1887,10 @@ mod tests {
                             },
                             glass: Rc::new(RefCell::new(Glass::new(13., 1.))),
                             backend: None,
+                            backend_live: false,
+                            smtc: None,
+                            latest_smtc: None,
+                            smtc_active: false,
                             playback: Playback {
                                 signed_in,
                                 video_id: "preview0004".into(),
@@ -1771,6 +1932,7 @@ mod tests {
                             rounded_art: RefCell::new(HashMap::new()),
                             art_files: HashMap::new(),
                             buttons: Vec::new(),
+                            seek_track: None,
                             control_plates: Vec::new(),
                             hover: None,
                             pressed: None,

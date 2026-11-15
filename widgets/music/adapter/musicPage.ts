@@ -51,6 +51,8 @@ export const MUSIC_PAGE_STATE = `(() => {
   const signIn = !!document.querySelector('ytmusic-nav-bar a[href*="accounts.google.com"], ytmusic-nav-bar a[href*="ServiceLogin"]');
   const signedIn = typeof loggedIn === 'boolean' ? loggedIn : avatar ? true : signIn ? false : null;
   const duration = Number.isFinite(video?.duration) ? video.duration : 0;
+  const errNode = document.querySelector('ytmusic-player yt-player-error-message-renderer #reason, ytmusic-player .ytp-error-content-wrap-reason, #movie_player .ytp-error-content-wrap-reason, ytmusic-player #error-screen #reason');
+  const errText = errNode && errNode.getBoundingClientRect?.().height > 0 ? text(errNode) : '';
   return { available:!!video && video.readyState >= 2 && !!title, playing:!!video && !video.paused && !video.ended,
     title, artist:current?.artist || text(bar?.querySelector('.byline a')) || meta?.artist,
     album:meta?.album || '', art:current?.thumb || bar?.querySelector('img')?.src || meta?.artwork?.at(-1)?.src || null,
@@ -60,7 +62,7 @@ export const MUSIC_PAGE_STATE = `(() => {
     videoId,
     playlistId:new URL(location.href).searchParams.get('list') || '',
     signedIn,
-    queue,error:null};
+    queue,error:errText || null};
 })()`
 
 export function musicPageSelect(videoId: string): string {
@@ -88,7 +90,13 @@ export function musicPageCommand(action: string, value?: number): string {
     const action=${JSON.stringify(action)}, value=${JSON.stringify(Number.isFinite(value) ? value : null)};
     const video=document.querySelector('video');
     if (!video) throw new Error('Choose a song first');
-    if (action === 'play' || (action === 'toggle' && video.paused)) await video.play();
+    if (action === 'play' || (action === 'toggle' && video.paused)) {
+      try { await video.play(); } catch (err) {
+        const btn=document.querySelector('ytmusic-player-bar .play-pause-button');
+        if (btn && video.paused) btn.click();
+        else throw err;
+      }
+    }
     else if (action === 'pause' || action === 'toggle') video.pause();
     else if (action === 'seek' && value !== null && Number.isFinite(video.duration) && !document.querySelector('.ad-showing')) video.currentTime=Math.max(0,Math.min(video.duration,value));
     else if (action === 'next' || action === 'previous') {

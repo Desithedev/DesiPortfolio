@@ -1,6 +1,6 @@
 {
   "name": "lumen-native",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "description": "Native Rust desktop widgets",
   "scripts": {

@@ -1,9 +1,8 @@
-Lumen 0.1.4 updates the default appearance, glass effects, and drag/resize behavior:
+Lumen 0.1.5 improves the built-in updater, tray notifications, and settings UI:
 
-- Liquid Glass, Low Power Mode, and Desktop icon sync are enabled by default.
-- Updated default widget themes, sizes, blur, and tint settings across App Dock and widgets (without personal data).
-- Low Power Mode skips wallpaper backdrop updates while dragging or resizing widgets, refreshing once at the final position/size.
-- Fixed compositor `fade_list` background restoration outside the scrolled viewport range.
+- **One-click Update Now & Download Package**: General Settings → Updates highlights available releases and provides an `Update Now` button on portable installs (auto-downloads, verifies SHA-256, unpacks, and restarts via `Lumen-updater.exe`) as well as a direct `Download Package` link.
+- **Startup Update Check**: Automatically checks for updates once ~5 minutes after startup or restart.
+- **System Tray Update Indicator**: Displays a red badge dot and `Update available` tooltip on the tray icon when an update is found, and switches the tray menu item from `Check for updates` to `Update now`.
 
 Optional Python entry points remain available:
 
@@ -15,7 +14,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.4-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.5-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

@@ -112,6 +112,7 @@ pub struct Host {
     update_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::update::Release>, String>>>,
     update_candidate: Option<crate::update::Release>,
     update_status: String,
+    auto_apply_update: bool,
 }
 impl Host {
     pub unsafe fn create(
@@ -141,6 +142,7 @@ impl Host {
             update_rx: None,
             update_candidate: None,
             update_status: String::new(),
+            auto_apply_update: false,
         };
         host.update_rows();
         Ok(host)
@@ -196,22 +198,47 @@ impl Host {
                 self.config.liquid_glass,
             ),
         ]);
+        const UPDATE_ACCENT: u32 = 0xe5881e;
         rows.push(Row::section("Updates"));
         if self.update_rx.is_none() {
             rows.push(Row::button(7, "Check for updates"));
-            if self.update_candidate.is_some()
-                && crate::update::portable(&self.root)
-                && !crate::update::pending(&self.root)
-            {
-                rows.push(Row::button(8, "Download update"));
+            if let Some(release) = &self.update_candidate {
+                if crate::update::portable(&self.root) && !crate::update::pending(&self.root) {
+                    rows.push(Row::accent_button(
+                        8,
+                        format!("Update Now · v{}", release.version),
+                        UPDATE_ACCENT,
+                    ));
+                    rows.push(Row::button(
+                        14,
+                        format!("Download v{} Package", release.version),
+                    ));
+                } else if !crate::update::portable(&self.root) {
+                    rows.push(Row::accent_button(
+                        14,
+                        format!("Download v{} Package", release.version),
+                        UPDATE_ACCENT,
+                    ));
+                }
             }
             if crate::update::pending(&self.root) {
-                rows.push(Row::button(9, "Restart and apply update"));
+                rows.push(Row::accent_button(
+                    9,
+                    "Restart and Apply Update",
+                    UPDATE_ACCENT,
+                ));
             }
             rows.push(Row::button(10, "Open GitHub Releases"));
         }
         if !self.update_status.is_empty() {
-            rows.push(Row::note(&self.update_status));
+            if self.update_candidate.is_some()
+                || crate::update::pending(&self.root)
+                || self.update_rx.is_some()
+            {
+                rows.push(Row::highlight_note(&self.update_status, UPDATE_ACCENT));
+            } else {
+                rows.push(Row::note(&self.update_status));
+            }
         }
         if !self.error.is_empty() {
             rows.push(Row::note(&self.error));
@@ -349,31 +376,21 @@ impl Host {
                     actions.push(Action::RefreshGlass);
                     dirty = true;
                 }
-                (7, Value::Action) if self.update_rx.is_none() && !self.smoke => {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let root = self.root.clone();
-                    self.update_rx = Some(rx);
-                    self.update_status = "Checking GitHub…".into();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(crate::update::check(&root));
-                    });
-                }
-                (8, Value::Action) if self.update_rx.is_none() && !self.smoke => {
-                    if let Some(candidate) = self.update_candidate.clone() {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        let root = self.root.clone();
-                        self.update_rx = Some(rx);
-                        self.update_status = "Downloading and verifying update…".into();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(crate::update::stage(&root, &candidate).map(|_| None));
-                        });
-                    }
-                }
+                (7, Value::Action) => self.start_update_check(),
+                (8, Value::Action) => actions.extend(self.trigger_update_now()),
                 (9, Value::Action) if self.update_rx.is_none() && !self.smoke => {
                     actions.push(Action::RestartUpdate)
                 }
                 (10, Value::Action) if !self.smoke => unsafe {
                     crate::update::open_releases();
+                },
+                (14, Value::Action) if !self.smoke => unsafe {
+                    let url = self
+                        .update_candidate
+                        .as_ref()
+                        .map(|release| release.url.as_str())
+                        .unwrap_or("");
+                    crate::update::open_download(url);
                 },
                 (11, Value::Action) if !self.smoke => unsafe {
                     let file = self.root.join("LICENSES/CREDITS.txt");
@@ -418,35 +435,98 @@ impl Host {
     pub unsafe fn refresh(&mut self) {
         self.ui.refresh();
     }
-    pub fn poll_update(&mut self) {
+    pub fn has_update(&self) -> bool {
+        self.update_candidate.is_some() || crate::update::pending(&self.root)
+    }
+    pub fn start_update_check(&mut self) {
+        if self.update_rx.is_some() || self.smoke {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = self.root.clone();
+        self.update_rx = Some(rx);
+        self.update_candidate = None;
+        self.auto_apply_update = false;
+        self.update_status = "Checking GitHub…".into();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::update::check(&root));
+        });
+        self.update_rows();
+    }
+    pub fn trigger_update_now(&mut self) -> Vec<Action> {
+        if self.update_rx.is_some() || self.smoke {
+            return Vec::new();
+        }
+        if crate::update::pending(&self.root) {
+            return vec![Action::RestartUpdate];
+        }
+        if let Some(candidate) = self.update_candidate.clone() {
+            if crate::update::portable(&self.root) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let root = self.root.clone();
+                self.update_rx = Some(rx);
+                self.auto_apply_update = true;
+                self.update_status =
+                    format!("Downloading and extracting Lumen {}…", candidate.version);
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::update::stage(&root, &candidate).map(|_| None));
+                });
+                self.update_rows();
+            } else {
+                unsafe {
+                    crate::update::open_download(&candidate.url);
+                }
+            }
+        }
+        Vec::new()
+    }
+    pub fn poll_update(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
         let result = self.update_rx.as_ref().map(|rx| rx.try_recv());
         match result {
             Some(Ok(value)) => {
                 self.update_rx = None;
                 match value {
                     Ok(Some(release)) => {
-                        self.update_status = format!("Lumen {} is available.", release.version);
+                        self.auto_apply_update = false;
+                        self.update_status =
+                            format!("New version Lumen {} is available!", release.version);
                         self.update_candidate = Some(release);
                     }
                     Ok(None) => {
                         self.update_candidate = None;
-                        self.update_status = if crate::update::pending(&self.root) {
-                            "Verified update ready. Restart to apply.".into()
+                        if crate::update::pending(&self.root) {
+                            if self.auto_apply_update {
+                                self.auto_apply_update = false;
+                                self.update_status =
+                                    "Update extracted. Restarting Lumen to apply…".into();
+                                actions.push(Action::RestartUpdate);
+                            } else {
+                                self.update_status =
+                                    "Verified update ready. Restart to apply.".into();
+                            }
                         } else {
-                            "No newer compatible stable release is published.".into()
-                        };
+                            self.auto_apply_update = false;
+                            self.update_status =
+                                "No newer compatible stable release is published.".into();
+                        }
                     }
-                    Err(error) => self.update_status = error,
+                    Err(error) => {
+                        self.auto_apply_update = false;
+                        self.update_status = error;
+                    }
                 }
                 self.update_rows();
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                 self.update_rx = None;
+                self.auto_apply_update = false;
                 self.update_status = "Update worker stopped. Try again.".into();
                 self.update_rows();
             }
             _ => {}
         }
+        actions
     }
 }
 #[cfg(test)]
@@ -486,19 +566,28 @@ mod tests {
                 digest: String::new(),
             })))
             .unwrap();
-            host.poll_update();
+            assert!(host.poll_update().is_empty());
             assert!(host.update_status.contains("0.2.0"));
+            assert!(host
+                .rows()
+                .iter()
+                .any(|row| matches!(row, Row::HighlightNote { text, .. } if text.contains("0.2.0"))));
             assert!(has(&host.rows(), 7));
             assert!(
                 !has(&host.rows(), 8),
                 "source builds must not install portable updates over source"
             );
+            assert!(
+                has(&host.rows(), 14),
+                "source builds should offer a direct Download Package button"
+            );
             std::fs::write(root.join("lumen-portable.json"), "{}").unwrap();
             assert!(has(&host.rows(), 8));
+            assert!(has(&host.rows(), 14));
             let (tx, rx) = std::sync::mpsc::channel();
             host.update_rx = Some(rx);
             tx.send(Err("offline".into())).unwrap();
-            host.poll_update();
+            assert!(host.poll_update().is_empty());
             assert_eq!(host.update_status, "offline");
             assert!(has(&host.rows(), 7));
         }

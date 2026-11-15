@@ -8,18 +8,40 @@ import { MusicPipe } from './musicPipe'
 import { MUSIC_PAGE_STATE, musicPageCommand, musicPageSelect, type PlayerPageState } from './musicPage'
 import { hideMusicBackgroundWindow, type MusicFrameInsets } from './musicPlayerWindow'
 
-export type PlayerBrowser = 'edge' | 'chrome'
+export const PLAYER_BROWSERS = [
+  'chrome',
+  'edge',
+  'brave',
+  'coccoc',
+  'vivaldi',
+  'opera',
+  'opera_gx',
+  'chromium',
+] as const
+export type PlayerBrowser = (typeof PLAYER_BROWSERS)[number]
 export interface PlayerIdentity {
   browser: PlayerBrowser | null
   appId: string
 }
 
+const BROWSER_PATHS: Record<PlayerBrowser, string[][]> = {
+  chrome: [['Google', 'Chrome', 'Application', 'chrome.exe']],
+  edge: [['Microsoft', 'Edge', 'Application', 'msedge.exe']],
+  brave: [['BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe']],
+  coccoc: [['CocCoc', 'Browser', 'Application', 'browser.exe']],
+  vivaldi: [['Vivaldi', 'Application', 'vivaldi.exe']],
+  opera: [['Programs', 'Opera', 'opera.exe'], ['Opera', 'opera.exe']],
+  opera_gx: [['Programs', 'Opera GX', 'opera.exe'], ['Opera GX', 'opera.exe']],
+  chromium: [['Chromium', 'Application', 'chrome.exe']],
+}
+
 export function playerBrowserCandidates(env: NodeJS.ProcessEnv = process.env): { browser: PlayerBrowser; executable: string }[] {
   const roots = [env['ProgramFiles(x86)'], env.ProgramW6432, env.ProgramFiles, env.LOCALAPPDATA].filter(Boolean) as string[]
-  return (['chrome', 'edge'] as const).flatMap((browser) => roots.map((root) => ({
-    browser,
-    executable: path.join(root, ...(browser === 'edge' ? ['Microsoft', 'Edge', 'Application', 'msedge.exe'] : ['Google', 'Chrome', 'Application', 'chrome.exe']))
-  })))
+  return PLAYER_BROWSERS.flatMap((browser) =>
+    BROWSER_PATHS[browser].flatMap((segments) =>
+      roots.map((root) => ({ browser, executable: path.join(root, ...segments) }))
+    )
+  )
 }
 
 export function playerArguments(profile: string, url = 'https://music.youtube.com/'): string[] {
@@ -64,7 +86,7 @@ export class MusicPlayer {
     private readonly createHost?: (pid: number, insets: MusicFrameInsets, onClose: () => void) => MusicWindowHost) {
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(directory, 'music-player.json'), 'utf8'))
-      if (raw.browser === 'edge' || raw.browser === 'chrome') this.identity.browser = raw.browser
+      if (PLAYER_BROWSERS.includes(raw.browser)) this.identity.browser = raw.browser
       if (typeof raw.appId === 'string' && raw.appId.length < 256 && raw.appId.includes('LumenMusic')) this.identity.appId = raw.appId
       if (/^[\w-]{11}$/.test(raw.videoId || '')) this.resume.videoId = raw.videoId
       if (Number.isFinite(raw.position)) this.resume.position = Math.max(0, raw.position)
@@ -109,7 +131,7 @@ export class MusicPlayer {
     const candidates = playerBrowserCandidates()
     if (this.identity.browser) candidates.sort((a, b) => Number(b.browser === this.identity.browser) - Number(a.browser === this.identity.browser))
     const found = candidates.find(candidate => fs.existsSync(candidate.executable))
-    if (!found) throw new Error('Install Chrome or Edge to sign in to Music.')
+    if (!found) throw new Error('Install a Chromium browser (Chrome, Edge, Brave, CocCoc, Vivaldi, or Opera) to sign in to Music.')
     const exited = this.browserExit
     this.stop()
     await this.closing
@@ -124,10 +146,18 @@ export class MusicPlayer {
       child.once('exit', () => resolve())
     })
     this.signingIn = finished
+    console.error(`[music-player] sign-in browser opened: browser=${found.browser}, profile=${profile}`)
     void finished.then(() => {
       if (this.signingIn !== finished) return
       this.signingIn = null
-      this.changed(null, 'Sign-in browser closed. Press Play to reconnect Music.')
+      console.error('[music-player] sign-in browser closed; reconnecting background player')
+      this.changed(null, 'Sign-in browser closed. Reconnecting Music...')
+      if (!this.stopped) {
+        void this.ensure().catch((err) => {
+          console.error(`[music-player] reconnect after sign-in failed: ${err instanceof Error ? err.message : err}`)
+          if (!this.stopped) this.changed(null, 'Sign-in browser closed. Press Play to reconnect Music.')
+        })
+      }
     })
     await new Promise<void>((resolve, reject) => {
       child.once('spawn', resolve)
@@ -138,14 +168,27 @@ export class MusicPlayer {
   async signOut(): Promise<void> {
     await this.ensure()
     // This process uses only Music's isolated user-data-dir, never the user's
-    // everyday browser profile. Drop its authentication cookies and reload.
+    // everyday browser profile. Drop its authentication cookies, site storage,
+    // and cached auth pages, then reload home.
     await this.pipe!.send('Network.clearBrowserCookies', {}, this.playbackSession)
-    await this.pipe!.send('Page.navigate', { url: 'https://music.youtube.com/' }, this.playbackSession)
-    if (this.current) {
-      this.current = { ...this.current, signedIn: false, authKnown: true, available: false, playing: false,
-        canNext: false, canPrevious: false, canSeek: false }
-      this.changed(this.current)
+    await this.pipe!.send('Network.clearBrowserCache', {}, this.playbackSession).catch(() => {})
+    for (const origin of [
+      'https://music.youtube.com',
+      'https://www.youtube.com',
+      'https://accounts.google.com',
+      'https://myaccount.google.com',
+    ]) {
+      await this.pipe!.send('Storage.clearDataForOrigin', { origin, storageTypes: 'all' }, this.playbackSession).catch(() => {})
     }
+    this.resume = { videoId: '', position: 0 }
+    this.save()
+    await this.pipe!.send('Page.navigate', { url: 'https://music.youtube.com/' }, this.playbackSession)
+    this.current = {
+      available: false, playing: false, title: '', artist: '', album: '', art: null,
+      position: 0, duration: 0, canNext: false, canPrevious: false, canSeek: false,
+      videoId: '', playlistId: '', signedIn: false, authKnown: true, queue: [], error: null,
+    }
+    this.changed(this.current)
   }
 
   private async launch(): Promise<void> {
@@ -157,9 +200,15 @@ export class MusicPlayer {
     const candidates = playerBrowserCandidates()
     if (this.identity.browser) candidates.sort((a, b) => Number(b.browser === this.identity.browser) - Number(a.browser === this.identity.browser))
     const found = candidates.find((candidate) => fs.existsSync(candidate.executable))
-    if (!found) throw new Error('Install Microsoft Edge or Google Chrome to open the music player.')
+    if (!found) throw new Error('Install a Chromium browser (Chrome, Edge, Brave, CocCoc, Vivaldi, or Opera) to open the music player.')
     // Keep browser profiles separate, and keep both separate from normal browsing.
     const profile = path.join(this.directory, 'music-player', found.browser)
+    console.error(`[music-player] launching ${found.browser} (${found.executable}) with profile=${profile}`)
+    // Wait briefly if a previous Chrome/Edge process is still releasing its profile lock.
+    const lockFile = path.join(profile, 'SingletonLock')
+    for (let i = 0; i < 20 && fs.existsSync(lockFile); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
     const title = `Lumen Music Background ${randomBytes(8).toString('hex')}`
     const bootstrapPath = `/lumen-background/${randomBytes(12).toString('hex')}`
     const bootstrap = createServer((request, response) => {
@@ -186,7 +235,7 @@ export class MusicPlayer {
     }
     const bootstrapUrl = `http://127.0.0.1:${(bootstrap.address() as { port: number }).port}${bootstrapPath}`
     const args = [...playerArguments(profile).slice(0, -1), '--remote-debugging-pipe', `--app=${bootstrapUrl}`, '--window-position=-32000,-32000',
-      '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows']
+      '--disable-background-mode', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows']
     fs.mkdirSync(profile, { recursive: true })
     const child = spawn(found.executable, args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: false })
     this.browserExit = new Promise(resolve => {
@@ -216,7 +265,7 @@ export class MusicPlayer {
     this.save()
     try {
       let target: any
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 80; i++) {
         const { targetInfos } = await pipe.send('Target.getTargets')
         target = targetInfos.find((item: any) => item.type === 'page' && item.url === bootstrapUrl)
         if (target) break
@@ -228,7 +277,7 @@ export class MusicPlayer {
       await pipe.send('Emulation.setFocusEmulationEnabled', { enabled: true }, this.playbackSession)
       await this.evaluate(this.playbackSession, `document.title=${JSON.stringify(title)}; true`)
       let hidden = false
-      for (let i = 0; i < 30; i++) {
+      for (let i = 0; i < 80; i++) {
         if (hideMusicBackgroundWindow(this.pid, title)) { hidden = true; break }
         await new Promise((resolve) => setTimeout(resolve, 100))
       }
@@ -309,6 +358,7 @@ export class MusicPlayer {
         if (request !== this.playbackRequest) return
         try { state = await this.evaluate(this.playbackSession, MUSIC_PAGE_STATE) } catch { /* document navigation */ }
         if (state?.available && state.videoId === videoId) break
+        if (state?.error) throw new Error(state.error)
         await new Promise((resolve) => setTimeout(resolve, 250))
       }
       if (!state?.available || state.videoId !== videoId) throw new Error('This track did not load. Browse music to check sign-in or playback availability.')
