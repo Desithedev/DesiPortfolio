@@ -240,12 +240,15 @@ impl Editor {
                 200_000,
                 0,
             );
+            s.set_default_char_format();
             if let Some(note) = &s.note {
-                let rtf = note
-                    .rich_text()
-                    .replace("Segoe UI;", "Segoe UI Variable Text;")
-                    .replace("\\fs24", "\\fs21")
-                    .replace("\\fs22", "\\fs21");
+                let mut rtf = note.rich_text();
+                if note.rtf.is_none() {
+                    rtf = rtf
+                        .replace("Segoe UI;", "Segoe UI Variable Text;")
+                        .replace("\\fs24", "\\fs21")
+                        .replace("\\fs22", "\\fs21");
+                }
                 let mut bytes = Bytes {
                     data: rtf.into_bytes(),
                     offset: 0,
@@ -276,6 +279,11 @@ impl Editor {
     pub unsafe fn floating(&self, _on: bool) {} // Child follows the board's z-order.
     pub fn note_id(&self) -> Option<String> {
         self.state.borrow().note.as_ref().map(|n| n.id.clone())
+    }
+    pub(super) fn sync_images(&self, images: &[String]) {
+        if let Some(note) = &mut self.state.borrow_mut().note {
+            note.images = images.to_vec();
+        }
     }
     #[cfg(test)]
     pub(super) fn input_hwnd(&self) -> HWND {
@@ -563,25 +571,102 @@ impl Editor {
         }
     }
 }
-unsafe fn png_clipboard_format() -> u32 {
-    windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW(wide("PNG").as_ptr())
+unsafe fn png_clipboard_formats() -> [u32; 2] {
+    use windows_sys::Win32::System::DataExchange::RegisterClipboardFormatW;
+    [
+        RegisterClipboardFormatW(wide("PNG").as_ptr()),
+        RegisterClipboardFormatW(wide("image/png").as_ptr()),
+    ]
 }
-fn is_image_path(path: &std::path::Path) -> bool {
+pub(super) fn is_image_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| {
             matches!(
                 e.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif"
+                "png" | "jpg" | "jpeg" | "bmp" | "ico" | "webp" | "gif"
             )
         })
 }
-unsafe fn clipboard_has_image_drop() -> bool {
+pub(super) fn save_image_file(root: &Path, src: &Path, salt: usize) -> Option<String> {
+    let img = image::open(src).ok()?;
+    let dir = model::images_dir(root);
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = format!("img-{}-{}.png", model::now(), salt);
+    img.into_rgba8().save(dir.join(&name)).ok()?;
+    Some(name)
+}
+unsafe fn open_clipboard_retry(hwnd: HWND) -> bool {
+    use windows_sys::Win32::System::DataExchange::OpenClipboard;
+    for attempt in 0..5 {
+        if OpenClipboard(hwnd) != 0 {
+            return true;
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    false
+}
+unsafe fn clipboard_text_blocks_image() -> bool {
     use windows_sys::Win32::System::{
-        DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard},
+        DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable},
         Memory::{GlobalLock, GlobalSize, GlobalUnlock},
     };
-    if IsClipboardFormatAvailable(15) == 0 || OpenClipboard(null_mut()) == 0 {
+    if IsClipboardFormatAvailable(13) == 0 || !open_clipboard_retry(null_mut()) {
+        return false;
+    }
+    let text = (|| -> Option<String> {
+        let handle = GetClipboardData(13);
+        if handle.is_null() {
+            return None;
+        }
+        let size = GlobalSize(handle);
+        if size < 2 {
+            return None;
+        }
+        let ptr = GlobalLock(handle) as *const u16;
+        if ptr.is_null() {
+            return None;
+        }
+        let max_len = size / 2;
+        let slice = std::slice::from_raw_parts(ptr, max_len);
+        let nul = slice.iter().position(|&c| c == 0).unwrap_or(max_len);
+        let s = String::from_utf16_lossy(&slice[..nul]);
+        GlobalUnlock(handle);
+        Some(s)
+    })();
+    CloseClipboard();
+    let Some(raw) = text else {
+        return false;
+    };
+    let t = raw.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Browsers and chat apps often populate CF_UNICODETEXT with the image URL
+    // or filename alongside CF_DIB / PNG when copying an image.
+    let single_line = !t.contains('\n') && !t.contains('\r');
+    if single_line {
+        let lower = t.to_ascii_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("file://")
+            || lower.starts_with("data:image/")
+            || lower.starts_with("blob:")
+            || is_image_path(std::path::Path::new(t))
+        {
+            return false;
+        }
+    }
+    true
+}
+unsafe fn clipboard_has_image_drop() -> bool {
+    use windows_sys::Win32::System::{
+        DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable},
+        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+    };
+    if IsClipboardFormatAvailable(15) == 0 || !open_clipboard_retry(null_mut()) {
         return false;
     }
     let found = (|| -> Option<bool> {
@@ -651,12 +736,13 @@ fn parse_hdrop_paths(data: &[u8]) -> Vec<String> {
 }
 unsafe fn paste_from_clipboard(hwnd: HWND, parent: HWND) -> LRESULT {
     use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
-    let png_fmt = png_clipboard_format();
-    let has_text = IsClipboardFormatAvailable(13) != 0;
+    let [png_fmt, mime_png_fmt] = png_clipboard_formats();
     let has_dib = IsClipboardFormatAvailable(8) != 0
         || IsClipboardFormatAvailable(17) != 0
-        || (png_fmt != 0 && IsClipboardFormatAvailable(png_fmt) != 0);
-    if clipboard_has_image_drop() || (has_dib && !has_text) {
+        || IsClipboardFormatAvailable(2) != 0
+        || (png_fmt != 0 && IsClipboardFormatAvailable(png_fmt) != 0)
+        || (mime_png_fmt != 0 && IsClipboardFormatAvailable(mime_png_fmt) != 0);
+    if clipboard_has_image_drop() || (has_dib && !clipboard_text_blocks_image()) {
         PostMessageW(parent, PASTE_IMAGE, 0, 0);
         return 0;
     }
@@ -731,6 +817,9 @@ unsafe extern "system" fn input_proc(
             return paste_from_clipboard(hwnd, parent);
         }
     }
+    if msg == WM_CHAR && w == 0x16 {
+        return 0;
+    }
     if msg == WM_PASTE {
         return paste_from_clipboard(hwnd, parent);
     }
@@ -759,15 +848,10 @@ impl Drop for Editor {
     }
 }
 impl State {
-    unsafe fn apply_line_spacing(&mut self) {
-        if self.edit.is_null() || self.note.is_none() {
+    unsafe fn set_default_char_format(&self) {
+        if self.edit.is_null() {
             return;
         }
-        let was_loading = self.loading;
-        let was_changed = self.changed;
-        self.loading = true;
-        let left_margin = (2. * self.dpi).round().max(1.) as u16;
-        SendMessageW(self.edit, 0x00D3, 3, left_margin as isize);
         let mut cf: CharFormat = zeroed();
         cf.size = size_of::<CharFormat>() as u32;
         cf.mask = 0x2000_0000 | 0x8000_0000; // CFM_FACE | CFM_SIZE
@@ -775,14 +859,33 @@ impl State {
         let face = wide("Segoe UI Variable Text");
         let len = face.len().min(cf.face.len());
         cf.face[..len].copy_from_slice(&face[..len]);
-        SendMessageW(self.edit, WM_USER + 68, 4, &cf as *const _ as isize); // SCF_ALL
         SendMessageW(self.edit, WM_USER + 68, 0, &cf as *const _ as isize); // SCF_DEFAULT
+    }
+    unsafe fn apply_line_spacing(&mut self) {
+        if self.edit.is_null() || self.note.is_none() {
+            return;
+        }
+        #[repr(C)]
+        struct CharRange {
+            min: i32,
+            max: i32,
+        }
+        let was_loading = self.loading;
+        let was_changed = self.changed;
+        self.loading = true;
+        let left_margin = (2. * self.dpi).round().max(1.) as u16;
+        SendMessageW(self.edit, 0x00D3, 3, left_margin as isize);
+        let mut prev_sel = CharRange { min: 0, max: 0 };
+        SendMessageW(self.edit, WM_USER + 52, 0, &mut prev_sel as *mut _ as isize);
+        let all = CharRange { min: 0, max: -1 };
+        SendMessageW(self.edit, WM_USER + 55, 0, &all as *const _ as isize);
         let mut pf2: ParaFormat2 = zeroed();
         pf2.base.size = size_of::<ParaFormat2>() as u32;
         pf2.base.mask = 0x0000_0100; // PFM_LINESPACING
         pf2.line_spacing_rule = 4; // tomLineSpaceExactly (in twips)
         pf2.line_spacing = (self.leading * 15.).round() as i32;
         SendMessageW(self.edit, WM_USER + 71, 0, &pf2 as *const _ as isize);
+        SendMessageW(self.edit, WM_USER + 55, 0, &prev_sel as *const _ as isize);
         self.changed = was_changed;
         self.loading = was_loading;
     }
@@ -917,21 +1020,174 @@ impl State {
     }
     unsafe fn paste_clipboard_image(&mut self) {
         use windows_sys::Win32::System::{
-            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
+            DataExchange::{CloseClipboard, GetClipboardData},
             Memory::{GlobalLock, GlobalSize, GlobalUnlock},
         };
+        fn extract_bitfield(pixel: u32, mask: u32) -> u8 {
+            if mask == 0 {
+                return 0;
+            }
+            let shift = mask.trailing_zeros();
+            let bits = (mask >> shift).count_ones();
+            let val = (pixel & mask) >> shift;
+            let max = if bits >= 32 { u32::MAX } else { (1u32 << bits) - 1 };
+            ((val as u64 * 255) / (max.max(1) as u64)).min(255) as u8
+        }
+        fn decode_dib_to_rgba(data: &[u8]) -> Option<image::RgbaImage> {
+            if data.len() < 40 {
+                return None;
+            }
+            let header_size = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+            let w = i32::from_le_bytes(data[4..8].try_into().ok()?);
+            let h_raw = i32::from_le_bytes(data[8..12].try_into().ok()?);
+            let bpp = u16::from_le_bytes(data[14..16].try_into().ok()?) as usize;
+            let comp = u32::from_le_bytes(data[16..20].try_into().ok()?);
+            let clr_used = u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
+            if header_size < 40
+                || header_size > data.len()
+                || w <= 0
+                || h_raw == 0
+                || w > 8192
+                || h_raw.abs() > 8192
+                || !matches!(bpp, 24 | 32)
+                || !matches!(comp, 0 | 3)
+            {
+                return None;
+            }
+            let mask_bytes = if comp == 3 && header_size == 40 { 12 } else { 0 };
+            let palette_bytes = if comp == 3 && header_size == 40 && clr_used == 3 {
+                0
+            } else if clr_used > 0 {
+                clr_used * 4
+            } else {
+                0
+            };
+            let pixel_offset = header_size + mask_bytes + palette_bytes;
+            let width = w as usize;
+            let height = h_raw.unsigned_abs() as usize;
+            let stride = ((width * bpp + 31) / 32) * 4;
+            if pixel_offset + stride * height > data.len() {
+                return None;
+            }
+            let mut r_mask = 0x00ff_0000u32;
+            let mut g_mask = 0x0000_ff00u32;
+            let mut b_mask = 0x0000_00ffu32;
+            let mut a_mask = 0u32;
+            if comp == 3 && data.len() >= 52 {
+                r_mask = u32::from_le_bytes(data[40..44].try_into().ok()?);
+                g_mask = u32::from_le_bytes(data[44..48].try_into().ok()?);
+                b_mask = u32::from_le_bytes(data[48..52].try_into().ok()?);
+                if header_size >= 56 && data.len() >= 56 {
+                    a_mask = u32::from_le_bytes(data[52..56].try_into().ok()?);
+                }
+            }
+            let pixels = &data[pixel_offset..];
+            let mut rgba = vec![255u8; width * height * 4];
+            let mut any_alpha = false;
+            for y in 0..height {
+                let src_y = if h_raw > 0 { height - 1 - y } else { y };
+                let row = &pixels[src_y * stride..src_y * stride + width * (bpp / 8)];
+                for x in 0..width {
+                    let s = x * (bpp / 8);
+                    let d = (y * width + x) * 4;
+                    if bpp == 32 && comp == 3 {
+                        let px = u32::from_le_bytes([row[s], row[s + 1], row[s + 2], row[s + 3]]);
+                        rgba[d] = extract_bitfield(px, r_mask);
+                        rgba[d + 1] = extract_bitfield(px, g_mask);
+                        rgba[d + 2] = extract_bitfield(px, b_mask);
+                        if a_mask != 0 {
+                            let a = extract_bitfield(px, a_mask);
+                            if a != 0 {
+                                any_alpha = true;
+                            }
+                            rgba[d + 3] = a;
+                        }
+                    } else {
+                        rgba[d] = row[s + 2];
+                        rgba[d + 1] = row[s + 1];
+                        rgba[d + 2] = row[s];
+                        if bpp == 32 {
+                            let a = row[s + 3];
+                            if a != 0 {
+                                any_alpha = true;
+                            }
+                            rgba[d + 3] = a;
+                        }
+                    }
+                }
+            }
+            if bpp == 32 && (comp == 0 || a_mask != 0) && !any_alpha {
+                for p in rgba.chunks_exact_mut(4) {
+                    p[3] = 255;
+                }
+            }
+            image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+        }
+        unsafe fn decode_hbitmap_to_rgba(hbitmap: HBITMAP) -> Option<image::RgbaImage> {
+            if hbitmap.is_null() {
+                return None;
+            }
+            let mut bitmap: BITMAP = zeroed();
+            if GetObjectW(hbitmap, size_of::<BITMAP>() as i32, &mut bitmap as *mut _ as _) == 0 {
+                return None;
+            }
+            let w = bitmap.bmWidth;
+            let h = bitmap.bmHeight.abs();
+            if w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+                return None;
+            }
+            let mut bmi: BITMAPINFO = zeroed();
+            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = 0; // BI_RGB
+            let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
+            let dc = GetDC(null_mut());
+            let rows = GetDIBits(
+                dc,
+                hbitmap,
+                0,
+                h as u32,
+                bgra.as_mut_ptr() as _,
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(null_mut(), dc);
+            if rows == 0 {
+                return None;
+            }
+            let all_zero_alpha = bgra.chunks_exact(4).all(|p| p[3] == 0);
+            let mut rgba = vec![255u8; bgra.len()];
+            for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = if all_zero_alpha { 255 } else { src[3] };
+            }
+            image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+        }
         let Some(note) = &mut self.note else {
             return;
         };
-        if OpenClipboard(self.hwnd) == 0 {
+        if !open_clipboard_retry(self.hwnd) {
             return;
         }
-        let saved_name = (|| -> Option<String> {
-            let dir = model::images_dir(&self.root);
-            std::fs::create_dir_all(&dir).ok()?;
-            let name = format!("img-{}-{}.png", model::now(), note.images.len());
-            let png_fmt = png_clipboard_format();
-            if png_fmt != 0 {
+        let saved_names = (|| -> Vec<String> {
+            let Some(dir) = Some(model::images_dir(&self.root)) else {
+                return Vec::new();
+            };
+            if std::fs::create_dir_all(&dir).is_err() {
+                return Vec::new();
+            }
+            let mut out = Vec::new();
+            let base_idx = note.images.len();
+            let next_name = |offset: usize| format!("img-{}-{}.png", model::now(), base_idx + offset);
+            for png_fmt in png_clipboard_formats() {
+                if png_fmt == 0 {
+                    continue;
+                }
                 let handle = GetClipboardData(png_fmt);
                 if !handle.is_null() {
                     let size = GlobalSize(handle);
@@ -941,86 +1197,45 @@ impl State {
                         let decoded = image::load_from_memory(data).ok();
                         GlobalUnlock(handle);
                         if let Some(img) = decoded {
-                            img.into_rgba8().save(dir.join(&name)).ok()?;
-                            return Some(name);
+                            let name = next_name(0);
+                            if img.into_rgba8().save(dir.join(&name)).is_ok() {
+                                out.push(name);
+                                return out;
+                            }
                         }
                     } else if !ptr.is_null() {
                         GlobalUnlock(handle);
                     }
                 }
             }
-            let mut handle = GetClipboardData(8); // CF_DIB
-            if handle.is_null() {
-                handle = GetClipboardData(17); // CF_DIBV5
-            }
-            if !handle.is_null() {
-                let size = GlobalSize(handle);
-                if size >= 40 {
-                    let ptr = GlobalLock(handle) as *const u8;
-                    if !ptr.is_null() {
-                        let data = std::slice::from_raw_parts(ptr, size);
-                        let header_size =
-                            u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-                        let w = i32::from_le_bytes(data[4..8].try_into().ok()?);
-                        let h_raw = i32::from_le_bytes(data[8..12].try_into().ok()?);
-                        let bpp = u16::from_le_bytes(data[14..16].try_into().ok()?) as usize;
-                        let comp = u32::from_le_bytes(data[16..20].try_into().ok()?);
-                        let clr_used =
-                            u32::from_le_bytes(data[32..36].try_into().ok()?) as usize;
-                        if header_size >= 40
-                            && w > 0
-                            && h_raw != 0
-                            && w <= 8192
-                            && h_raw.abs() <= 8192
-                            && matches!(bpp, 24 | 32)
-                            && matches!(comp, 0 | 3)
-                        {
-                            let mask_bytes =
-                                if comp == 3 && header_size == 40 { 12 } else { 0 };
-                            let palette_bytes = if clr_used > 0 { clr_used * 4 } else { 0 };
-                            let pixel_offset = header_size + mask_bytes + palette_bytes;
-                            let width = w as usize;
-                            let height = h_raw.unsigned_abs() as usize;
-                            let stride = ((width * bpp + 31) / 32) * 4;
-                            if pixel_offset + stride * height <= data.len() {
-                                let pixels = &data[pixel_offset..];
-                                let mut rgba = vec![255u8; width * height * 4];
-                                let mut any_alpha = false;
-                                for y in 0..height {
-                                    let src_y = if h_raw > 0 { height - 1 - y } else { y };
-                                    let row = &pixels
-                                        [src_y * stride..src_y * stride + width * (bpp / 8)];
-                                    for x in 0..width {
-                                        let s = x * (bpp / 8);
-                                        let d = (y * width + x) * 4;
-                                        rgba[d] = row[s + 2];
-                                        rgba[d + 1] = row[s + 1];
-                                        rgba[d + 2] = row[s];
-                                        if bpp == 32 {
-                                            let a = row[s + 3];
-                                            if a != 0 {
-                                                any_alpha = true;
-                                            }
-                                            rgba[d + 3] = a;
-                                        }
-                                    }
+            for fmt in [17u32, 8u32] {
+                let handle = GetClipboardData(fmt); // CF_DIBV5 then CF_DIB
+                if !handle.is_null() {
+                    let size = GlobalSize(handle);
+                    if size >= 40 {
+                        let ptr = GlobalLock(handle) as *const u8;
+                        if !ptr.is_null() {
+                            let data = std::slice::from_raw_parts(ptr, size);
+                            let decoded = decode_dib_to_rgba(data);
+                            GlobalUnlock(handle);
+                            if let Some(img) = decoded {
+                                let name = next_name(0);
+                                if img.save(dir.join(&name)).is_ok() {
+                                    out.push(name);
+                                    return out;
                                 }
-                                GlobalUnlock(handle);
-                                if bpp == 32 && !any_alpha {
-                                    for p in rgba.chunks_exact_mut(4) {
-                                        p[3] = 255;
-                                    }
-                                }
-                                let img = image::RgbaImage::from_raw(
-                                    width as u32,
-                                    height as u32,
-                                    rgba,
-                                )?;
-                                img.save(dir.join(&name)).ok()?;
-                                return Some(name);
                             }
                         }
-                        GlobalUnlock(handle);
+                    }
+                }
+            }
+            let bmp_handle = GetClipboardData(2); // CF_BITMAP
+            if !bmp_handle.is_null() {
+                if let Some(img) = decode_hbitmap_to_rgba(bmp_handle as HBITMAP) {
+                    let name = next_name(0);
+                    if img.save(dir.join(&name)).is_ok() {
+                        out.push(name);
+                        return out;
                     }
                 }
             }
@@ -1035,9 +1250,8 @@ impl State {
                     for path_str in paths {
                         let p = std::path::Path::new(&path_str);
                         if is_image_path(p) {
-                            if let Ok(img) = image::open(p) {
-                                img.into_rgba8().save(dir.join(&name)).ok()?;
-                                return Some(name);
+                            if let Some(name) = save_image_file(&self.root, p, base_idx + out.len()) {
+                                out.push(name);
                             }
                         }
                     }
@@ -1045,31 +1259,35 @@ impl State {
                     GlobalUnlock(drop_handle);
                 }
             }
-            None
+            out
         })();
         CloseClipboard();
-        if let Some(name) = saved_name {
-            note.images.push(name);
+        if !saved_names.is_empty() {
+            note.images.extend(saved_names);
             note.updated_at = model::now();
             self.events.borrow_mut().push(Event::Note(note.clone()));
             PostMessageW(self.board, EVENTS, 0, 0);
         }
     }
-    fn hit(&self, p: [f32; 2]) -> Option<usize> {
+    fn toolbar_rect(&self) -> Option<[f32; 4]> {
         let width = self.rect[2] - self.rect[0];
         let height = self.rect[3] - self.rect[1];
-        if self.note.is_none()
-            || typography::compact_card([width, height])
-            || p[1] < height - 32.
-            || p[1] > height - 7.
-        {
+        if self.note.is_none() || typography::compact_card([width, height]) {
             return None;
         }
         let count = LABELS.len() as f32;
         let bw = ((width - 24.) / count).min(25.);
         let left = width - 12. - bw * count;
+        Some([left, height - 32., left + bw * count, height - 7.])
+    }
+    fn hit(&self, p: [f32; 2]) -> Option<usize> {
+        let tr = self.toolbar_rect()?;
+        if !inside(p, tr) {
+            return None;
+        }
+        let bw = (tr[2] - tr[0]) / LABELS.len() as f32;
         (0..LABELS.len()).find(|&i| {
-            let x = left + i as f32 * bw;
+            let x = tr[0] + i as f32 * bw;
             p[0] >= x && p[0] < x + bw - 3.
         })
     }
@@ -1118,9 +1336,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 y: point(l)[1] as i32,
             };
             ScreenToClient(hwnd, &mut p);
-            if s.hit([p.x as f32 / s.dpi, p.y as f32 / s.dpi]).is_some()
-                || inside([p.x as f32 / s.dpi, p.y as f32 / s.dpi], s.text_rect)
-            {
+            let pt = [p.x as f32 / s.dpi, p.y as f32 / s.dpi];
+            if s.toolbar_rect().is_some_and(|r| inside(pt, r)) || inside(pt, s.text_rect) {
                 HTCLIENT as isize
             } else {
                 HTTRANSPARENT as isize

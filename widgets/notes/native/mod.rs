@@ -4,6 +4,7 @@ mod icons;
 mod layout;
 mod lenses;
 pub mod model;
+mod richtext;
 mod settings;
 mod theme;
 mod typography;
@@ -40,18 +41,15 @@ unsafe fn compute_image_rects(
     if note.images.is_empty() {
         return vec![];
     }
-    let text = note.plain();
     let content_x = card_rect[0] + type_scale.left;
     let text_w = (card_rect[2] - content_x - 16.).max(type_scale.body);
-    let text_lines = if text.trim().is_empty() {
-        0
-    } else {
-        typography.line_count(&text, text_w, dpi, type_scale.body)
-    };
+    let (text_empty, lines) =
+        richtext::wrap_note(note, text_w, dpi, type_scale.body, typography);
+    let text_lines = if text_empty { 0 } else { lines.len() };
     let mut img_y = card_rect[1]
         + type_scale.top
         + (text_lines as f32) * type_scale.leading
-        + if text.trim().is_empty() { 0. } else { 6. };
+        + if text_empty { 0. } else { 6. };
     let mut rects = Vec::with_capacity(note.images.len());
     for name in &note.images {
         if let Some((iw, ih, _)) = image_cache.get(name) {
@@ -328,6 +326,7 @@ impl Host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         SetWindowTextW(hwnd, wide("Lumen · Sticky Notes").as_ptr());
+        windows_sys::Win32::UI::Shell::DragAcceptFiles(hwnd, 1);
         {
             let mut state = s.borrow_mut();
             state.hwnd = hwnd;
@@ -489,7 +488,15 @@ impl State {
             match event {
                 editor::Event::Note(note) => {
                     if let Some(old) = self.board.notes.iter_mut().find(|n| n.id == note.id) {
+                        let layout_changed = old.images != note.images
+                            || old.body != note.body
+                            || old.rtf != note.rtf;
+                        let id = note.id.clone();
                         *old = note;
+                        self.card_cache.remove(&id);
+                        if layout_changed {
+                            self.place_editor();
+                        }
                         self.schedule();
                     }
                 }
@@ -678,6 +685,15 @@ impl State {
         }
         None
     }
+    unsafe fn sync_editor_images(&self, note_id: &str) {
+        if let Some(e) = &self.editor {
+            if e.note_id().as_deref() == Some(note_id) {
+                if let Some(note) = self.board.notes.iter().find(|n| n.id == note_id) {
+                    e.sync_images(&note.images);
+                }
+            }
+        }
+    }
     unsafe fn delete_selected_image(&mut self) {
         let Some((note_id, idx)) = self.selected_image.take() else {
             return;
@@ -695,6 +711,7 @@ impl State {
             None
         };
         if let Some(name) = removed_name {
+            self.sync_editor_images(&note_id);
             let still_used = self
                 .board
                 .notes
@@ -740,6 +757,7 @@ impl State {
                 note.images.insert(insert_at, img);
                 note.updated_at = model::now();
                 self.selected_image = Some((from_id.to_string(), insert_at));
+                self.sync_editor_images(from_id);
                 self.card_cache.remove(from_id);
                 self.place_editor();
                 self.schedule();
@@ -763,6 +781,8 @@ impl State {
                 dst.updated_at = model::now();
                 let new_idx = dst.images.len() - 1;
                 self.selected_image = Some((target_id.clone(), new_idx));
+                self.sync_editor_images(from_id);
+                self.sync_editor_images(&target_id);
                 self.card_cache.remove(from_id);
                 self.card_cache.remove(&target_id);
                 self.place_editor();
@@ -846,6 +866,110 @@ impl State {
     }
     unsafe fn viewport(&self) -> [f32; 2] {
         self.chrome().viewport()
+    }
+    fn point_in_widget(&self, p: [f32; 2]) -> bool {
+        let size = unsafe { self.dimensions() };
+        p[0] >= 0.
+            && p[1] >= 0.
+            && p[0] < size[0]
+            && p[1] < size[1]
+            && crate::compositor::distance(p[0], p[1], size[0], size[1], 30., 0.) <= 0.
+    }
+    unsafe fn cursor_in_widget(&self) -> bool {
+        let mut pt: POINT = zeroed();
+        if GetCursorPos(&mut pt) == 0 || ScreenToClient(self.hwnd, &mut pt) == 0 {
+            return false;
+        }
+        self.point_in_widget([pt.x as f32 / self.dpi, pt.y as f32 / self.dpi])
+    }
+    unsafe fn handle_mouse_leave(&mut self, inside_widget: bool) {
+        self.hover = None;
+        let keep_bar = inside_widget || self.scrollbar_drag.is_some();
+        if self.scrollbar_visible != keep_bar {
+            self.scrollbar_visible = keep_bar;
+        }
+        self.sync_hover();
+        InvalidateRect(self.hwnd, null(), 0);
+    }
+    unsafe fn handle_editor_hover(&mut self, hovered: bool, inside_widget: bool) {
+        let mut redraw = false;
+        if self.editor_hovered != hovered {
+            self.editor_hovered = hovered;
+            self.sync_hover();
+            redraw = true;
+        }
+        let want_bar = hovered || self.scrollbar_drag.is_some() || inside_widget;
+        if self.scrollbar_visible != want_bar {
+            self.scrollbar_visible = want_bar;
+            redraw = true;
+        }
+        if redraw {
+            InvalidateRect(self.hwnd, null(), 0);
+        }
+    }
+    unsafe fn drop_files(&mut self, hdrop: windows_sys::Win32::UI::Shell::HDROP) {
+        use windows_sys::Win32::UI::Shell::{DragFinish, DragQueryFileW, DragQueryPoint};
+        let count = DragQueryFileW(hdrop, u32::MAX, null_mut(), 0);
+        if count == 0 {
+            DragFinish(hdrop);
+            return;
+        }
+        let mut pt: POINT = zeroed();
+        DragQueryPoint(hdrop, &mut pt);
+        let p = [pt.x as f32 / self.dpi, pt.y as f32 / self.dpi];
+        let mut paths = Vec::new();
+        for idx in 0..count {
+            let len = DragQueryFileW(hdrop, idx, null_mut(), 0);
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; (len + 1) as usize];
+            if DragQueryFileW(hdrop, idx, buf.as_mut_ptr(), len + 1) > 0 {
+                let nul = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                let path = PathBuf::from(String::from_utf16_lossy(&buf[..nul]));
+                if editor::is_image_path(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        DragFinish(hdrop);
+        if paths.is_empty() {
+            return;
+        }
+        let target_id = self
+            .layout()
+            .into_iter()
+            .find(|(_, r)| inside(p, *r))
+            .map(|(id, _)| id)
+            .or_else(|| self.editor.as_ref().and_then(|e| e.note_id()))
+            .or_else(|| self.board.create().ok());
+        let Some(id) = target_id else {
+            return;
+        };
+        let existing_len = self
+            .board
+            .notes
+            .iter()
+            .find(|n| n.id == id)
+            .map_or(0, |n| n.images.len());
+        let mut added = Vec::new();
+        for (i, path) in paths.iter().enumerate() {
+            if let Some(name) = editor::save_image_file(&self.root, path, existing_len + i) {
+                added.push(name);
+            }
+        }
+        if added.is_empty() {
+            return;
+        }
+        if let Some(note) = self.board.notes.iter_mut().find(|n| n.id == id) {
+            note.images.extend(added);
+            note.updated_at = model::now();
+        }
+        self.sync_editor_images(&id);
+        self.card_cache.remove(&id);
+        self.place_editor();
+        self.schedule();
+        InvalidateRect(self.hwnd, null(), 0);
     }
     fn hovered_card_id(&self) -> Option<String> {
         match &self.hover {
@@ -932,36 +1056,36 @@ impl State {
         let width = (w - inset * 2. - gap * (cols - 1) as f32) / cols as f32;
         let text_width = (width - type_scale.left - 16.).max(type_scale.body);
         let dpi = self.dpi;
-        let notes_meta: Vec<(String, String, Vec<String>, bool)> = list
+        let notes_meta: Vec<(String, usize, Vec<String>, bool, bool)> = list
             .iter()
             .map(|&index| {
                 let note = &self.board.notes[index];
-                let plain = note.plain();
-                let empty = plain.trim().is_empty() && note.images.is_empty();
-                (note.id.clone(), plain, note.images.clone(), empty)
+                let (text_empty, rich_lines) = richtext::wrap_note(
+                    note,
+                    text_width,
+                    dpi,
+                    type_scale.body,
+                    &mut self.typography,
+                );
+                let empty = text_empty && note.images.is_empty();
+                (
+                    note.id.clone(),
+                    rich_lines.len(),
+                    note.images.clone(),
+                    text_empty,
+                    empty,
+                )
             })
             .collect();
         let mut out = Vec::with_capacity(notes_meta.len());
         let mut row_top = top;
         for chunk in notes_meta.chunks(cols) {
             let mut row_height = 0f32;
-            for (col, (id, plain, images, empty)) in chunk.iter().enumerate() {
+            for (col, (id, lines, images, text_empty, empty)) in chunk.iter().enumerate() {
                 let img_h = self.images_height(images, text_width);
-                let img_gap = if img_h > 0. && !plain.trim().is_empty() {
-                    6.
-                } else {
-                    0.
-                };
-                let lines = if *empty {
-                    1
-                } else if plain.trim().is_empty() {
-                    0
-                } else {
-                    self.typography
-                        .line_count(plain, text_width, dpi, type_scale.body)
-                };
+                let img_gap = if img_h > 0. && !*text_empty { 6. } else { 0. };
                 let needed = type_scale.top
-                    + (lines as f32) * type_scale.leading
+                    + (*lines as f32) * type_scale.leading
                     + img_gap
                     + img_h
                     + 34.;
@@ -1298,19 +1422,16 @@ impl State {
                 );
             }
         }
-        let text = note.plain();
         let content_x = x + type_scale.left;
         let text_w = (right - content_x - 16.).max(type_scale.body);
-        let text_lines = if text.trim().is_empty() {
-            if note.images.is_empty() { 1 } else { 0 }
-        } else {
-            typography.line_count(&text, text_w, dpi, type_scale.body)
-        };
+        let (text_empty, rich_lines) =
+            richtext::wrap_note(note, text_w, dpi, type_scale.body, typography);
+        let text_lines = if text_empty { 0 } else { rich_lines.len() };
         if !note.images.is_empty() {
             let mut img_y = y
                 + type_scale.top
                 + (text_lines as f32) * type_scale.leading
-                + if text.trim().is_empty() { 0. } else { 6. };
+                + if text_empty { 0. } else { 6. };
             for name in &note.images {
                 if let Some((iw, ih, image)) = image_cache.get(name) {
                     if *iw > 0 {
@@ -1327,31 +1448,17 @@ impl State {
         if !draw_text {
             return;
         }
-        let preview = if text.trim().is_empty() && note.images.is_empty() {
-            "Write something…".into()
-        } else {
-            text.clone()
-        };
         let compact_card = typography::compact_card([right - x, bottom - y]);
-        for (i, line) in typography
-            .lines(&preview, text_w, dpi, type_scale.body, usize::MAX)
-            .iter()
-            .enumerate()
-        {
-            let top = y + type_scale.top + i as f32 * type_scale.leading;
-            c.text(
-                line,
-                [content_x, top, right - 16., top + type_scale.leading],
-                type_scale.body,
-                false,
-                if text.trim().is_empty() {
-                    card_muted
-                } else {
-                    card_ink
-                },
-                0,
-            );
-        }
+        richtext::draw_lines(
+            c,
+            &rich_lines,
+            content_x,
+            right - 16.,
+            y + type_scale.top,
+            type_scale.leading,
+            type_scale.body,
+            if text_empty { card_muted } else { card_ink },
+        );
         if !compact_card {
             c.text(
                 &icons::note_day(note.updated_at),
@@ -2312,6 +2419,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                     s.palette_note = None;
                     InvalidateRect(hwnd, null(), 0);
                 }
+            } else if !s.cursor_in_widget() {
+                s.handle_mouse_leave(false);
             }
             0
         }
@@ -2365,18 +2474,41 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_MOUSELEAVE => {
-            s.hover = None;
-            s.scrollbar_visible = false;
-            s.sync_hover();
-            InvalidateRect(hwnd, null(), 0);
+            let inside_widget = s.cursor_in_widget();
+            s.handle_mouse_leave(inside_widget);
+            0
+        }
+        WM_NCMOUSEMOVE => {
+            if !s.scrollbar_visible {
+                s.scrollbar_visible = true;
+                InvalidateRect(hwnd, null(), 0);
+            }
+            if s.hover.take().is_some() {
+                s.sync_hover();
+                InvalidateRect(hwnd, null(), 0);
+            }
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE | TME_NONCLIENT,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut track);
+            drop(s);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+        0x02A2 /* WM_NCMOUSELEAVE */ => {
+            let inside_widget = s.cursor_in_widget();
+            s.handle_mouse_leave(inside_widget);
+            0
+        }
+        WM_DROPFILES => {
+            s.drop_files(w as windows_sys::Win32::UI::Shell::HDROP);
             0
         }
         EDITOR_HOVER => {
-            let hovered = w != 0;
-            if s.editor_hovered != hovered {
-                s.editor_hovered = hovered;
-                s.sync_hover();
-            }
+            let inside_widget = s.cursor_in_widget();
+            s.handle_editor_hover(w != 0, inside_widget);
             0
         }
         EDITOR_FOCUS => {
@@ -3339,6 +3471,165 @@ mod tests {
         }
         crate::glass::set_liquid_glass(prev_lg);
         crate::glass::set_frosted_glass(prev_fg);
+    }
+    #[test]
+    fn scrollbar_stays_visible_while_pointer_inside_widget_and_editor() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-scrollbar-hover-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            {
+                let mut s = host.state.borrow_mut();
+                s.board.notes.clear();
+                s.board.create().unwrap();
+                let id = s.board.notes[0].id.clone();
+                s.scrollbar_visible = true;
+
+                // Leaving the board HWND while still inside the widget/editor bounds keeps scrollbar visible.
+                s.handle_mouse_leave(true);
+                assert!(s.scrollbar_visible);
+
+                // Hovering into and across Editor toolbar keeps scrollbar visible while cursor is inside widget.
+                s.handle_editor_hover(true, true);
+                assert!(s.scrollbar_visible);
+                assert!(s.editor_hovered);
+                s.handle_editor_hover(false, true);
+                assert!(s.scrollbar_visible);
+
+                // Opening the editor gives a gap-free HTCLIENT hit box across the formatting toolbar.
+                s.open_editor(Some(id));
+                let layout = s.layout();
+                let r = layout[0].1;
+                let width = r[2] - r[0];
+                let height = r[3] - r[1];
+                let bw = ((width - 24.) / 6.).min(25.);
+                let left = width - 12. - bw * 6.;
+                let editor_hwnd = {
+                    let e = s.editor.as_ref().unwrap();
+                    e.input_hwnd()
+                };
+                let editor_parent = GetParent(editor_hwnd);
+                let mut pt = POINT {
+                    x: ((left + bw - 1.5) * s.dpi).round() as i32,
+                    y: ((height - 19.) * s.dpi).round() as i32,
+                };
+                ClientToScreen(editor_parent, &mut pt);
+                let lparam = (((pt.y as i16 as u16) as usize) << 16) | (pt.x as i16 as u16) as usize;
+                assert_eq!(
+                    SendMessageW(editor_parent, WM_NCHITTEST, 0, lparam as isize),
+                    HTCLIENT as isize,
+                    "3 DIP gaps between formatting buttons must stay HTCLIENT so hover never flickers"
+                );
+                s.finish_editor();
+
+                // Leaving the outer widget hides the scrollbar.
+                s.handle_mouse_leave(false);
+                assert!(!s.scrollbar_visible);
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+    #[test]
+    fn exiting_editor_preserves_formatting_fonts_lists_and_images() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-preserve-rich-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            let dir = model::images_dir(&root);
+            std::fs::create_dir_all(&dir).unwrap();
+            let img = image::RgbaImage::from_pixel(120, 60, image::Rgba([16, 210, 48, 255]));
+            img.save(dir.join("note-pic.png")).unwrap();
+
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            {
+                let mut s = host.state.borrow_mut();
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (360. * s.dpi).round() as i32,
+                    (520. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                s.board.notes.clear();
+                s.board.create().unwrap();
+                let id = s.board.notes[0].id.clone();
+                s.board.notes[0].body = "Bold Bullet".into();
+                s.board.notes[0].rtf = Some(
+                    r#"{\rtf1\ansi\deff0{\fonttbl{\f0\fnil Segoe UI Variable Text;}{\f1\fmodern Consolas;}}\viewkind4\uc1{\*\pn\pnlvlblt\pnf1\pnindent0{\pntxtb\'b7}}\fi-240\li240\f1\fs28\b Bold \i Italic \ul Under\ulnone\i0\b0\par}"#
+                        .into(),
+                );
+                s.board.notes[0].images.push("note-pic.png".into());
+
+                // Enter editor (triggers place_editor -> apply_line_spacing), toggle Strike via click, and exit.
+                let pre_rect = s.layout()[0].1;
+                let bw = ((pre_rect[2] - pre_rect[0] - 24.) / 6.).min(25.);
+                let left = pre_rect[2] - pre_rect[0] - 12. - bw * 6.;
+                let height = pre_rect[3] - pre_rect[1];
+                s.open_editor(Some(id.clone()));
+                let edit_hwnd = s.editor.as_ref().unwrap().input_hwnd();
+                let editor_parent = GetParent(edit_hwnd);
+                SendMessageW(edit_hwnd, 0x00B1, 0, 4); // EM_SETSEL first 4 chars before clicking Strike
+                let click_x = ((left + 3. * bw + 4.) * s.dpi).round() as i32;
+                let click_y = ((height - 19.) * s.dpi).round() as i32;
+                let click_l = (((click_y as i16 as u16) as usize) << 16) | (click_x as i16 as u16) as usize;
+                SendMessageW(editor_parent, WM_LBUTTONDOWN, 1, click_l as isize);
+                SendMessageW(editor_parent, WM_LBUTTONUP, 0, click_l as isize);
+                s.finish_editor();
+
+                let saved = s.board.notes.iter().find(|n| n.id == id).unwrap().clone();
+                let rtf = saved.rtf.as_deref().unwrap();
+                assert!(rtf.contains("Consolas"), "Custom font must survive editor roundtrip: {rtf}");
+                assert!(rtf.contains("\\b"), "Bold must survive exit");
+                assert!(rtf.contains("\\i"), "Italic must survive exit");
+                assert!(rtf.contains("\\ul"), "Underline must survive exit");
+                assert!(rtf.contains("\\strike"), "Clicked Strike formatting must persist after exit: {rtf}");
+                assert_eq!(saved.images, vec!["note-pic.png".to_string()]);
+
+                // Measure rich rendering without entering editor again.
+                s.board.notes[0].images.clear();
+                s.paint();
+                let no_img_frame = s.frame.as_ref().unwrap().snapshot();
+                s.board.notes[0].images.push("note-pic.png".into());
+                s.card_cache.clear();
+                s.paint();
+                let card_rect = s.layout()[0].1;
+                let rects = s.note_image_rects(&id, card_rect);
+                assert_eq!(rects.len(), 1);
+                let ir = rects[0];
+                let frame = s.frame.as_ref().unwrap();
+                let pixels = frame.snapshot();
+                let ix = (((ir[0] + ir[2]) * 0.5) * s.dpi) as usize;
+                let iy = (((ir[1] + ir[3]) * 0.5) * s.dpi) as usize;
+                let pidx = (iy * frame.width as usize + ix) * 4;
+                assert!(
+                    pixels[pidx + 1] > pixels[pidx] + 60 && pixels[pidx + 1] > no_img_frame[pidx + 1] + 20,
+                    "Attached image must render in card after exiting input mode"
+                );
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }
 

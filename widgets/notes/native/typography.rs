@@ -1,7 +1,7 @@
 //! Shared content type scale for all Notes designs. Native fonts, no stretched
 //! text bitmaps. The measurement DC/font and bounded wrap cache belong to State.
 use super::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy)]
 pub struct Metrics {
@@ -94,6 +94,7 @@ pub struct Typography {
     dpi: f32,
     size: f32,
     cache: VecDeque<(Key, Vec<String>)>,
+    styled_fonts: HashMap<(String, i32, u8), HFONT>,
 }
 impl Default for Typography {
     fn default() -> Self {
@@ -104,6 +105,7 @@ impl Default for Typography {
             dpi: 0.,
             size: 0.,
             cache: VecDeque::new(),
+            styled_fonts: HashMap::new(),
         }
     }
 }
@@ -122,7 +124,14 @@ impl Typography {
                 if !self.font.is_null() {
                     DeleteObject(self.font);
                 }
+                for (_, f) in self.styled_fonts.drain() {
+                    if !f.is_null() {
+                        DeleteObject(f);
+                    }
+                }
                 DeleteDC(self.dc);
+            } else {
+                self.styled_fonts.clear();
             }
             self.dc = null_mut();
             self.font = null_mut();
@@ -171,6 +180,86 @@ impl Typography {
             return text.len() as f32 * self.size * 0.6;
         }
         extent.cx as f32 / self.dpi
+    }
+    /// Measure a styled text span with matching font face, size, bold, and italic.
+    pub unsafe fn measure_styled(
+        &mut self,
+        text: &str,
+        family: Option<&str>,
+        dpi: f32,
+        size: f32,
+        bold: bool,
+        italic: bool,
+    ) -> f32 {
+        if text.is_empty() {
+            return 0.;
+        }
+        self.prepare(dpi, size);
+        let default_face = family.is_none_or(|f| {
+            let t = f.trim();
+            t.is_empty()
+                || t.eq_ignore_ascii_case("Segoe UI Variable Text")
+                || t.eq_ignore_ascii_case("Segoe UI")
+        });
+        if default_face && !bold && !italic && (self.size - size).abs() < 0.01 {
+            return self.measure(text);
+        }
+        if self.dc.is_null() {
+            return text.chars().count() as f32 * size * 0.6;
+        }
+        let face_name = family
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .unwrap_or("Segoe UI Variable Text");
+        let style_bits = u8::from(bold) | (u8::from(italic) << 1);
+        let px_h = (size * dpi).round().max(1.) as i32;
+        let key = (face_name.to_ascii_lowercase(), px_h, style_bits);
+        if !self.styled_fonts.contains_key(&key) {
+            if self.styled_fonts.len() >= 64 {
+                if !self.font.is_null() {
+                    SelectObject(self.dc, self.font);
+                }
+                for (_, f) in self.styled_fonts.drain() {
+                    if !f.is_null() {
+                        DeleteObject(f);
+                    }
+                }
+            }
+            let hfont = CreateFontW(
+                -px_h,
+                0,
+                0,
+                0,
+                if bold { 700 } else { 400 },
+                u32::from(italic),
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                0,
+                0,
+                CLEARTYPE_QUALITY as u32,
+                0,
+                wide(face_name).as_ptr(),
+            );
+            self.styled_fonts.insert(key.clone(), hfont);
+        }
+        let hfont = self.styled_fonts.get(&key).copied().unwrap_or(null_mut());
+        let prev = if !hfont.is_null() {
+            SelectObject(self.dc, hfont)
+        } else {
+            null_mut()
+        };
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let mut extent: SIZE = zeroed();
+        let ok = GetTextExtentPoint32W(self.dc, utf16.as_ptr(), utf16.len() as i32, &mut extent);
+        if !prev.is_null() {
+            SelectObject(self.dc, prev);
+        }
+        if ok == 0 {
+            text.chars().count() as f32 * size * 0.6
+        } else {
+            extent.cx as f32 / self.dpi
+        }
     }
     pub unsafe fn line_count(
         &mut self,

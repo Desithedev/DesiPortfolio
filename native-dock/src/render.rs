@@ -92,6 +92,10 @@ extern "system" {
     fn GdipCreateFont(family: Ptr, size: f32, style: i32, unit: i32, out: *mut Ptr) -> i32;
     fn GdipDeleteFont(font: Ptr) -> i32;
     fn GdipCreateStringFormat(flags: i32, language: u16, out: *mut Ptr) -> i32;
+    fn GdipStringFormatGetGenericTypographic(out: *mut Ptr) -> i32;
+    fn GdipCloneStringFormat(format: Ptr, out: *mut Ptr) -> i32;
+    fn GdipGetStringFormatFlags(format: Ptr, flags: *mut i32) -> i32;
+    fn GdipSetStringFormatFlags(format: Ptr, flags: i32) -> i32;
     fn GdipDeleteStringFormat(format: Ptr) -> i32;
     fn GdipSetStringFormatAlign(format: Ptr, align: i32) -> i32;
     fn GdipSetStringFormatLineAlign(format: Ptr, align: i32) -> i32;
@@ -163,6 +167,7 @@ struct ShadowSurface {
 thread_local! {static GROUPS:RefCell<HashMap<(u32,u32,u32,u32),Image>>=RefCell::new(HashMap::new());}
 thread_local! {static SHADOWS:RefCell<HashMap<(u32,u32,u32,u32,u32),ShadowSurface>>=RefCell::new(HashMap::new());}
 thread_local! {static FONTS:RefCell<HashMap<(i32,u16),CachedFont>>=RefCell::new(HashMap::new());}
+thread_local! {static CUSTOM_FONTS:RefCell<HashMap<(String,i32,u8),CachedFont>>=RefCell::new(HashMap::new());}
 unsafe fn font_at(size: f32, weight: u16) -> Ptr {
     FONTS.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -212,6 +217,60 @@ unsafe fn font_at(size: f32, weight: u16) -> Ptr {
         entry.font
     })
 }
+unsafe fn styled_font_at(family_name: Option<&str>, size: f32, style: u8) -> Ptr {
+    let style = style & 0x0f;
+    let Some(name) = family_name.map(str::trim).filter(|s| {
+        !s.is_empty()
+            && !s.eq_ignore_ascii_case("Segoe UI Variable Text")
+            && !s.eq_ignore_ascii_case("Segoe UI")
+    }) else {
+        return font_at(size, 400 | ((style as u16) << 12));
+    };
+    CUSTOM_FONTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = (name.to_ascii_lowercase(), (size * 64.).round() as i32, style);
+        if !cache.contains_key(&key) && cache.len() >= 128 {
+            cache.clear();
+        }
+        let entry = cache.entry(key).or_insert_with(|| {
+            let mut family = null_mut();
+            if GdipCreateFontFamilyFromName(wide(name).as_ptr(), null_mut(), &mut family) != 0
+                && GdipCreateFontFamilyFromName(
+                    wide("Segoe UI Variable Text").as_ptr(),
+                    null_mut(),
+                    &mut family,
+                ) != 0
+            {
+                GdipCreateFontFamilyFromName(wide("Segoe UI").as_ptr(), null_mut(), &mut family);
+            }
+            let mut font = null_mut();
+            GdipCreateFont(family, size, style as i32, 2, &mut font);
+            CachedFont { font, family }
+        });
+        entry.font
+    })
+}
+unsafe fn rich_string_format() -> Ptr {
+    let mut base = null_mut();
+    let mut format = null_mut();
+    if GdipStringFormatGetGenericTypographic(&mut base) == 0 && !base.is_null() {
+        GdipCloneStringFormat(base, &mut format);
+    }
+    if format.is_null() {
+        GdipCreateStringFormat(0x0800 | 0x1000 | 0x4000, 0, &mut format);
+    }
+    if !format.is_null() {
+        let mut flags = 0i32;
+        if GdipGetStringFormatFlags(format, &mut flags) == 0 {
+            // Measure trailing spaces and keep single-line runs typographic without glyph clipping.
+            GdipSetStringFormatFlags(format, (flags | 0x0800 | 0x1000 | 0x4000) & !0x2000);
+        }
+        GdipSetStringFormatAlign(format, 0);
+        GdipSetStringFormatLineAlign(format, 1);
+        GdipSetStringFormatTrimming(format, 0);
+    }
+    format
+}
 pub struct Runtime(usize);
 impl Runtime {
     pub fn start() -> Result<Self, String> {
@@ -249,6 +308,7 @@ impl Drop for Runtime {
     fn drop(&mut self) {
         clear_caches();
         FONTS.with(|fonts| fonts.borrow_mut().clear());
+        CUSTOM_FONTS.with(|fonts| fonts.borrow_mut().clear());
         unsafe {
             GdiplusShutdown(self.0);
         }
@@ -2175,6 +2235,93 @@ impl Canvas {
                 self.g,
                 text.as_ptr(),
                 text.len() as i32 - 1,
+                font,
+                &r,
+                format,
+                brush,
+            );
+            GdipDeleteBrush(brush);
+            GdipDeleteStringFormat(format);
+        }
+    }
+    /// Measure an inline rich-text run using typographic GDI+ metrics (including trailing spaces).
+    pub fn measure_rich_run(&self, text: &str, family: Option<&str>, size: f32, style: u8) -> f32 {
+        if text.is_empty() {
+            return 0.;
+        }
+        unsafe {
+            let font = styled_font_at(family, size * self.scale, style);
+            let format = rich_string_format();
+            let layout = Rect {
+                x: 0.,
+                y: 0.,
+                w: 10000.,
+                h: 1000.,
+            };
+            let mut bounds = Rect {
+                x: 0.,
+                y: 0.,
+                w: 0.,
+                h: 0.,
+            };
+            let wtext = wide(text);
+            let result = GdipMeasureString(
+                self.g,
+                wtext.as_ptr(),
+                wtext.len() as i32 - 1,
+                font,
+                &layout,
+                format,
+                &mut bounds,
+                null_mut(),
+                null_mut(),
+            );
+            GdipDeleteStringFormat(format);
+            if result == 0 {
+                bounds.w / self.scale
+            } else {
+                text.chars().count() as f32 * size * 0.55
+            }
+        }
+    }
+    /// Draw an inline rich-text run with custom font family, size, and style bits (1=B, 2=I, 4=U, 8=S).
+    pub fn text_rich_run(
+        &self,
+        text: &str,
+        r: [f32; 4],
+        family: Option<&str>,
+        size: f32,
+        style: u8,
+        color: u32,
+        opacity: u8,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        unsafe {
+            GdipSetTextRenderingHint(
+                self.g,
+                if self.transform.get()[3].abs() < 0.001 {
+                    3
+                } else {
+                    4
+                },
+            );
+            let font = styled_font_at(family, size * self.scale, style);
+            let format = rich_string_format();
+            let mut brush = null_mut();
+            GdipCreateSolidFill(argb(color, opacity), &mut brush);
+            let r = Rect {
+                x: r[0] * self.scale,
+                y: r[1] * self.scale,
+                w: (r[2] - r[0]).max(1.) * self.scale,
+                h: (r[3] - r[1]).max(1.) * self.scale,
+            };
+            let wtext = wide(text);
+            GdipDrawString(
+                self.g,
+                wtext.as_ptr(),
+                wtext.len() as i32 - 1,
                 font,
                 &r,
                 format,

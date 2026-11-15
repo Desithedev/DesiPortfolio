@@ -14,6 +14,50 @@ pub const DESIGNS: [&str; 4] = ["lumen", "notebook", "index", "honey"];
 pub fn images_dir(root: &Path) -> std::path::PathBuf {
     root.join("config/notes-images")
 }
+fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
+    if dib.len() < 40 {
+        return None;
+    }
+    let header_size = u32::from_le_bytes(dib[0..4].try_into().ok()?) as usize;
+    if header_size < 40 || header_size > dib.len() {
+        return None;
+    }
+    let bpp = u16::from_le_bytes(dib[14..16].try_into().ok()?) as usize;
+    let comp = u32::from_le_bytes(dib[16..20].try_into().ok()?);
+    let clr_used = u32::from_le_bytes(dib[32..36].try_into().ok()?) as usize;
+    let mask_bytes = if header_size == 40 && comp == 3 {
+        12
+    } else if header_size == 40 && comp == 6 {
+        16
+    } else {
+        0
+    };
+    let palette_entries = if header_size == 40 && comp == 3 && clr_used == 3 {
+        0
+    } else if clr_used > 0 {
+        clr_used
+    } else if bpp <= 8 {
+        1usize << bpp
+    } else {
+        0
+    };
+    let pixel_offset = 14usize
+        .checked_add(header_size)?
+        .checked_add(mask_bytes)?
+        .checked_add(palette_entries.checked_mul(4)?)?;
+    if pixel_offset >= 14 + dib.len() {
+        return None;
+    }
+    let file_size = 14usize.checked_add(dib.len())?;
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0u8; 4]);
+    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some(bmp)
+}
+
 pub fn extract_rtf_pictures(note: &mut Note, root: &Path) -> bool {
     let Some(rtf) = note.rtf.as_deref() else {
         return false;
@@ -52,7 +96,8 @@ pub fn extract_rtf_pictures(note: &mut Note, root: &Path) -> bool {
         }
         let group = &rtf[start..i];
         let mut saved = false;
-        if group.contains("\\pngblip") || group.contains("\\jpegblip") {
+        let is_dib = group.contains("\\dibitmap");
+        if group.contains("\\pngblip") || group.contains("\\jpegblip") || is_dib {
             let mut hex = Vec::new();
             let gb = group.as_bytes();
             let mut j = 1;
@@ -116,11 +161,22 @@ pub fn extract_rtf_pictures(note: &mut Note, root: &Path) -> bool {
                         u8::from_str_radix(s, 16).ok()
                     })
                     .collect();
-                if let Ok(img) = image::load_from_memory(&decoded) {
+                let encoded = if is_dib && !decoded.starts_with(b"BM") {
+                    dib_to_bmp(&decoded).unwrap_or(decoded)
+                } else {
+                    decoded
+                };
+                if let Ok(img) = image::load_from_memory(&encoded) {
+                    let mut rgba = img.into_rgba8();
+                    if is_dib && rgba.pixels().all(|p| p[3] == 0) {
+                        for p in rgba.pixels_mut() {
+                            p[3] = 255;
+                        }
+                    }
                     let dir = images_dir(root);
                     if fs::create_dir_all(&dir).is_ok() {
                         let name = format!("img-{}-{}.png", now(), note.images.len());
-                        if img.into_rgba8().save(dir.join(&name)).is_ok() {
+                        if rgba.save(dir.join(&name)).is_ok() {
                             note.images.push(name);
                             saved = true;
                             changed = true;
@@ -736,6 +792,29 @@ mod tests {
         assert!(images_dir(&root).join(&b.notes[0].images[0]).exists());
         assert!(!b.notes[0].rtf.as_deref().unwrap().contains("\\pict"));
         assert!(!extract_rtf_pictures(&mut b.notes[0], &root));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn extract_rtf_pictures_migrates_dibitmap() {
+        let root = std::env::temp_dir()
+            .join(format!("lumen-notes-dib-{}-{}", std::process::id(), now()));
+        fs::create_dir_all(root.join("config")).unwrap();
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 140, 220, 255]));
+        let mut bmp = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bmp), image::ImageFormat::Bmp)
+            .unwrap();
+        let dib = &bmp[14..];
+        let hex: String = dib.iter().map(|b| format!("{b:02x}")).collect();
+        let mut b = Board::default();
+        b.create().unwrap();
+        b.notes[0].body = "Dib".into();
+        b.notes[0].rtf = Some(format!(
+            "{{\\rtf1\\ansi Dib{{\\pict\\dibitmap\\picw2\\pich2 {hex}}}\\par}}"
+        ));
+        assert!(extract_rtf_pictures(&mut b.notes[0], &root));
+        assert_eq!(b.notes[0].images.len(), 1);
+        assert!(images_dir(&root).join(&b.notes[0].images[0]).exists());
+        assert!(!b.notes[0].rtf.as_deref().unwrap().contains("\\pict"));
         fs::remove_dir_all(root).unwrap();
     }
 }
