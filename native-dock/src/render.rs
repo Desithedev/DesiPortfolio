@@ -395,21 +395,68 @@ impl Image {
         }
         Self::from_rgba(side, side, rgba)
     }
-    pub fn max_opaque_extent(&self) -> [u32; 2] {
+    pub fn opaque_bounds(&self) -> [u32; 4] {
         let Some(pixels) = &self._pixels else {
-            return [self.width, self.height];
+            return [0, 0, self.width, self.height];
         };
+        let (mut min_x, mut min_y) = (self.width, self.height);
         let (mut max_x, mut max_y) = (0u32, 0u32);
         for y in 0..self.height {
             for x in 0..self.width {
                 let a = pixels[((y * self.width + x) as usize) * 4 + 3];
                 if a > 8 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
                     max_x = max_x.max(x + 1);
                     max_y = max_y.max(y + 1);
                 }
             }
         }
-        [max_x, max_y]
+        if max_x <= min_x || max_y <= min_y {
+            [0, 0, 0, 0]
+        } else {
+            [min_x, min_y, max_x, max_y]
+        }
+    }
+    pub fn max_opaque_extent(&self) -> [u32; 2] {
+        let [x0, y0, x1, y1] = self.opaque_bounds();
+        [x1.saturating_sub(x0), y1.saturating_sub(y0)]
+    }
+    /// Crop excessive transparent padding when Windows packs a small 16-48px
+    /// file/app glyph inside a 256x256 jumbo/shell canvas.
+    pub fn trim_padded_icon(self) -> Self {
+        let [x0, y0, x1, y1] = self.opaque_bounds();
+        let bw = x1.saturating_sub(x0);
+        let bh = y1.saturating_sub(y0);
+        let min_dim = self.width.min(self.height);
+        if bw == 0 || bh == 0 || min_dim == 0 || bw.max(bh) > (min_dim * 55) / 100 {
+            return self;
+        }
+        let Some(pixels) = &self._pixels else {
+            return self;
+        };
+        let side = ((bw.max(bh) as f32) * 1.16).ceil().max(1.0) as u32;
+        let cx = (x0 + x1) as i32 / 2;
+        let cy = (y0 + y1) as i32 / 2;
+        let sx0 = cx - side as i32 / 2;
+        let sy0 = cy - side as i32 / 2;
+        let mut rgba = vec![0u8; (side as usize) * (side as usize) * 4];
+        for dy in 0..side {
+            let sy = sy0 + dy as i32;
+            if sy < 0 || sy >= self.height as i32 {
+                continue;
+            }
+            for dx in 0..side {
+                let sx = sx0 + dx as i32;
+                if sx < 0 || sx >= self.width as i32 {
+                    continue;
+                }
+                let src = ((sy as u32 * self.width + sx as u32) as usize) * 4;
+                let dst = ((dy * side + dx) as usize) * 4;
+                rgba[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+            }
+        }
+        Self::from_rgba(side, side, rgba).unwrap_or(self)
     }
     pub fn load(path: &Path) -> Option<Self> {
         let decoded = image::open(path).ok()?.into_rgba8();
@@ -1556,7 +1603,7 @@ impl Canvas {
             GdipDeletePath(path);
         }
     }
-    fn reflection_edge(&self, r: [f32; 4], radius: f32, amount: f32) {
+    pub fn reflection_edge(&self, r: [f32; 4], radius: f32, amount: f32) {
         unsafe {
             let edge = self.path(r, radius);
             for (point, strength, span) in [

@@ -521,6 +521,7 @@ impl State {
         if self.background.is_none() || fusion_changed || move_backdrop_dirty {
             let reuse_frost = fusion_changed
                 && !move_backdrop_dirty
+                && !crate::glass::liquid_glass()
                 && self.background.is_some()
                 && self.frost.is_some();
             if !self.moving && !reuse_frost {
@@ -2192,6 +2193,116 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn fusion_change_with_liquid_glass_invalidates_reuse_frost() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass());
+        crate::glass::set_liquid_glass(true);
+
+        unsafe {
+            let _runtime = render::Runtime::start().unwrap();
+            let root = test_root("music-liquid-fusion-invalidation");
+            std::fs::create_dir_all(&root).unwrap();
+            let wave_path = root.join("wave.png");
+            let mut wave_img = image::RgbaImage::new(256, 256);
+            for y in 0..256u32 {
+                for x in 0..256u32 {
+                    wave_img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            ((x * 3 + y) % 255) as u8,
+                            ((y * 2 + 40) % 255) as u8,
+                            210,
+                            255,
+                        ]),
+                    );
+                }
+            }
+            wave_img.save(&wave_path).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::fixture_tiled_file(&wave_path, 14., 1.)));
+            crate::fusion::init(glass.clone());
+            let host = Host::create(&root, glass, false, true).unwrap();
+            let hwnd = host.state.borrow().hwnd;
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                -19600,
+                -20000,
+                320,
+                260,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            crate::fusion::register_widget(hwnd);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            crate::fusion::prepare(hwnd, 34.);
+            InvalidateRect(hwnd, null(), 0);
+            SendMessageW(hwnd, WM_PAINT, 0, 0);
+            let frost_before = host
+                .state
+                .borrow()
+                .frost
+                .as_ref()
+                .expect("initial Music frost image")
+                .identity();
+            let rev_before = host.state.borrow().fusion_revision;
+
+            // Attach an adjacent widget on Music's left edge without moving Music.
+            let neighbor = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                wide("STATIC").as_ptr(),
+                wide("Music fusion neighbor").as_ptr(),
+                WS_POPUP,
+                -19600 - 200 + 8,
+                -20000,
+                200,
+                260,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!neighbor.is_null());
+            crate::fusion::register_widget(neighbor);
+            ShowWindow(neighbor, SW_SHOWNOACTIVATE);
+            crate::fusion::prepare(neighbor, 30.);
+            let mut nbuf = Buffer::new(200, 260, 1., 30.).unwrap();
+            let nb = CreateSolidBrush(0x3070d0);
+            FillRect(nbuf.dc, &RECT { left: 0, top: 0, right: 200, bottom: 260 }, nb);
+            DeleteObject(nb);
+            nbuf.background_alpha(255);
+            nbuf.bevel_for(neighbor);
+            assert!(nbuf.present_with_alpha(neighbor, true));
+            crate::fusion::refresh();
+            assert!(crate::fusion::fused(hwnd), "Music must fuse with adjacent neighbor");
+
+            InvalidateRect(hwnd, null(), 0);
+            SendMessageW(hwnd, WM_PAINT, 0, 0);
+            let s = host.state.borrow();
+            let frost_after = s.frost.as_ref().expect("rebuilt Music frost image").identity();
+            assert_ne!(
+                s.fusion_revision, rev_before,
+                "Music must advance cached fusion_revision on attach"
+            );
+            assert_ne!(
+                frost_after, frost_before,
+                "reuse_frost must stay disabled under Liquid Glass when fusion_changed fires"
+            );
+            drop(s);
+
+            DestroyWindow(neighbor);
+            drop(host);
+            crate::fusion::shutdown();
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 }

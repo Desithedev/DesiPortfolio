@@ -269,8 +269,12 @@ pub struct GlassConstants {
     pub flags: [f32; 4],      // [frosted, liquid, frost_strength, opacity]
     pub nested_count: u32,
     pub has_content: u32,
-    pub _pad: [u32; 2],
+    pub fuse_line_count: u32,
+    pub fuse_corner_count: u32,
     pub nested: [NestedGlassRect; 8],
+    pub fuse_lines: [[f32; 4]; 32],
+    pub fuse_corner_c: [[f32; 4]; 32],
+    pub fuse_corner_uv: [[f32; 4]; 32],
 }
 
 #[repr(C)]
@@ -291,9 +295,13 @@ cbuffer GlassCB : register(b0) {
     float4 flags; // x=frosted, y=liquid, z=frost_strength, w=opacity
     uint nested_count;
     uint has_content;
-    uint2 _pad;
+    uint fuse_line_count;
+    uint fuse_corner_count;
     float4 nested_rect[8];
     float4 nested_meta[8]; // x=radius, y=tint_alpha
+    float4 fuse_lines[32];     // x0, y0, x1, y1 in local window px
+    float4 fuse_corner_c[32];  // cx, cy, radius, +1 convex / -1 concave
+    float4 fuse_corner_uv[32]; // -v.x, -v.y, u.x, u.y
 };
 
 cbuffer BlurCB : register(b1) {
@@ -697,15 +705,15 @@ impl GpuSurface {
             *mut *mut c_void,
         ) -> HRESULT = std::mem::transmute(*gpu.dxgi_factory.vtable().add(24));
         let mut sc_ptr = null_mut();
-        if create_sc(
+        let hr_sc = create_sc(
             gpu.dxgi_factory.as_ptr(),
             gpu.device.as_ptr(),
             &desc,
             null_mut(),
             &mut sc_ptr,
-        ) < 0
-            || sc_ptr.is_null()
-        {
+        );
+        if hr_sc < 0 || sc_ptr.is_null() {
+            eprintln!("gpu::GpuSurface::new create_sc failed hr=0x{:08x}", hr_sc as u32);
             return None;
         }
         let swapchain = ComPtr(sc_ptr);
@@ -718,8 +726,9 @@ impl GpuSurface {
             *mut *mut c_void,
         ) -> HRESULT = std::mem::transmute(*gpu.dcomp.vtable().add(6));
         let mut target_ptr = null_mut();
-        if create_target(gpu.dcomp.as_ptr(), hwnd, 1, &mut target_ptr) < 0 || target_ptr.is_null()
-        {
+        let hr_target = create_target(gpu.dcomp.as_ptr(), hwnd, 1, &mut target_ptr);
+        if hr_target < 0 || target_ptr.is_null() {
+            eprintln!("gpu::GpuSurface::new create_target failed hr=0x{:08x}", hr_target as u32);
             return None;
         }
         let target = ComPtr(target_ptr);
@@ -727,7 +736,9 @@ impl GpuSurface {
         let create_visual: extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT =
             std::mem::transmute(*gpu.dcomp.vtable().add(7));
         let mut visual_ptr = null_mut();
-        if create_visual(gpu.dcomp.as_ptr(), &mut visual_ptr) < 0 || visual_ptr.is_null() {
+        let hr_vis = create_visual(gpu.dcomp.as_ptr(), &mut visual_ptr);
+        if hr_vis < 0 || visual_ptr.is_null() {
+            eprintln!("gpu::GpuSurface::new create_visual failed hr=0x{:08x}", hr_vis as u32);
             return None;
         }
         let visual = ComPtr(visual_ptr);
@@ -797,11 +808,6 @@ impl GpuSurface {
         }
         self.source_w = w;
         self.source_h = h;
-        if let Some(sc2) = &self.swapchain2 {
-            let set_source: extern "system" fn(*mut c_void, u32, u32) -> HRESULT =
-                std::mem::transmute(*sc2.vtable().add(29));
-            let _ = set_source(sc2.as_ptr(), w as u32, h as u32);
-        }
         reallocated
     }
 
@@ -935,11 +941,15 @@ pub unsafe fn present_bgra(hwnd: HWND, w: i32, h: i32, bgra: &[u8]) -> bool {
             radius: 0.0,
             dpi: 1.0,
             tint_color: [0.0; 4],
-            flags: [0.0, 0.0, 0.0, 0.0],
+            flags: [0.0; 4],
             nested_count: 0,
             has_content: 1,
-            _pad: [0; 2],
+            fuse_line_count: 0,
+            fuse_corner_count: 0,
             nested: [NestedGlassRect::default(); 8],
+            fuse_lines: [[0.0; 4]; 32],
+            fuse_corner_c: [[0.0; 4]; 32],
+            fuse_corner_uv: [[0.0; 4]; 32],
         };
         surface.present(gpu, &constants);
         true
@@ -1026,7 +1036,7 @@ unsafe fn create_sampler(device: &ComPtr, addr: u32) -> Option<ComPtr> {
         max_lod: f32::MAX,
     };
     let f: extern "system" fn(*mut c_void, *const D3D11SamplerDesc, *mut *mut c_void) -> HRESULT =
-        std::mem::transmute(*device.vtable().add(22));
+        std::mem::transmute(*device.vtable().add(23));
     let mut out = null_mut();
     (f(device.as_ptr(), &desc, &mut out) >= 0 && !out.is_null()).then(|| ComPtr(out))
 }
@@ -1351,8 +1361,12 @@ mod tests {
                 flags: [1.0, 1.0, 0.85, 1.0],
                 nested_count: 1,
                 has_content: 0,
-                _pad: [0; 2],
+                fuse_line_count: 0,
+                fuse_corner_count: 0,
                 nested: [NestedGlassRect::default(); 8],
+                fuse_lines: [[0.0; 4]; 32],
+                fuse_corner_c: [[0.0; 4]; 32],
+                fuse_corner_uv: [[0.0; 4]; 32],
             };
             constants.nested[0] = NestedGlassRect {
                 rect: [20.0, 20.0, 140.0, 60.0],

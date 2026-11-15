@@ -7,17 +7,17 @@ type Point = [f32; 2];
 pub(crate) struct Corner {
     pub(crate) min: Point,
     pub(crate) max: Point,
-    center: Point,
-    a: Point,
-    b: Point,
-    u: Point,
-    v: Point,
-    radius: f32,
-    convex: bool,
+    pub(crate) center: Point,
+    pub(crate) a: Point,
+    pub(crate) b: Point,
+    pub(crate) u: Point,
+    pub(crate) v: Point,
+    pub(crate) radius: f32,
+    pub(crate) convex: bool,
 }
 pub struct Outline {
     rects: Vec<[f32; 4]>,
-    h_lines: Vec<[f32; 3]>,
+    pub(crate) h_lines: Vec<[f32; 3]>,
     pub(crate) v_lines: Vec<[f32; 3]>,
     pub(crate) corners: Vec<Corner>,
 }
@@ -55,7 +55,7 @@ fn coordinates(panes: &[Pane], axis: usize, tolerance: f32) -> Vec<f32> {
 }
 impl Outline {
     fn new(panes: &[Pane]) -> Self {
-        let tolerance = panes.iter().map(|p| p.dpi).fold(1f32, f32::max) * 1.5;
+        let tolerance = panes.iter().map(|p| p.dpi).fold(1f32, f32::max) * 2.0;
         let xs = coordinates(panes, 0, tolerance);
         let ys = coordinates(panes, 1, tolerance);
         let nearest = |a: f32, values: &[f32]| {
@@ -184,8 +184,8 @@ impl Outline {
                 let v = vertices[i];
                 let before = sub(v, vertices[(i + vertices.len() - 1) % vertices.len()]);
                 let after = sub(vertices[(i + 1) % vertices.len()], v);
-                let bl = length(before);
-                let al = length(after);
+                let bl = length(before).max(1e-3);
+                let al = length(after).max(1e-3);
                 let u = [before[0] / bl, before[1] / bl];
                 let w = [after[0] / al, after[1] / al];
                 let r = radius.min(bl * 0.5).min(al * 0.5);

@@ -1335,7 +1335,9 @@ impl State {
                 );
             }
             let c = Canvas::new(frame.dc, self.dpi);
+            let fused = crate::fusion::fused(self.hwnd);
             let pane = [0., 0., w, h];
+            let paint_r = if fused { 0. } else { 30. };
             let tint = if frosted {
                 self.config.tint / 100.
             } else {
@@ -1346,7 +1348,7 @@ impl State {
             } else {
                 c.round(
                     pane,
-                    30.,
+                    paint_r,
                     crate::surface::color(
                         &self.config.palette,
                         self.glass.borrow().wallpaper_accent(),
@@ -1357,9 +1359,9 @@ impl State {
                 );
             }
             if design == "soft-violet" {
-                c.round(pane, 30., rgb(229, 233, 232), 205, false, false);
+                c.round(pane, paint_r, rgb(229, 233, 232), 205, false, false);
             }
-            c.coating(pane, 30.);
+            c.coating(pane, paint_r);
             c.draw_pane_overlay(
                 [r.right as u32, r.bottom as u32],
                 self.dpi,
@@ -1367,7 +1369,7 @@ impl State {
                 light,
                 pane,
             );
-            c.widget_corner_reflection_for(self.hwnd, pane, 30., light);
+            c.widget_corner_reflection_for(self.hwnd, pane, paint_r, light);
             drop(c);
             frame.bevel_for(self.hwnd);
             self.ink = Some(

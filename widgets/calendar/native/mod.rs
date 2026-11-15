@@ -713,8 +713,14 @@ impl State {
             }
             // Fill the complete backing. The compositor owns the single rounded
             // contour; independently rounding this material multiplies edge alpha.
+            let fused = crate::fusion::fused(self.hwnd);
             let pane = layout::background_rect(w, h);
-            let chrome = [4., 4., w - 4., h - 4.];
+            let chrome = if fused {
+                [0., 0., w, h]
+            } else {
+                [4., 4., w - 4., h - 4.]
+            };
+            let chrome_r = if fused { 0. } else { radius };
             let blend = if frosted {
                 self.config.tint / 100.
             } else {
@@ -733,7 +739,7 @@ impl State {
             }
             crate::surface::paint(&c, pane, &self.config.palette, blend);
             self.paint_agenda_sidebar(frame.dc, w, h);
-            c.coating(chrome, radius);
+            c.coating(chrome, chrome_r);
             c.draw_pane_overlay(
                 [r.right as u32, r.bottom as u32],
                 self.dpi,
@@ -741,7 +747,7 @@ impl State {
                 light,
                 [0., 0., w, h],
             );
-            c.widget_corner_reflection_for(self.hwnd, chrome, radius, light);
+            c.widget_corner_reflection_for(self.hwnd, chrome, chrome_r, light);
             drop(c);
             frame.bevel_for(self.hwnd);
             self.ink = Some(

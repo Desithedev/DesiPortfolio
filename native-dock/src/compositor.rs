@@ -23,6 +23,10 @@ struct Rim {
     liquid_spec: f32,
 }
 #[inline]
+pub(crate) fn liquid_spec_width(dpi: f32, w: f32, h: f32) -> f32 {
+    0.32 * (44.0 * dpi).min(w.min(h) * 0.45).max(1.0)
+}
+#[inline]
 pub(crate) fn liquid_rim_spec(d: f32, nx: f32, ny: f32, spec_w: f32) -> f32 {
     if d > 0.5 || -d >= spec_w {
         return 0.;
@@ -262,7 +266,7 @@ impl Buffer {
         let h = height as f32;
         let radius = radius * dpi;
         let inset = 4. * dpi;
-        let spec_w = 0.32 * (44.0 * dpi).min(w.min(h) * 0.45).max(1.0);
+        let spec_w = liquid_spec_width(dpi, w, h);
         let rim_limit = (6. * dpi).max(spec_w);
         for y in 0..if shape { height } else { 0 } {
             for x in 0..width {
@@ -363,6 +367,11 @@ impl Buffer {
     }
     /// Internal seams do not get a second bright rim. The fused signed-distance
     /// outline controls both the bevel and the final antialiased coverage.
+    ///
+    /// For shared-wallpaper widgets, we publish and blend only the chrome delta
+    /// (`chrome - wallpaper`) across fused seams so themes, tints, coatings,
+    /// and overlays bleed smoothly across neighbors without blurring the
+    /// underlying shared wallpaper.
     pub unsafe fn bevel_for(&mut self, hwnd: HWND) {
         crate::fusion::prepare(hwnd, self.radius);
         if crate::fusion::may_fuse() && !crate::fusion::is_moving(hwnd) {
@@ -384,128 +393,130 @@ impl Buffer {
             if let Some(material) =
                 crate::fusion::shared_material(hwnd, self.width, self.height, self.dpi)
             {
-                GdiFlush();
-                let pixels = std::slice::from_raw_parts_mut(
-                    self.bits,
-                    (self.width * self.height * 4) as usize,
-                );
-                if let Some(own) = panes.iter().find(|p| p.id == hwnd as usize) {
-                    struct Seam {
-                        vertical: bool,
-                        seam: f32,
-                        span: [f32; 2],
-                        scale: f32,
-                        bounds: [i32; 4],
-                    }
-                    let a = own.rect;
-                    let seams: Vec<Seam> = panes
-                        .iter()
-                        .filter(|p| crate::fusion::geometry::adjacent(own, p))
-                        .map(|p| {
-                            let b = p.rect;
-                            let scale = own.dpi.max(p.dpi);
-                            let reach_n = 140. * scale;
-                            let reach_t = 80. * scale;
-                            let vertical = crate::fusion::geometry::touching_edges(a[2], b[0], scale)
-                                || crate::fusion::geometry::touching_edges(b[2], a[0], scale);
-                            if vertical {
-                                let seam = if crate::fusion::geometry::touching_edges(
-                                    a[2], b[0], scale,
-                                ) {
-                                    (a[2] + b[0]) * 0.5
+                    GdiFlush();
+                    let pixels = std::slice::from_raw_parts_mut(
+                        self.bits,
+                        (self.width * self.height * 4) as usize,
+                    );
+                    if let Some(own) = panes.iter().find(|p| p.id == hwnd as usize) {
+                        struct Seam {
+                            vertical: bool,
+                            seam: f32,
+                            span: [f32; 2],
+                            scale: f32,
+                            bounds: [i32; 4],
+                        }
+                        let a = own.rect;
+                        let seams: Vec<Seam> = panes
+                            .iter()
+                            .filter(|p| crate::fusion::geometry::adjacent(own, p))
+                            .map(|p| {
+                                let b = p.rect;
+                                let scale = own.dpi.max(p.dpi);
+                                let reach_n = 140. * scale;
+                                let reach_t = 80. * scale;
+                                let vertical =
+                                    crate::fusion::geometry::touching_edges(a[2], b[0], scale)
+                                        || crate::fusion::geometry::touching_edges(b[2], a[0], scale);
+                                if vertical {
+                                    let seam = if crate::fusion::geometry::touching_edges(
+                                        a[2], b[0], scale,
+                                    ) {
+                                        (a[2] + b[0]) * 0.5
+                                    } else {
+                                        (a[0] + b[2]) * 0.5
+                                    };
+                                    let span = [a[1].max(b[1]), a[3].min(b[3])];
+                                    Seam {
+                                        vertical: true,
+                                        seam,
+                                        span,
+                                        scale,
+                                        bounds: [
+                                            ((seam - reach_n - rect.left as f32).floor() as i32)
+                                                .clamp(0, self.width),
+                                            ((span[0] - reach_t - rect.top as f32).floor() as i32)
+                                                .clamp(0, self.height),
+                                            ((seam + reach_n - rect.left as f32).ceil() as i32)
+                                                .clamp(0, self.width),
+                                            ((span[1] + reach_t - rect.top as f32).ceil() as i32)
+                                                .clamp(0, self.height),
+                                        ],
+                                    }
                                 } else {
-                                    (a[0] + b[2]) * 0.5
-                                };
-                                let span = [a[1].max(b[1]), a[3].min(b[3])];
-                                Seam {
-                                    vertical: true,
-                                    seam,
-                                    span,
-                                    scale,
-                                    bounds: [
-                                        ((seam - reach_n - rect.left as f32).floor() as i32)
-                                            .clamp(0, self.width),
-                                        ((span[0] - reach_t - rect.top as f32).floor() as i32)
-                                            .clamp(0, self.height),
-                                        ((seam + reach_n - rect.left as f32).ceil() as i32)
-                                            .clamp(0, self.width),
-                                        ((span[1] + reach_t - rect.top as f32).ceil() as i32)
-                                            .clamp(0, self.height),
-                                    ],
+                                    let seam = if crate::fusion::geometry::touching_edges(
+                                        a[3], b[1], scale,
+                                    ) {
+                                        (a[3] + b[1]) * 0.5
+                                    } else {
+                                        (a[1] + b[3]) * 0.5
+                                    };
+                                    let span = [a[0].max(b[0]), a[2].min(b[2])];
+                                    Seam {
+                                        vertical: false,
+                                        seam,
+                                        span,
+                                        scale,
+                                        bounds: [
+                                            ((span[0] - reach_t - rect.left as f32).floor() as i32)
+                                                .clamp(0, self.width),
+                                            ((seam - reach_n - rect.top as f32).floor() as i32)
+                                                .clamp(0, self.height),
+                                            ((span[1] + reach_t - rect.left as f32).ceil() as i32)
+                                                .clamp(0, self.width),
+                                            ((seam + reach_n - rect.top as f32).ceil() as i32)
+                                                .clamp(0, self.height),
+                                        ],
+                                    }
                                 }
-                            } else {
-                                let seam = if crate::fusion::geometry::touching_edges(
-                                    a[3], b[1], scale,
-                                ) {
-                                    (a[3] + b[1]) * 0.5
-                                } else {
-                                    (a[1] + b[3]) * 0.5
-                                };
-                                let span = [a[0].max(b[0]), a[2].min(b[2])];
-                                Seam {
-                                    vertical: false,
-                                    seam,
-                                    span,
-                                    scale,
-                                    bounds: [
-                                        ((span[0] - reach_t - rect.left as f32).floor() as i32)
-                                            .clamp(0, self.width),
-                                        ((seam - reach_n - rect.top as f32).floor() as i32)
-                                            .clamp(0, self.height),
-                                        ((span[1] + reach_t - rect.left as f32).ceil() as i32)
-                                            .clamp(0, self.width),
-                                        ((seam + reach_n - rect.top as f32).ceil() as i32)
-                                            .clamp(0, self.height),
-                                    ],
+                            })
+                            .collect();
+                        let x_min = seams.iter().map(|s| s.bounds[0]).min().unwrap_or(0);
+                        let y_min = seams.iter().map(|s| s.bounds[1]).min().unwrap_or(0);
+                        let x_max = seams.iter().map(|s| s.bounds[2]).max().unwrap_or(0);
+                        let y_max = seams.iter().map(|s| s.bounds[3]).max().unwrap_or(0);
+                        for y in y_min..y_max {
+                            let gy = rect.top as f32 + y as f32 + 0.5;
+                            for x in x_min..x_max {
+                                let gx = rect.left as f32 + x as f32 + 0.5;
+                                let mut weight = 0f32;
+                                for s in &seams {
+                                    if x < s.bounds[0]
+                                        || x >= s.bounds[2]
+                                        || y < s.bounds[1]
+                                        || y >= s.bounds[3]
+                                    {
+                                        continue;
+                                    }
+                                    let (normal, tangent) = if s.vertical {
+                                        (
+                                            (gx - s.seam).abs(),
+                                            (s.span[0] - gy).max(gy - s.span[1]).max(0.),
+                                        )
+                                    } else {
+                                        (
+                                            (gy - s.seam).abs(),
+                                            (s.span[0] - gx).max(gx - s.span[1]).max(0.),
+                                        )
+                                    };
+                                    weight = weight.max(crate::fusion::geometry::material_weight(
+                                        normal, tangent, s.scale,
+                                    ));
                                 }
-                            }
-                        })
-                        .collect();
-                    let x_min = seams.iter().map(|s| s.bounds[0]).min().unwrap_or(0);
-                    let y_min = seams.iter().map(|s| s.bounds[1]).min().unwrap_or(0);
-                    let x_max = seams.iter().map(|s| s.bounds[2]).max().unwrap_or(0);
-                    let y_max = seams.iter().map(|s| s.bounds[3]).max().unwrap_or(0);
-                    for y in y_min..y_max {
-                        let gy = rect.top as f32 + y as f32 + 0.5;
-                        for x in x_min..x_max {
-                            let gx = rect.left as f32 + x as f32 + 0.5;
-                            let mut weight = 0f32;
-                            for s in &seams {
-                                if x < s.bounds[0]
-                                    || x >= s.bounds[2]
-                                    || y < s.bounds[1]
-                                    || y >= s.bounds[3]
-                                {
-                                    continue;
-                                }
-                                let (normal, tangent) = if s.vertical {
-                                    (
-                                        (gx - s.seam).abs(),
-                                        (s.span[0] - gy).max(gy - s.span[1]).max(0.),
-                                    )
-                                } else {
-                                    (
-                                        (gy - s.seam).abs(),
-                                        (s.span[0] - gx).max(gx - s.span[1]).max(0.),
-                                    )
-                                };
-                                weight = weight.max(crate::fusion::geometry::material_weight(
-                                    normal, tangent, s.scale,
-                                ));
-                            }
-                            if weight > 0. {
-                                let i = ((y * self.width + x) * 4) as usize;
-                                let color = material.sample(gx, gy);
-                                for c in 0..3 {
-                                    pixels[i + c] =
-                                        (pixels[i + c] as f32 * (1. - weight) + color[c] * weight)
-                                            .round() as u8;
+                                if weight > 0. {
+                                    let i = ((y * self.width + x) * 4) as usize;
+                                    let color = material.sample(gx, gy);
+                                    for c in 0..3 {
+                                        pixels[i + c] = (pixels[i + c] as f32 * (1. - weight)
+                                            + color[c] * weight)
+                                            .round()
+                                            as u8;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
         }
         self.bevel_inner(group.map(|p| (p, [rect.left as f32, rect.top as f32])));
     }
@@ -525,7 +536,7 @@ impl Buffer {
             let w = self.width;
             let h = self.height;
             let dpi = self.dpi;
-            let spec_w = 0.32 * (44.0 * dpi).min((w.min(h) as f32) * 0.45).max(1.0);
+            let spec_w = liquid_spec_width(dpi, w as f32, h as f32);
             let band = (self.radius + 10.) * dpi + if liquid { spec_w } else { 0. };
             let min_d = if liquid { -spec_w } else { -2.5 * dpi };
             crate::fusion::geometry::with_outline(panes, |outline| {
@@ -1208,16 +1219,19 @@ impl Buffer {
     pub unsafe fn upload_alpha(&self, hwnd: HWND, opacity: u8) -> bool {
         let pending = crate::fusion::pending_move_point(hwnd);
         if crate::gpu::is_gpu_window(hwnd) {
-            if let Some(pt) = pending {
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    pt.x,
-                    pt.y,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
+            let mut wr: RECT = std::mem::zeroed();
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+            let need_size = (wr.right - wr.left) != self.width || (wr.bottom - wr.top) != self.height;
+            if pending.is_some() || need_size {
+                let (x, y) = pending.map(|p| (p.x, p.y)).unwrap_or((wr.left, wr.top));
+                let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+                if pending.is_none() {
+                    flags |= SWP_NOMOVE;
+                }
+                if !need_size {
+                    flags |= SWP_NOSIZE;
+                }
+                SetWindowPos(hwnd, null_mut(), x, y, self.width, self.height, flags);
             }
             GdiFlush();
             let len = self.width as usize * self.height as usize * 4;
@@ -1236,6 +1250,8 @@ impl Buffer {
             return crate::gpu::present_bgra(hwnd, self.width, self.height, &scaled);
         }
         let origin = POINT { x: 0, y: 0 };
+        #[cfg(test)]
+        test_capture::record(hwnd, pending, self.width, self.height, self.bits);
         let size = SIZE {
             cx: self.width,
             cy: self.height,
@@ -1944,5 +1960,79 @@ mod tests {
             let b = distance(180. - x as f32, 18., 180., 100., 34., 4.);
             assert!((a - b).abs() < 0.001);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_capture {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    pub(crate) struct CapturedUpload {
+        pub rect: [i32; 4],
+        pub w: i32,
+        pub h: i32,
+        pub bgra: Vec<u8>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<(bool, HashMap<isize, CapturedUpload>)> =
+            RefCell::new((false, HashMap::new()));
+    }
+
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            CAPTURES.with(|c| {
+                let mut borrow = c.borrow_mut();
+                borrow.0 = false;
+                borrow.1.clear();
+            });
+        }
+    }
+
+    pub(crate) fn start() -> Guard {
+        CAPTURES.with(|c| {
+            let mut borrow = c.borrow_mut();
+            borrow.0 = true;
+            borrow.1.clear();
+        });
+        Guard
+    }
+
+    pub(crate) fn get(hwnd: HWND) -> Option<CapturedUpload> {
+        CAPTURES.with(|c| c.borrow().1.get(&(hwnd as isize)).cloned())
+    }
+
+    pub(crate) unsafe fn record(
+        hwnd: HWND,
+        pending: Option<POINT>,
+        w: i32,
+        h: i32,
+        bits: *const u8,
+    ) {
+        let active = CAPTURES.with(|c| c.borrow().0);
+        if !active || hwnd.is_null() || bits.is_null() || w <= 0 || h <= 0 {
+            return;
+        }
+        GdiFlush();
+        let mut wr: RECT = zeroed();
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+        let left = pending.map_or(wr.left, |p| p.x);
+        let top = pending.map_or(wr.top, |p| p.y);
+        let bgra = std::slice::from_raw_parts(bits, (w * h * 4) as usize).to_vec();
+        CAPTURES.with(|c| {
+            c.borrow_mut().1.insert(
+                hwnd as isize,
+                CapturedUpload {
+                    rect: [left, top, left + w, top + h],
+                    w,
+                    h,
+                    bgra,
+                },
+            );
+        });
     }
 }

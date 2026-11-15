@@ -29,6 +29,34 @@ pub unsafe fn draw_translucent_nested_glass(
     c.coating(rect, radius);
 }
 
+/// Draws the shared translucent Liquid Glass search surface above `backing`
+/// at any widget opacity (including `100%`), restoring optical edge refraction
+/// when stationary and keeping the search pill rendered above the backdrop.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn draw_search_glass(
+    dc: windows_sys::Win32::Graphics::Gdi::HDC,
+    dpi: f32,
+    backing: Option<&crate::compositor::Buffer>,
+    rect: [f32; 4],
+    radius: f32,
+    accent: u32,
+    light: bool,
+    opacity: f32,
+    moving: bool,
+    draw_pill_surface: bool,
+) {
+    if !moving && (opacity < 100. || crate::glass::liquid_glass()) {
+        if let Some(bg) = backing {
+            bg.restore_glass_card(dc, rect, radius);
+        }
+    }
+    if draw_pill_surface {
+        let c = crate::render::Canvas::new(dc, dpi);
+        c.search_surface(rect, radius, accent, light);
+        c.round(rect, radius, accent, 35, false, false);
+    }
+}
+
 pub unsafe fn start_resize(hwnd: HWND, resizing: &mut bool, shadow: Option<&WindowShadow>) {
     *resizing = true;
     crate::glass::set_resizing(hwnd, true);
@@ -218,6 +246,73 @@ mod tests {
             ShowWindow(owner, SW_HIDE);
             DestroyWindow(owner);
         }
+
+        // Shared search glass renders curved liquid glass + tint above the backdrop
+        // at both 100% and reduced widget opacities, without stamping stale backing
+        // while the window is moving.
+        let prev_liquid = crate::glass::liquid_glass();
+        crate::glass::set_liquid_glass(true);
+        unsafe {
+            let backing = Buffer::plain(160, 80, 1.).expect("backing buffer");
+            {
+                let c = Canvas::new(backing.dc, 1.);
+                c.round([0., 0., 160., 80.], 0., 0x001e3c72, 255, false, false);
+                c.round([12., 12., 148., 44.], 8., 0x003468c8, 255, false, false);
+            }
+            crate::render::flush(backing.dc);
+            let backing_px = backing.snapshot();
+
+            // 100% opacity: curved rim + surface render distinctly on top of backdrop.
+            let full = Buffer::plain(160, 80, 1.).expect("full frame");
+            full.copy_from(backing.dc);
+            draw_search_glass(
+                full.dc,
+                1.,
+                Some(&backing),
+                [16., 14., 144., 46.],
+                16.,
+                0x00583818,
+                false,
+                100.,
+                false,
+                true,
+            );
+            crate::render::flush(full.dc);
+            let full_px = full.snapshot();
+            let rim = ((16 * 160 + 24) * 4) as usize;
+            let rim_diff = full_px[rim].abs_diff(backing_px[rim]) as u32
+                + full_px[rim + 1].abs_diff(backing_px[rim + 1]) as u32
+                + full_px[rim + 2].abs_diff(backing_px[rim + 2]) as u32;
+            assert!(
+                rim_diff > 6,
+                "search glass rim must render visibly above backdrop at 100% opacity (diff={rim_diff})"
+            );
+            assert_eq!(full_px[rim + 3], 255);
+
+            // Reduced opacity: glass pill restores full alpha over translucent chrome.
+            let mut faded = Buffer::plain(160, 80, 1.).expect("faded frame");
+            faded.copy_from(backing.dc);
+            faded.background_alpha(180);
+            draw_search_glass(
+                faded.dc,
+                1.,
+                Some(&backing),
+                [16., 14., 144., 46.],
+                16.,
+                0x00583818,
+                false,
+                70.,
+                false,
+                true,
+            );
+            crate::render::flush(faded.dc);
+            let faded_px = faded.snapshot();
+            let inside = ((30 * 160 + 80) * 4) as usize;
+            let outside = ((70 * 160 + 80) * 4) as usize;
+            assert_eq!(faded_px[inside + 3], 255);
+            assert_eq!(faded_px[outside + 3], 180);
+        }
+        crate::glass::set_liquid_glass(prev_liquid);
 
         crate::motion::set_low_power(prev_low);
         crate::glass::set_frosted_glass(prev_frosted);

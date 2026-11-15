@@ -1510,11 +1510,13 @@ impl State {
                 };
                 {
                     let c = Canvas::new(frame.dc, self.dpi);
+                    let fused = crate::fusion::fused(self.hwnd);
                     let pane = [0., 0., w, h];
+                    let paint_r = if fused { 0. } else { 30. };
                     if !crate::surface::managed(&self.board.palette) {
                         c.round(
                             pane,
-                            30.,
+                            paint_r,
                             base,
                             (tint * 255.).round() as u8,
                             false,
@@ -1527,7 +1529,7 @@ impl State {
                         &self.board.palette,
                         tint,
                     );
-                    c.coating(pane, 30.);
+                    c.coating(pane, paint_r);
                     c.draw_pane_overlay(
                         [r.right as u32, r.bottom as u32],
                         self.dpi,
@@ -1535,7 +1537,7 @@ impl State {
                         paper,
                         [0., 0., w, h],
                     );
-                    c.widget_corner_reflection_for(self.hwnd, [0., 0., w, h], 30., paper);
+                    c.widget_corner_reflection_for(self.hwnd, [0., 0., w, h], paint_r, paper);
                 }
             }
             frame.bevel_for(self.hwnd);
@@ -1640,9 +1642,21 @@ impl State {
                 }
             }
             let search = self.search_rect();
-            if self.board.opacity < 100. {
-                backing.restore_glass_card(frame.dc, search, 17.);
-            }
+            let search_radius = (search[3] - search[1]) * 0.5;
+            let search_accent = source_glass.borrow().raw_wallpaper_accent();
+            let search_light = paper || crate::contrast::luminance(ink) < 0.5;
+            crate::widget_interaction::draw_search_glass(
+                frame.dc,
+                self.dpi,
+                Some(backing),
+                search,
+                search_radius,
+                search_accent,
+                search_light,
+                self.board.opacity,
+                false,
+                !self.chrome().search_icon(),
+            );
             if self.chrome().search_icon() {
                 let mut style = lenses::ENABLED;
                 if self.hover.as_ref() == Some(&Action::Search) {
@@ -1657,7 +1671,8 @@ impl State {
                 if crate::contrast::luminance(ink) < 0.5 {
                     style |= lenses::LIGHT;
                 }
-                self.button_lenses.draw(&c, self.dpi, search, base, style);
+                self.button_lenses
+                    .draw(&c, self.dpi, search, search_accent, style);
                 icons::search(
                     &c,
                     self.dpi,
@@ -1667,8 +1682,6 @@ impl State {
                     235,
                 );
             } else {
-                c.search_surface(search, 16., base, paper);
-                c.round(search, 16., base, 35, false, false);
                 icons::search(
                     &c,
                     self.dpi,
@@ -3260,6 +3273,72 @@ mod tests {
             drop(host);
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+    #[test]
+    fn search_glass_renders_above_background_at_full_and_partial_opacity() {
+        let _ui = crate::native_ui_test_lock();
+        let prev_lg = crate::glass::liquid_glass();
+        let prev_fg = crate::glass::frosted_glass();
+        crate::glass::set_liquid_glass(true);
+        crate::glass::set_frosted_glass(false);
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-notes-search-glass-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            glass.borrow_mut().refresh();
+            let mut host = Host::create(&root, glass, true, true).unwrap();
+            host.show();
+            {
+                let mut s = host.state.borrow_mut();
+                SetWindowPos(
+                    s.hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    (360. * s.dpi).round() as i32,
+                    (360. * s.dpi).round() as i32,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                s.board.design = "lumen".into();
+                s.board.opacity = 100.;
+                s.paint();
+                let backing = s.background.as_ref().unwrap().snapshot();
+                let frame = s.frame.as_ref().unwrap().snapshot();
+                let fw = s.frame.as_ref().unwrap().width as usize;
+                let search = s.search_rect();
+                // Sample a top-rim pixel of the expanded search pill where glass
+                // highlight + specular rim must differ from the raw background even
+                // at 100% widget opacity.
+                let px = (((search[0] + search[2]) * 0.5) * s.dpi).round() as usize;
+                let py = ((search[1] + 1.) * s.dpi).round() as usize;
+                let i = (py * fw + px) * 4;
+                let diff = frame[i].abs_diff(backing[i]) as u32
+                    + frame[i + 1].abs_diff(backing[i + 1]) as u32
+                    + frame[i + 2].abs_diff(backing[i + 2]) as u32;
+                assert!(
+                    diff > 8,
+                    "Search Notes glass must render above background at 100% opacity (diff={diff})"
+                );
+
+                // Lowering opacity restores full 255 alpha inside the search glass.
+                s.board.opacity = 80.;
+                s.paint();
+                let faded = s.frame.as_ref().unwrap().snapshot();
+                let cx = (((search[0] + search[2]) * 0.5) * s.dpi).round() as usize;
+                let cy = (((search[1] + search[3]) * 0.5) * s.dpi).round() as usize;
+                assert_eq!(faded[(cy * fw + cx) * 4 + 3], 255);
+                s.hide();
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        crate::glass::set_liquid_glass(prev_lg);
+        crate::glass::set_frosted_glass(prev_fg);
     }
 }
 

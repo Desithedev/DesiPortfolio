@@ -1,8 +1,8 @@
-Lumen 0.1.5 improves the built-in updater, tray notifications, and settings UI:
+Lumen 0.1.6 refines Liquid Glass rendering, fused panes, low-power backdrop clarity, and shared search glass styling:
 
-- **One-click Update Now & Download Package**: General Settings → Updates highlights available releases and provides an `Update Now` button on portable installs (auto-downloads, verifies SHA-256, unpacks, and restarts via `Lumen-updater.exe`) as well as a direct `Download Package` link.
-- **Startup Update Check**: Automatically checks for updates once ~5 minutes after startup or restart.
-- **System Tray Update Indicator**: Displays a red badge dot and `Update available` tooltip on the tray icon when an update is found, and switches the tray menu item from `Check for updates` to `Update now`.
+- **Curved Liquid Glass & Fused Panes**: Improved edge refraction and chromatic dispersion using crisp backdrop sampling across independent cards and fused widget L-junctions, eliminating double seams and sharp corner artifacts.
+- **Unified Search Glass & Divider Sync**: Both App Dock Search and Sticky Notes Search now share the un-boosted dominant wallpaper accent with Sticky Notes-style Liquid Glass rendered above the background at both `100%` and reduced opacity; the App Dock search `|` separator is synced with shortcut icon ink.
+- **Low Power Wallpaper Resolution**: Raised Low Power Mode wallpaper decoding cap to Full HD range (`1280px–1920px`) for sharper frosted glass on high-DPI displays.
 
 Optional Python entry points remain available:
 
@@ -14,7 +14,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.5-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.6-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

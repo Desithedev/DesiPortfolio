@@ -68,14 +68,14 @@ impl Material {
             for y in 0..th {
                 for x in 0..tw {
                     let mut sum = [0u32; 3];
-                    for (k, w) in [1, 4, 6, 4, 1].into_iter().enumerate() {
+                    for (k, w) in [1, 2, 1].into_iter().enumerate() {
                         let sx = if axis == 0 {
-                            (x as isize + k as isize - 2).clamp(0, tw as isize - 1) as usize
+                            (x as isize + k as isize - 1).clamp(0, tw as isize - 1) as usize
                         } else {
                             x
                         };
                         let sy = if axis == 1 {
-                            (y as isize + k as isize - 2).clamp(0, th as isize - 1) as usize
+                            (y as isize + k as isize - 1).clamp(0, th as isize - 1) as usize
                         } else {
                             y
                         };
@@ -83,7 +83,7 @@ impl Material {
                             sum[c] += bgr[sy * tw + sx][c] as u32 * w;
                         }
                     }
-                    scratch[y * tw + x] = sum.map(|v| ((v + 8) / 16) as u8);
+                    scratch[y * tw + x] = sum.map(|v| ((v + 2) / 4) as u8);
                 }
             }
             std::mem::swap(&mut bgr, &mut scratch);

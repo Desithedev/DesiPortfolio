@@ -362,6 +362,7 @@ impl Manager {
             let changed = old.pane != new.pane || old.visible != new.visible;
             self.members.insert(id, new);
             if changed && !old.moving {
+                self.materials.remove(&id);
                 self.changed();
             }
         } else if is_widget(hwnd) {
@@ -413,6 +414,15 @@ pub unsafe fn prepare(hwnd: HWND, radius: f32) {
         }
     });
 }
+pub fn pane_radius(hwnd: HWND) -> Option<f32> {
+    MANAGER.with(|m| {
+        m.try_borrow().ok().and_then(|s| {
+            let p = &s.as_ref()?.members.get(&(hwnd as usize))?.pane;
+            Some(p.radius / p.dpi.max(1.0))
+        })
+    })
+}
+
 /// Publish only raw chrome, before shared blending, bevel, alpha and content.
 /// Equality suppresses repaint feedback and keeps storage below12 KiB/member.
 pub unsafe fn publish_material(hwnd: HWND, material: material::Material) {
@@ -816,6 +826,7 @@ unsafe extern "system" fn widget_proc(
                             p.snap_drag = None;
                             if p.moving {
                                 p.moving = false;
+                                s.materials.remove(&(hwnd as usize));
                                 s.update(hwnd, None);
                                 s.changed();
                             }
@@ -950,6 +961,15 @@ pub(crate) unsafe fn refresh() {
         };
         let has_material = ps.iter().any(|p| s.materials.contains_key(&p.id));
         if !has_material {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                l,
+                t,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
             let brush = CreateSolidBrush(s.glass.borrow().wallpaper_accent());
             let rr = RECT {
                 left: 0,
@@ -972,7 +992,9 @@ pub(crate) unsafe fn refresh() {
         let pad_f = pad as f32;
         let pixels = buffer.pixels_mut();
         let liquid = crate::glass::liquid_glass();
-        let spec_w = 0.32 * (44.0 * dpi).min((w.min(h) as f32) * 0.45).max(1.0);
+        let spec_w = crate::compositor::liquid_spec_width(dpi, w as f32, h as f32);
+        let bridge_rim = (40.0 * dpi).clamp(12.0, (w.min(h) as f32) * 0.44);
+        let mut rim_samples: Vec<(i32, i32, f32, f32, f32, f32, f32, f32)> = Vec::new();
         geometry::with_outline(&ps, |outline| {
             let r_max = pad_f + 6. * dpi;
             let mut x_zones: Vec<[f32; 2]> = outline
@@ -1107,21 +1129,30 @@ pub(crate) unsafe fn refresh() {
                     if coverage > 0. {
                         let a = coverage * alpha;
                         let edge = outline.rim_light(gx, gy, d, dpi);
-                        let spec = if liquid && -d < spec_w {
+                        let (nx, ny, has_n) = if liquid && d > -bridge_rim {
                             let dx =
                                 outline.distance([gx + 1., gy]) - outline.distance([gx - 1., gy]);
                             let dy =
                                 outline.distance([gx, gy + 1.]) - outline.distance([gx, gy - 1.]);
                             let len = (dx * dx + dy * dy).sqrt().max(1e-5);
-                            crate::compositor::liquid_rim_spec(d, dx / len, dy / len, spec_w)
+                            (dx / len, dy / len, true)
+                        } else {
+                            (0., 0., false)
+                        };
+                        let spec = if has_n && -d < spec_w {
+                            crate::compositor::liquid_rim_spec(d, nx, ny, spec_w)
                         } else {
                             0.
                         };
                         let material = s.material_at(&ps, gx, gy);
-                        for c in 0..3 {
-                            let value = material.map_or(pixels[i + c] as f32, |m| m[c]);
-                            let lit = (value + (255. - value) * edge + spec).min(255.);
-                            pixels[i + c] = (lit * a) as u8;
+                        if material.is_none() && has_n {
+                            rim_samples.push((x, y, d, nx, ny, a, edge, spec));
+                        } else {
+                            for c in 0..3 {
+                                let value = material.map_or(pixels[i + c] as f32, |m| m[c]);
+                                let lit = (value + (255. - value) * edge + spec).min(255.);
+                                pixels[i + c] = (lit * a) as u8;
+                            }
                         }
                         pixels[i + 3] = (255. * a) as u8;
                         x += 1;
@@ -1148,6 +1179,22 @@ pub(crate) unsafe fn refresh() {
                 }
             }
         });
+        if !rim_samples.is_empty() {
+            s.glass.borrow().apply_bridge_refraction(
+                hwnd,
+                RECT {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                },
+                w,
+                h,
+                dpi,
+                pixels,
+                &rim_samples,
+            );
+        }
         restack(hwnd, &ps, Some([l, t, w, h]));
         if buffer.upload(hwnd) {
             bridge.uploads += 1;
@@ -1607,6 +1654,261 @@ mod tests {
             refresh();
             assert!(!fused(windows[1]));
             assert!(fused(windows[0]));
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+            MANAGER.with(|m| assert!(m.borrow().is_none()));
+        }
+    }
+
+    #[test]
+    fn fused_l_junction_liquid_glass_visual_verification() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass());
+        crate::glass::set_liquid_glass(true);
+
+        let verify_dir = std::env::var_os("LUMEN_VERIFY_DIR").map(std::path::PathBuf::from);
+        if let Some(ref dir) = verify_dir {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-verify-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (620usize, 420usize);
+        let wave_path = temp_dir.join("fusion-wave.png");
+        let mut wave_img = image::RgbaImage::new(cw as u32, ch as u32);
+        let tau = std::f32::consts::TAU;
+        for y in 0..ch {
+            let py = y as f32 / ch as f32 * tau;
+            for x in 0..cw {
+                let px = x as f32 / cw as f32 * tau;
+                let ribbon1 = ((px + py.sin() * 0.55).sin() * 0.5 + 0.5).powf(2.0);
+                let ribbon2 = (((px * 2.0 - 0.8) - py.cos() * 0.6).sin() * 0.5 + 0.5).powf(2.6);
+                let crest = (1.0 - ((py.sin() - 0.55 * px.sin()).abs() * 2.4).min(1.0)).powf(2.0);
+                let r = (12.0 + 45.0 * ribbon2 + 110.0 * crest).clamp(0.0, 255.0) as u8;
+                let g = (44.0 + 130.0 * ribbon1 + 115.0 * crest).clamp(0.0, 255.0) as u8;
+                let b = (118.0 + 128.0 * ribbon1.max(ribbon2) + 42.0 * crest).clamp(0.0, 255.0) as u8;
+                wave_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        wave_img.save(&wave_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&wave_path, 14.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(&wave_path, 14.0, 1.0))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-(cw as i32) * 32, -(ch as i32) * 48);
+
+            // L-junction cluster with deliberate 2px edge step between Clock (x=40) and Notes (x=42):
+            // Clock [40..300, 40..230] (pane [44..296, 44..226]) — warm sunset orange chrome
+            // Notes [42..222, 222..382] (pane [46..218, 226..378]) — soft cool slate chrome
+            // Music [292..580, 40..382] (pane [296..576, 44..378]) — deep royal blue chrome
+            // Concave Bridge fillet connects Notes right (x=218) + Clock bottom (y=226) + Music left (x=296).
+            struct WidgetSpec {
+                rect: [i32; 4],
+                top_rgb: [f32; 3],
+                bot_rgb: [f32; 3],
+                tint_mix: f32,
+            }
+            let specs = [
+                WidgetSpec {
+                    rect: [ox + 40, oy + 40, 260, 190],
+                    top_rgb: [248.0, 185.0, 138.0],
+                    bot_rgb: [242.0, 128.0, 74.0],
+                    tint_mix: 0.44,
+                },
+                WidgetSpec {
+                    rect: [ox + 42, oy + 222, 180, 160],
+                    top_rgb: [132.0, 168.0, 214.0],
+                    bot_rgb: [96.0, 134.0, 186.0],
+                    tint_mix: 0.40,
+                },
+                WidgetSpec {
+                    rect: [ox + 292, oy + 40, 288, 342],
+                    top_rgb: [42.0, 108.0, 224.0],
+                    bot_rgb: [18.0, 62.0, 168.0],
+                    tint_mix: 0.42,
+                },
+            ];
+            let mut windows = Vec::new();
+            for sp in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Fusion Liquid Glass verify").as_ptr(),
+                    WS_POPUP,
+                    sp.rect[0],
+                    sp.rect[1],
+                    sp.rect[2],
+                    sp.rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, sp) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = sp.rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    let brush = CreateSolidBrush(0x281e18);
+                    FillRect(frame.dc, &RECT { left: 0, top: 0, right: w, bottom: h }, brush);
+                    DeleteObject(brush);
+                    widget_glass.draw_blended(frame.dc, hwnd, w, h, 215);
+                    {
+                        let px = frame.pixels_mut();
+                        for y in 0..h as usize {
+                            let ty = y as f32 / (h as f32).max(1.0);
+                            let cr = sp.top_rgb[0] * (1.0 - ty) + sp.bot_rgb[0] * ty;
+                            let cg = sp.top_rgb[1] * (1.0 - ty) + sp.bot_rgb[1] * ty;
+                            let cb = sp.top_rgb[2] * (1.0 - ty) + sp.bot_rgb[2] * ty;
+                            let row = y * w as usize * 4;
+                            for x in 0..w as usize {
+                                let i = row + x * 4;
+                                px[i] = (px[i] as f32 * (1.0 - sp.tint_mix) + cb * sp.tint_mix).round() as u8;
+                                px[i + 1] = (px[i + 1] as f32 * (1.0 - sp.tint_mix) + cg * sp.tint_mix).round() as u8;
+                                px[i + 2] = (px[i + 2] as f32 * (1.0 - sp.tint_mix) + cr * sp.tint_mix).round() as u8;
+                            }
+                        }
+                    }
+                    frame.background_alpha_for(hwnd, 255);
+                    frame.bevel_for(hwnd);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)), "all L-junction panes must fuse");
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap = crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let member_caps: Vec<_> = windows
+                .iter()
+                .map(|&h| crate::compositor::test_capture::get(h).expect("member upload"))
+                .collect();
+
+            // Composite onto 620x420 wave wallpaper canvas (Bridge below members, matching Z-order).
+            let mut canvas = wave_img.clone();
+            let blend_cap = |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                let lx0 = cap.rect[0] - ox;
+                let ly0 = cap.rect[1] - oy;
+                for y in 0..cap.h {
+                    let cy = ly0 + y;
+                    if cy < 0 || cy >= ch as i32 {
+                        continue;
+                    }
+                    for x in 0..cap.w {
+                        let cx = lx0 + x;
+                        if cx < 0 || cx >= cw as i32 {
+                            continue;
+                        }
+                        let si = ((y * cap.w + x) * 4) as usize;
+                        let a = cap.bgra[si + 3] as u32;
+                        if a == 0 {
+                            continue;
+                        }
+                        let inv = 255 - a;
+                        let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                        p.0[0] = (cap.bgra[si + 2] as u32 + (p.0[0] as u32 * inv + 127) / 255).min(255) as u8;
+                        p.0[1] = (cap.bgra[si + 1] as u32 + (p.0[1] as u32 * inv + 127) / 255).min(255) as u8;
+                        p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255).min(255) as u8;
+                        p.0[3] = 255;
+                    }
+                }
+            };
+            blend_cap(&mut canvas, &bridge_cap);
+            for mc in &member_caps {
+                blend_cap(&mut canvas, mc);
+            }
+
+            if let Some(ref dir) = verify_dir {
+                canvas.save(dir.join("verify_fused_l_junction.png")).unwrap();
+            }
+
+            // 1) Smooth blend across Clock | Music and across Music interior without seam/tile cuts.
+            let mut max_seam_step = 0i32;
+            for x in 270u32..555 {
+                let a = canvas.get_pixel(x, 140).0;
+                let b = canvas.get_pixel(x + 1, 140).0;
+                for c in 0..3 {
+                    max_seam_step = max_seam_step.max((a[c] as i32 - b[c] as i32).abs());
+                }
+            }
+            assert!(
+                max_seam_step <= 8,
+                "fused Clock | Music seam & interior must blend smoothly without L-cut discontinuities (max 1px jump={max_seam_step})"
+            );
+            let mut max_vert_step = 0i32;
+            for y in 65u32..355 {
+                let a = canvas.get_pixel(350, y).0;
+                let b = canvas.get_pixel(350, y + 1).0;
+                for c in 0..3 {
+                    max_vert_step = max_vert_step.max((a[c] as i32 - b[c] as i32).abs());
+                }
+            }
+            assert!(
+                max_vert_step <= 8,
+                "fused Music vertical slice must remain smooth without cutoff steps (max 1px jump={max_vert_step})"
+            );
+
+            // 2) Zero square corner regression on sub-2dp offset: Notes outer corner bbox (x=42, y=381) must stay rounded (transparent), not filled square!
+            let notes_cap = &member_caps[1];
+            let corner_bbox = (notes_cap.h as usize - 1) * notes_cap.w as usize * 4;
+            assert_eq!(
+                notes_cap.bgra[corner_bbox + 3],
+                0,
+                "bottom-left outer corner must stay transparent with rounded corner arc"
+            );
+            // Also check inward corner around offset (8, h-9): should be inside rounded radius 30? Wait: radius=30, margin=4 -> (4 + 30*(1 - cos 45°)) = 4 + 8.8 = 12.8px. So (6, h-7) is outside rounded arc (alpha=0)!
+            let outer_arc_px = ((notes_cap.h as usize - 7) * notes_cap.w as usize + 6) * 4;
+            assert_eq!(
+                notes_cap.bgra[outer_arc_px + 3],
+                0,
+                "notes rounded corner must NOT collapse square despite 2px left edge mismatch with clock"
+            );
+
+            // 3) Concave Bridge fillet pixel in the L-notch (x = 223, y = 232) must be opaque/blended (Bridge filled the notch!).
+            let bx = 223 - (bridge_cap.rect[0] - ox);
+            let by = 232 - (bridge_cap.rect[1] - oy);
+            let bi = ((by * bridge_cap.w + bx) * 4) as usize;
+            assert!(
+                bridge_cap.bgra[bi + 3] > 200,
+                "bridge must smoothly fill concave L-junction fillet (alpha={})",
+                bridge_cap.bgra[bi + 3]
+            );
+
             for hwnd in windows {
                 DestroyWindow(hwnd);
             }

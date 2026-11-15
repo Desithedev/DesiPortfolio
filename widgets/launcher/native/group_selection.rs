@@ -212,12 +212,6 @@ impl App {
         };
         let c = Canvas::new(dc, self.dpi);
         let ink = self.search_ink;
-        c.search_surface(
-            [16., 14., w as f32 - 16., 60.],
-            23.,
-            self.theme_color(),
-            self.dock.light,
-        );
         if w >= 360 {
             c.text(
                 &format!("Group apps · {} selected", state.checked.len()),

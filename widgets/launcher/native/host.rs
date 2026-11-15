@@ -80,7 +80,6 @@ struct Palette {
     card: u32,
     text: u32,
     muted: u32,
-    line: u32,
 }
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
@@ -92,7 +91,6 @@ fn palette(light: bool) -> Palette {
             card: rgb(250, 251, 253),
             text: rgb(29, 39, 53),
             muted: rgb(98, 112, 130),
-            line: rgb(216, 222, 230),
         }
     } else {
         Palette {
@@ -100,7 +98,6 @@ fn palette(light: bool) -> Palette {
             card: rgb(32, 39, 49),
             text: rgb(235, 241, 248),
             muted: rgb(183, 183, 195),
-            line: rgb(105, 107, 116),
         }
     }
 }
@@ -700,7 +697,15 @@ impl App {
                 .or_else(|| shell_item_image(&key, 0x04 | 0x01))
                 .or_else(|| system_image_list_icon(&key))
         } else {
-            shell_item_image(&key, 0x01).or_else(|| system_image_list_icon(&key))
+            let img = shell_item_image(&key, 0x01);
+            if img.as_ref().is_some_and(|i| {
+                let [mx, my] = i.max_opaque_extent();
+                mx > 64 || my > 64
+            }) {
+                img
+            } else {
+                system_image_list_icon(&key).or(img)
+            }
         };
         let low_res = image
             .as_ref()
@@ -733,7 +738,8 @@ impl App {
             }
         }
         if let Some(image) = image {
-            self.icons.insert(item.id.clone(), Icon::Image(image));
+            self.icons
+                .insert(item.id.clone(), Icon::Image(image.trim_padded_icon()));
             return;
         }
         if let Some(icon) = legacy_icon {
@@ -1202,6 +1208,7 @@ impl App {
         let bg_cached = cached && key == self.background_key;
         let own_alpha = (self.dock.opacity * 2.55).round() as u8;
         let group_op = crate::fusion::group_opacities(hwnd, own_alpha);
+        let moving = self.moving_window || crate::fusion::is_moving(hwnd);
         let toolbar_items = self.toolbar_items();
         let fast_header_key = if bg_cached
             && self.resize_drag.is_none()
@@ -1326,30 +1333,7 @@ impl App {
                     ],
                 );
             }
-            // Build the nested search material before the decorative glow.
-            // During move/resize, skip recomputing the search bar's extra CPU blur;
-            // during move, also skip drawing the stale search_frost so live wallpaper shows through.
-            let prefix = format!("dpi{}:", self.dpi);
-            let moving = self.moving_window || crate::fusion::is_moving(hwnd);
-            let live_nested = crate::widget_interaction::use_live_nested_glass(
-                hwnd,
-                self.moving_window,
-                self.resize_drag.is_some(),
-            );
-            if !frosted {
-                self.search_frost = None;
-            } else if !live_nested {
-                self.search_frost = frame
-                    .frosted_piece_opacity(
-                        [16., 14., w as f32 - 16., 60.],
-                        23.,
-                        8.,
-                        [-2., -1.],
-                        self.theme_color(),
-                        0.25,
-                    )
-                    .map(|image| (format!("{prefix}{key}"), image));
-            }
+            self.search_frost = None;
             Canvas::new(dc, self.dpi).widget_corner_reflection_for(
                 hwnd,
                 pane,
@@ -1458,39 +1442,32 @@ impl App {
         if reused_header {
             frame.copy_from(self.list_base.as_ref().unwrap().dc);
         } else {
-        if (self.search_visible() || self.group_selection.is_some())
-            && crate::glass::frosted_glass()
-        {
+        if self.search_visible() || self.group_selection.is_some() {
             let rect = [16., 14., w as f32 - 16., 60.];
-            let c = Canvas::new(dc, self.dpi);
-            if crate::widget_interaction::use_live_nested_glass(
-                hwnd,
-                self.moving_window,
-                self.resize_drag.is_some(),
-            ) {
-                crate::widget_interaction::draw_translucent_nested_glass(
-                    &c,
-                    rect,
-                    23.,
-                    self.theme_color(),
-                    self.dock.tint,
-                );
-            } else if let Some((_, image)) = &self.search_frost {
-                c.image(image, rect);
-            }
+            let search_accent = self.glass.borrow().raw_wallpaper_accent();
+            let search_light = crate::contrast::luminance(self.search_ink) < 0.5;
+            crate::widget_interaction::draw_search_glass(
+                dc,
+                self.dpi,
+                self.background.as_ref(),
+                rect,
+                23.,
+                search_accent,
+                search_light,
+                self.dock.opacity,
+                moving,
+                true,
+            );
         }
         if self.search_visible() && self.group_selection.is_none() {
-            Canvas::new(dc, self.dpi).focus_shadow(
-                [16., 14., w as f32 - 16., 60.],
-                23.,
-                self.motion.search_focus.sample(now),
-            );
-            Canvas::new(dc, self.dpi).search_surface(
-                [16., 14., w as f32 - 16., 60.],
-                23.,
-                self.theme_color(),
-                self.dock.light,
-            );
+            let search_focus = self.motion.search_focus.sample(now);
+            if search_focus > 0.001 {
+                Canvas::new(dc, self.dpi).focus_shadow(
+                    [16., 14., w as f32 - 16., 60.],
+                    23.,
+                    search_focus,
+                );
+            }
             let (ink, muted) = self.adaptive_ink(
                 dc,
                 [
@@ -1512,7 +1489,22 @@ impl App {
             let toolbar_dy = header.toolbar_y - 37.;
             if !header.compact {
                 let divider = (header.toolbar_x - 24.).round() as i32;
-                self.stroke(dc, &[(divider, 28), (divider, 46)], p.line, 1);
+                let (divider_ink, _) = self.adaptive_ink(
+                    dc,
+                    [
+                        divider as f32 - 8.,
+                        22. + toolbar_dy,
+                        divider as f32 + 8.,
+                        50. + toolbar_dy,
+                    ],
+                    "divider",
+                );
+                Canvas::new(dc, self.dpi).line(
+                    &[(divider as f32, 28.), (divider as f32, 46.)],
+                    divider_ink,
+                    217,
+                    1.,
+                );
             }
             for (i, item) in toolbar_items.iter().enumerate() {
                 let amount = self
@@ -1782,17 +1774,6 @@ impl App {
             false,
         );
     }
-    unsafe fn stroke(&self, dc: HDC, points: &[(i32, i32)], color: u32, width: i32) {
-        Canvas::new(dc, self.dpi).line(
-            &points
-                .iter()
-                .map(|(x, y)| (*x as f32, *y as f32))
-                .collect::<Vec<_>>(),
-            color,
-            255,
-            width as f32,
-        );
-    }
     unsafe fn text(
         &self,
         dc: HDC,
@@ -1982,7 +1963,7 @@ unsafe fn system_image_list_icon(key: &str) -> Option<render::Image> {
             if min_extent > 0 && mx <= min_extent && my <= min_extent {
                 continue;
             }
-            return Some(image);
+            return Some(image.trim_padded_icon());
         }
     }
     None
@@ -3416,5 +3397,173 @@ mod tests {
         item.kind = "url".into();
         item.target = "example.org/a".into();
         assert_eq!(launch_target(&item), "https://example.org/a");
+    }
+    #[test]
+    fn search_divider_and_shortcuts_share_adaptive_ink_color() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let buf = crate::compositor::Buffer::plain(120, 60, 1.).expect("test buffer");
+            let brush = CreateSolidBrush(rgb(18, 60, 140));
+            let r = RECT {
+                left: 0,
+                top: 0,
+                right: 120,
+                bottom: 60,
+            };
+            FillRect(buf.dc, &r, brush);
+            DeleteObject(brush);
+
+            let mut glass = Glass::new(13., 1.);
+            glass.refresh();
+            let search_accent = glass.raw_wallpaper_accent();
+            let toolbar_ink = rgb(248, 250, 253);
+            let divider_ink = toolbar_ink;
+            crate::widget_interaction::draw_search_glass(
+                buf.dc,
+                1.,
+                Some(&buf),
+                [8., 8., 112., 52.],
+                22.,
+                search_accent,
+                false,
+                100.,
+                false,
+                true,
+            );
+            Canvas::new(buf.dc, 1.).line(&[(40., 22.), (40., 38.)], divider_ink, 217, 1.);
+            let symbols = crate::symbols::Symbols::default();
+            symbols.draw_rotated_alpha(buf.dc, 1., 1, 56., 22., 16., toolbar_ink, 0., 0.85);
+            render::flush(buf.dc);
+
+            let px = buf.snapshot();
+            // Compare the synced divider against a gray p.line stroke and the shortcut icon:
+            // synced divider must match the bright white-ink shortcut icon, not dark gray.
+            let mut max_divider_luma = 0u32;
+            let mut max_divider_red = 0u8;
+            for x in 39..=41 {
+                let i = (30 * 120 + x) * 4;
+                let luma = px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32;
+                max_divider_luma = max_divider_luma.max(luma);
+                max_divider_red = max_divider_red.max(px[i + 2]);
+            }
+            let mut max_icon_luma = 0u32;
+            for x in 56..72 {
+                for y in 22..38 {
+                    let i = (y * 120 + x) * 4;
+                    let luma = px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32;
+                    max_icon_luma = max_icon_luma.max(luma);
+                }
+            }
+            assert!(
+                max_divider_luma > 420 && max_divider_red > 95,
+                "Synced divider must render bright white-tinted ink matching toolbar icons (luma={max_divider_luma}, red={max_divider_red})"
+            );
+            assert!(
+                max_icon_luma > 420,
+                "Shortcut icon sanity check (luma={max_icon_luma})"
+            );
+        }
+    }
+    #[test]
+    #[ignore = "App Dock frame breakdown diagnostic"]
+    fn app_dock_frame_breakdown() {
+        let _ui = crate::native_ui_test_lock();
+        let prev_lg = crate::glass::liquid_glass();
+        let prev_fg = crate::glass::frosted_glass();
+        let prev_lp = crate::motion::low_power();
+        crate::glass::set_frosted_glass(true);
+        crate::motion::set_low_power(false);
+        crate::glass::set_liquid_glass(true);
+        unsafe {
+            let hinst = GetModuleHandleW(null());
+            let cls = wide("LumenGpuBench");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: hinst,
+                lpszClassName: cls.as_ptr(),
+                ..zeroed()
+            };
+            RegisterClassW(&wc);
+            let dpi = 1.75f32;
+            for (name, lw, lh) in [("AppDock", 621i32, 403i32), ("YouTubeMusic", 352i32, 497i32)] {
+                let (pw, ph) = ((lw as f32 * dpi).round() as i32, (lh as f32 * dpi).round() as i32);
+                let hwnd = CreateWindowExW(
+                    0x00200000 | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, // WS_EX_NOREDIRECTIONBITMAP
+                    cls.as_ptr(),
+                    wide("Lumen gpu bench").as_ptr(),
+                    WS_POPUP,
+                    100,
+                    100,
+                    pw,
+                    ph,
+                    null_mut(),
+                    null_mut(),
+                    hinst,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                let mut glass = crate::glass::Glass::new(9.0, dpi);
+                glass.refresh();
+                let mut buf = crate::compositor::Buffer::new(pw, ph, dpi, 34.).expect("buffer");
+                let pane = [4., 4., lw as f32 - 4., lh as f32 - 4.];
+                // Warmup (initializes GpuDevice, shaders, wallpaper Dual Kawase blur, and GpuSurface)
+                glass.draw_blended(buf.dc, hwnd, pw, ph, 255);
+                buf.present_with_alpha(hwnd, false);
+
+                let mut t_glass = 0.0f64;
+                let mut t_overlay = 0.0f64;
+                let mut t_bevel = 0.0f64;
+                let mut t_present = 0.0f64;
+                let mut t_total = 0.0f64;
+                let n = 20;
+                for _ in 0..n {
+                    let s_all = std::time::Instant::now();
+                    let s0 = std::time::Instant::now();
+                    glass.draw_blended(buf.dc, hwnd, pw, ph, 255);
+                    render::flush(buf.dc);
+                    t_glass += s0.elapsed().as_secs_f64() * 1000.;
+
+                    let s1 = std::time::Instant::now();
+                    let c = Canvas::new(buf.dc, dpi);
+                    c.coating(pane, 34.);
+                    c.draw_pane_overlay([pw as u32, ph as u32], dpi, 0., false, [0., 0., lw as f32, lh as f32]);
+                    c.widget_corner_reflection_for(hwnd, pane, 34., false);
+                    render::flush(buf.dc);
+                    t_overlay += s1.elapsed().as_secs_f64() * 1000.;
+
+                    let s2 = std::time::Instant::now();
+                    buf.bevel_for(hwnd);
+                    t_bevel += s2.elapsed().as_secs_f64() * 1000.;
+
+                    let s3 = std::time::Instant::now();
+                    let ok = buf.present_with_alpha(hwnd, false);
+                    if !ok {
+                        panic!(
+                            "GPU present_with_alpha failed: is_gpu={} avail={} last_err={}",
+                            crate::gpu::is_gpu_window(hwnd),
+                            crate::gpu::available(),
+                            windows_sys::Win32::Foundation::GetLastError()
+                        );
+                    }
+                    t_present += s3.elapsed().as_secs_f64() * 1000.;
+                    t_total += s_all.elapsed().as_secs_f64() * 1000.;
+                }
+                println!(
+                    "BENCH_GPU {} {}x{}@{:.2} | glass_cpu={:.2}ms overlay+refl={:.2}ms bevel={:.2}ms present_gpu={:.2}ms TOTAL={:.2}ms (120Hz budget=8.33ms)",
+                    name, pw, ph, dpi,
+                    t_glass / n as f64,
+                    t_overlay / n as f64,
+                    t_bevel / n as f64,
+                    t_present / n as f64,
+                    t_total / n as f64,
+                );
+                crate::gpu::remove_surface(hwnd);
+                DestroyWindow(hwnd);
+            }
+        }
+        crate::glass::set_liquid_glass(prev_lg);
+        crate::glass::set_frosted_glass(prev_fg);
+        crate::motion::set_low_power(prev_lp);
     }
 }
