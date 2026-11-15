@@ -58,10 +58,11 @@ const WIDGET_POINTER: u32 = WM_APP + 3;
 const WIDGET_REDRAW: u32 = WM_APP + 4;
 const MOTION_FRAME: u32 = WM_APP + 7;
 const WALLPAPER_READY: u32 = WM_APP + 20;
+const STARTUP_WIDGET: u32 = WM_APP + 21;
 const SEARCH_ID: usize = 100;
 const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
-const UPDATE_CHECK_TIMER: usize = 3;
+const UPDATE_CHECK_TIMER: usize = 6;
 const CMD_ADD: u32 = 10;
 const CMD_PC: u32 = 11;
 const CMD_BIN: u32 = 12;
@@ -147,6 +148,7 @@ struct App {
     search_muted: u32,
     resize_drag: Option<ResizeDrag>,
     pending_resize: Option<RECT>,
+    pending_startup: std::collections::VecDeque<String>,
     root: PathBuf,
     dock: Dock,
     desktop_watch: Option<crate::desktop_sync::Watch>,
@@ -430,6 +432,12 @@ impl App {
             start: xy(lparam),
             bounds,
         });
+        if hwnd == self.hwnd {
+            crate::glass::set_resizing(hwnd, true);
+            if let Some(shadow) = &self.window_shadow {
+                shadow.hide();
+            }
+        }
         SetCapture(hwnd);
     }
     unsafe fn move_resize(&mut self, hwnd: HWND, lparam: LPARAM) {
@@ -474,7 +482,7 @@ impl App {
             );
         }
         self.pending_resize = Some(r);
-        self.arm_motion(self.hwnd);
+        self.apply_resize();
     }
     pub(super) unsafe fn apply_resize(&mut self) -> bool {
         let (Some(r), Some(drag)) = (self.pending_resize.take(), self.resize_drag) else {
@@ -492,12 +500,15 @@ impl App {
         if drag.window == self.hwnd {
             self.layout_edit(self.hwnd);
         }
-        InvalidateRect(drag.window, null(), 0);
+        if crate::glass::resize_paint_due(drag.window) {
+            InvalidateRect(drag.window, null(), 0);
+        }
         drag.window == self.hwnd
     }
     unsafe fn finish_resize(&mut self, hwnd: HWND) {
         self.apply_resize();
         self.resize_drag = None;
+        crate::glass::set_resizing(hwnd, false);
         self.background_key.clear();
         InvalidateRect(hwnd, null(), 0);
         ReleaseCapture();
@@ -766,6 +777,9 @@ impl App {
         self.icons.insert(item.id.clone(), icon);
     }
     unsafe fn notify_wallpaper_changed(&mut self, hwnd: HWND) {
+        let blur = crate::glass::global_blur();
+        let dpi = self.dpi;
+        self.glass.borrow_mut().set_blur(blur, dpi);
         if let Some(host) = &mut self.general {
             host.refresh();
         }
@@ -912,12 +926,7 @@ impl App {
                 InvalidateRect(hwnd, null(), 0);
                 return;
             }
-            let mut point = POINT {
-                x: self.px(self.dimensions(hwnd).0 - 40),
-                y: self.px(62),
-            };
-            ClientToScreen(hwnd, &mut point);
-            self.context_menu(hwnd, point.x, point.y, None);
+            self.open_settings(hwnd);
             return;
         }
         if let Some(Some(id)) = items.get(button) {
@@ -926,7 +935,6 @@ impl App {
     }
     unsafe fn context_menu(&mut self, hwnd: HWND, x: i32, y: i32, item: Option<usize>) {
         if item.is_none() {
-            self.open_settings(hwnd);
             return;
         }
         let mut point = POINT { x, y };
@@ -1169,25 +1177,29 @@ impl App {
             [0.25, 0.1, 0.25, 1.],
         );
         let (w, h) = self.dimensions(hwnd);
-        let mut window: RECT = zeroed();
-        GetWindowRect(hwnd, &mut window);
+        let window = crate::fusion::window_rect(hwnd);
+        let frosted = crate::glass::frosted_glass();
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            window.left,
-            window.top,
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            if frosted { window.left } else { 0 },
+            if frosted { window.top } else { 0 },
             client.right,
             client.bottom,
             self.dpi,
             self.dock.theme,
-            self.dock.frosted,
+            frosted,
             self.dock.tint,
             self.dock.frost_strength,
             self.dock.light,
             self.glass.borrow().revision(),
             GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            crate::fusion::revision(hwnd)
+            crate::fusion::revision(hwnd),
+            crate::motion::low_power() && crate::fusion::is_moving(hwnd)
         );
-        let bg_cached = key == self.background_key && self.background.is_some();
+        let cached = self.background.as_ref().is_some_and(|b| {
+            b.width == client.right && b.height == client.bottom && b.dpi == self.dpi
+        });
+        let bg_cached = cached && key == self.background_key;
         let own_alpha = (self.dock.opacity * 2.55).round() as u8;
         let group_op = crate::fusion::group_opacities(hwnd, own_alpha);
         let toolbar_items = self.toolbar_items();
@@ -1256,26 +1268,21 @@ impl App {
             let brush = CreateSolidBrush(p.background);
             FillRect(dc, &client, brush);
             DeleteObject(brush);
-            if !((self.moving_window || self.resize_drag.is_some()) && crate::motion::low_power())
-            {
+            if frosted {
                 self.glass.borrow().draw_blended(
                     dc,
                     hwnd,
                     client.right,
                     client.bottom,
-                    if self.dock.frosted {
-                        (self.dock.frost_strength * 255. / 100.).round() as u8
-                    } else {
-                        0
-                    },
+                    (self.dock.frost_strength * 255. / 100.).round() as u8,
                 );
             }
-            let tint = if self.dock.frosted {
+            let tint = if frosted {
                 self.dock.tint
             } else {
                 100.
             };
-            let overlay_key = format!(
+            let _overlay_key = format!(
                 "{}:{}:{}:{}:{}:{}",
                 client.right,
                 client.bottom,
@@ -1284,20 +1291,6 @@ impl App {
                 tint,
                 self.dock.light
             );
-            if (self.resize_drag.is_none() || self.overlay.is_none())
-                && self
-                    .overlay
-                    .as_ref()
-                    .is_none_or(|(key, _)| *key != overlay_key)
-            {
-                self.overlay = Canvas::pane_overlay(
-                    [client.right as u32, client.bottom as u32],
-                    self.dpi,
-                    tint / 100.,
-                    self.dock.light,
-                )
-                .map(|image| (overlay_key, image));
-            }
             let fused = crate::fusion::fused(hwnd);
             let pane = if fused {
                 [0., 0., w as f32, h as f32]
@@ -1320,10 +1313,11 @@ impl App {
                     );
                 }
                 c.coating(pane, radius);
-            }
-            if let Some((_, image)) = &self.overlay {
-                Canvas::new(dc, self.dpi).image(
-                    image,
+                c.draw_pane_overlay(
+                    [client.right as u32, client.bottom as u32],
+                    self.dpi,
+                    tint / 100.,
+                    self.dock.light,
                     [
                         0.,
                         0.,
@@ -1333,14 +1327,18 @@ impl App {
                 );
             }
             // Build the nested search material before the decorative glow.
-            // Reuse it while resizing, but never bake the glow into its frost.
+            // During move/resize, skip recomputing the search bar's extra CPU blur;
+            // during move, also skip drawing the stale search_frost so live wallpaper shows through.
             let prefix = format!("dpi{}:", self.dpi);
-            let live_reuse = self.resize_drag.is_some()
-                && self
-                    .search_frost
-                    .as_ref()
-                    .is_some_and(|(old, _)| old.starts_with(&prefix));
-            if !live_reuse {
+            let moving = self.moving_window || crate::fusion::is_moving(hwnd);
+            let live_nested = crate::widget_interaction::use_live_nested_glass(
+                hwnd,
+                self.moving_window,
+                self.resize_drag.is_some(),
+            );
+            if !frosted {
+                self.search_frost = None;
+            } else if !live_nested {
                 self.search_frost = frame
                     .frosted_piece_opacity(
                         [16., 14., w as f32 - 16., 60.],
@@ -1359,24 +1357,30 @@ impl App {
                 self.dock.light,
             );
             frame.bevel_for(hwnd);
-            let cache = self
-                .background
-                .take()
-                .filter(|f| {
-                    f.width == client.right && f.height == client.bottom && f.dpi == self.dpi
-                })
-                .or_else(|| crate::compositor::Buffer::plain(client.right, client.bottom, self.dpi))
-                .unwrap();
-            cache.copy_from(dc);
-            self.background = Some(cache);
-            self.background_key = if self.resize_drag.is_some() {
+            if !moving {
+                let cache = self
+                    .background
+                    .take()
+                    .filter(|f| {
+                        f.width == client.right && f.height == client.bottom && f.dpi == self.dpi
+                    })
+                    .or_else(|| crate::compositor::Buffer::plain(client.right, client.bottom, self.dpi))
+                    .unwrap();
+                cache.copy_from(dc);
+                self.background = Some(cache);
+            }
+            self.background_key = if self.resize_drag.is_some() || moving {
                 String::new()
             } else {
                 key
             };
         }
         let bg_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-        if !fast_reused_header {
+        if !fast_reused_header
+            && !self.moving_window
+            && self.resize_drag.is_none()
+            && !crate::fusion::is_moving(hwnd)
+        {
             let luminance =
                 crate::contrast::sample(dc, self.dpi, [16., 14., (w - 16) as f32, (h - 14) as f32]);
             let (ink, muted) = crate::contrast::inks(luminance, Some(self.search_ink));
@@ -1454,21 +1458,25 @@ impl App {
         if reused_header {
             frame.copy_from(self.list_base.as_ref().unwrap().dc);
         } else {
-        if self.search_visible() || self.group_selection.is_some() {
+        if (self.search_visible() || self.group_selection.is_some())
+            && crate::glass::frosted_glass()
+        {
             let rect = [16., 14., w as f32 - 16., 60.];
-            let prefix = format!("dpi{}:", self.dpi);
-            let live_reuse = self.resize_drag.is_some()
-                && self
-                    .search_frost
-                    .as_ref()
-                    .is_some_and(|(old, _)| old.starts_with(&prefix));
-            if let Some((_, image)) = &self.search_frost {
-                let c = Canvas::new(dc, self.dpi);
-                if live_reuse {
-                    c.image_horizontal_alpha(image, rect, (23. * self.dpi).round() as u32, 1.);
-                } else {
-                    c.image(image, rect);
-                }
+            let c = Canvas::new(dc, self.dpi);
+            if crate::widget_interaction::use_live_nested_glass(
+                hwnd,
+                self.moving_window,
+                self.resize_drag.is_some(),
+            ) {
+                crate::widget_interaction::draw_translucent_nested_glass(
+                    &c,
+                    rect,
+                    23.,
+                    self.theme_color(),
+                    self.dock.tint,
+                );
+            } else if let Some((_, image)) = &self.search_frost {
+                c.image(image, rect);
             }
         }
         if self.search_visible() && self.group_selection.is_none() {
@@ -1582,35 +1590,58 @@ impl App {
                 canvas.line(&[(x + 3., 34.), (x - 3., 40.)], p.text, 220, 1.2);
             }
             // The Edit uses the exact glass pixels beneath it as its background.
-            render::flush(dc);
-            let ew = self.px(header.edit_width);
-            let eh = self.px(23);
-            let edit_dc = CreateCompatibleDC(dc);
-            let edit_bitmap = CreateCompatibleBitmap(dc, ew, eh);
-            let old = SelectObject(edit_dc, edit_bitmap);
-            BitBlt(edit_dc, 0, 0, ew, eh, dc, self.px(58), self.px(26), SRCCOPY);
-            if !self.search_brush.is_null() {
-                DeleteObject(self.search_brush);
-            }
-            self.search_brush = CreatePatternBrush(edit_bitmap);
-            SEARCH_PALETTE
-                .with(|p| p.set(Some((hwnd, self.edit, self.search_brush, self.search_ink))));
-            if alpha_batch.is_some() {
-                if !self.query.is_empty() {
-                    self.paint_translucent_search_text(dc, hwnd, ew, eh);
+            let focused = GetFocus() == self.edit;
+            if !self.query.is_empty() || focused {
+                render::flush(dc);
+                let ew = self.px(header.edit_width);
+                let eh = self.px(23);
+                let edit_dc = CreateCompatibleDC(dc);
+                let edit_bitmap = CreateCompatibleBitmap(dc, ew, eh);
+                let old = SelectObject(edit_dc, edit_bitmap);
+                BitBlt(edit_dc, 0, 0, ew, eh, dc, self.px(58), self.px(26), SRCCOPY);
+                if !self.search_brush.is_null() {
+                    DeleteObject(self.search_brush);
                 }
-            } else {
-                if !self.query.is_empty() {
+                self.search_brush = CreatePatternBrush(edit_bitmap);
+                SEARCH_PALETTE
+                    .with(|p| p.set(Some((hwnd, self.edit, self.search_brush, self.search_ink))));
+                if alpha_batch.is_some() {
+                    if !self.query.is_empty() {
+                        self.paint_translucent_search_text(dc, hwnd, ew, eh);
+                    }
+                } else {
+                    if !self.query.is_empty() {
+                        SendMessageW(
+                            self.edit,
+                            WM_PRINTCLIENT,
+                            edit_dc as usize,
+                            (PRF_CLIENT | PRF_ERASEBKGND) as isize,
+                        );
+                    }
+                    BitBlt(dc, self.px(58), self.px(26), ew, eh, edit_dc, 0, 0, SRCCOPY);
+                }
+                SEARCH_PALETTE.with(|p| p.set(None));
+                if focused && self.caret_on {
+                    let mut a = 0u32;
+                    let mut b = 0u32;
                     SendMessageW(
                         self.edit,
-                        WM_PRINTCLIENT,
-                        edit_dc as usize,
-                        (PRF_CLIENT | PRF_ERASEBKGND) as isize,
+                        EM_GETSEL,
+                        &mut a as *mut _ as usize,
+                        &mut b as *mut _ as isize,
                     );
+                    if a == b {
+                        let mut point: POINT = zeroed();
+                        if GetCaretPos(&mut point) != 0 {
+                            let x = 58. + point.x as f32 / self.dpi;
+                            Canvas::new(dc, self.dpi).line(&[(x, 28.), (x, 45.)], p.text, 230, 0.8);
+                        }
+                    }
                 }
-                BitBlt(dc, self.px(58), self.px(26), ew, eh, edit_dc, 0, 0, SRCCOPY);
+                SelectObject(edit_dc, old);
+                DeleteObject(edit_bitmap);
+                DeleteDC(edit_dc);
             }
-            SEARCH_PALETTE.with(|p| p.set(None));
             if self.query.trim().is_empty() {
                 Canvas::new(dc, self.dpi).text_alpha(
                     "Search app...",
@@ -1622,27 +1653,6 @@ impl App {
                     self.placeholder_opacity(),
                 );
             }
-            if GetFocus() == self.edit && self.caret_on {
-                let mut a = 0u32;
-                let mut b = 0u32;
-                SendMessageW(
-                    self.edit,
-                    EM_GETSEL,
-                    &mut a as *mut _ as usize,
-                    &mut b as *mut _ as isize,
-                );
-                if a == b {
-                    let mut point: POINT = zeroed();
-                    if GetCaretPos(&mut point) != 0 {
-                        let x = 58. + point.x as f32 / self.dpi;
-                        Canvas::new(dc, self.dpi).line(&[(x, 28.), (x, 45.)], p.text, 230, 0.8);
-                    }
-                }
-            }
-
-            SelectObject(edit_dc, old);
-            DeleteObject(edit_bitmap);
-            DeleteDC(edit_dc);
         }
         self.paint_group_selection_header(dc, w);
         render::flush(dc);
@@ -1731,16 +1741,22 @@ impl App {
         let preserve_alpha = needs_alpha;
         drop(alpha_batch);
         frame.present_with_alpha(hwnd, preserve_alpha);
-        if self.window_shadow.is_none() {
-            self.window_shadow = crate::compositor::WindowShadow::new(hwnd);
-        }
-        if let Some(shadow) = &mut self.window_shadow {
-            shadow.sync(hwnd, self.dpi, (self.dock.opacity * 2.55).round() as u8);
+        if self.resize_drag.is_some_and(|d| d.window == hwnd) {
+            if let Some(shadow) = &self.window_shadow {
+                shadow.hide();
+            }
+        } else if !self.moving_window {
+            if self.window_shadow.is_none() {
+                self.window_shadow = crate::compositor::WindowShadow::new(hwnd);
+            }
+            if let Some(shadow) = &mut self.window_shadow {
+                shadow.sync(hwnd, self.dpi, (self.dock.opacity * 2.55).round() as u8);
+            }
         }
         let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
         self.frame = Some(frame);
         EndPaint(hwnd, &ps);
-        if self.motion.timer_running {
+        if self.motion.timer_running && !self.moving_window && self.resize_drag.is_none() {
             crate::motion::pace_vsync(hwnd, frame_started, &mut self.frame_queued, MOTION_FRAME);
         }
         if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
@@ -2356,12 +2372,18 @@ unsafe extern "system" fn wndproc(
             app.popup = None;
             app.layout_edit(hwnd);
 
-            InvalidateRect(hwnd, null(), 0);
+            if app.resize_drag.is_none() || crate::glass::resize_paint_due(hwnd) {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_WINDOWPOSCHANGING => {
             let dpi = app.dpi;
-            if let Some(shadow) = &mut app.window_shadow {
+            if app.resize_drag.is_some_and(|d| d.window == hwnd) {
+                if let Some(shadow) = &app.window_shadow {
+                    shadow.hide();
+                }
+            } else if let Some(shadow) = &mut app.window_shadow {
                 shadow.follow_position(&*(lparam as *const WINDOWPOS), dpi);
             }
             drop(app);
@@ -2370,16 +2392,25 @@ unsafe extern "system" fn wndproc(
         WM_WINDOWPOSCHANGED => {
             let dpi = app.dpi;
             let opacity = (app.dock.opacity * 2.55).round() as u8;
-            if let Some(shadow) = &mut app.window_shadow {
-                shadow.sync(hwnd, dpi, opacity);
+            if app.resize_drag.is_some() {
+                if let Some(shadow) = &app.window_shadow {
+                    shadow.hide();
+                }
+            } else if app.moving_window {
+                if let Some(shadow) = &mut app.window_shadow {
+                    shadow.follow_position(&*(lparam as *const WINDOWPOS), dpi);
+                }
+            } else {
+                if let Some(shadow) = &mut app.window_shadow {
+                    shadow.sync(hwnd, dpi, opacity);
+                }
             }
             drop(app);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_MOVE => {
-            if (!app.moving_window
-                || (!crate::motion::low_power()
-                    && (app.dock.frosted || crate::glass::liquid_glass())))
+            if !crate::fusion::is_atomic_moving(hwnd)
+                && crate::glass::frosted_glass()
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);
@@ -2701,6 +2732,7 @@ unsafe extern "system" fn wndproc(
             app.motion.group_target(None, now);
             app.scroll.by(-(delta as f32) / 120. * 72., now);
             app.arm_motion(hwnd);
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_CONTEXTMENU => {
@@ -2770,7 +2802,22 @@ unsafe extern "system" fn wndproc(
                 }
                 app.background_key.clear();
                 app.packages.refresh();
+                if let Some(host) = &mut app.general {
+                    host.refresh();
+                }
+                crate::fusion::refresh();
                 InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        STARTUP_WIDGET => {
+            if let Some(id) = app.pending_startup.pop_front() {
+                app.show_package(&id);
+                if !app.pending_startup.is_empty() {
+                    PostMessageW(hwnd, STARTUP_WIDGET, 0, 0);
+                } else if crate::motion::low_power() {
+                    crate::glass::trim_working_set();
+                }
             }
             0
         }
@@ -2900,6 +2947,7 @@ unsafe extern "system" fn wndproc(
             report_metrics(app.started.elapsed().as_secs_f64(), app.cpu_start);
             KillTimer(hwnd, PIN_TIMER);
             KillTimer(hwnd, SMOKE_TIMER);
+            KillTimer(hwnd, UPDATE_CHECK_TIMER);
             for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
                 KillTimer(hwnd, id);
             }
@@ -2907,6 +2955,7 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_NCDESTROY => {
+            crate::gpu::remove_surface(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -3041,6 +3090,9 @@ pub fn run() -> Result<(), String> {
         let mut work: RECT = zeroed();
         SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut work as *mut _ as _, 0);
         let dpi = GetDpiForSystem() as f32 / 96.0;
+        if let Err(error) = crate::general::load_preferences(&root) {
+            eprintln!("native-general: {error}");
+        }
         let mut app = Box::new(RefCell::new(App {
             frame: None,
             window_shadow: None,
@@ -3080,7 +3132,8 @@ pub fn run() -> Result<(), String> {
             search_muted: rgb(193, 202, 215),
             resize_drag: None,
             pending_resize: None,
-            glass: std::rc::Rc::new(RefCell::new(Glass::new(dock.blur, dpi))),
+            pending_startup: std::collections::VecDeque::new(),
+            glass: std::rc::Rc::new(RefCell::new(Glass::new(crate::glass::global_blur(), dpi))),
             packages: crate::widget_packages::Registry::discover(&root),
             general: None,
             root,
@@ -3140,7 +3193,7 @@ pub fn run() -> Result<(), String> {
             (info.rcWork.bottom - height).max(info.rcWork.top),
         );
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED
+            crate::gpu::window_ex_style()
                 | if inspect {
                     WS_EX_APPWINDOW
                 } else {
@@ -3163,9 +3216,6 @@ pub fn run() -> Result<(), String> {
             return Err(std::io::Error::last_os_error().to_string());
         }
         crate::fusion::init(app.borrow().glass.clone());
-        if let Err(error) = crate::general::load_preferences(&app.borrow().root) {
-            eprintln!("native-general: {error}");
-        }
         ShowWindow(
             hwnd,
             if !inspect && !app.borrow().packages.enabled("launcher", true) {
@@ -3198,8 +3248,15 @@ pub fn run() -> Result<(), String> {
                 }
             }
         }
-        for id in startup {
-            app.borrow_mut().show_package(&id);
+        if smoke {
+            for id in startup {
+                app.borrow_mut().show_package(&id);
+            }
+        } else if !startup.is_empty() {
+            app.borrow_mut().pending_startup.extend(startup);
+            PostMessageW(hwnd, STARTUP_WIDGET, 0, 0);
+        } else if crate::motion::low_power() {
+            crate::glass::trim_working_set();
         }
         if std::env::args().any(|a| a == "--manage-widgets") {
             app.borrow_mut().show_general();
@@ -3227,8 +3284,36 @@ pub fn run() -> Result<(), String> {
             if crate::notes::translate(&message) {
                 continue;
             }
+            if matches!(
+                message.message,
+                MOTION_FRAME
+                    | crate::motion::VSYNC_FRAME
+                    | crate::widget_header::HEADER_FRAME
+            ) {
+                let mut pending: MSG = zeroed();
+                let mut pumped = 0;
+                while pumped < 16
+                    && PeekMessageW(&mut pending, null_mut(), WM_PAINT, WM_PAINT, PM_REMOVE) != 0
+                {
+                    DispatchMessageW(&pending);
+                    pumped += 1;
+                }
+                let mut timers = 0;
+                while timers < 16
+                    && PeekMessageW(&mut pending, null_mut(), WM_TIMER, WM_TIMER, PM_REMOVE) != 0
+                {
+                    DispatchMessageW(&pending);
+                    timers += 1;
+                }
+            }
+            let was_paint = message.message == WM_PAINT;
             TranslateMessage(&message);
             DispatchMessageW(&message);
+            if was_paint
+                && ((GetQueueStatus(QS_PAINT) >> 16) & QS_PAINT == 0)
+            {
+                crate::motion::flush_pending_vsync(std::time::Instant::now());
+            }
         }
         crate::fusion::shutdown();
         CloseHandle(mutex);

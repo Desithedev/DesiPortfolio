@@ -201,6 +201,9 @@ struct State {
     changes: VecDeque<Change>,
     frame: Option<Buffer>,
     backdrop: Option<Buffer>,
+    content_cache: Option<Buffer>,
+    content_key: String,
+    content_hits: Vec<Hit>,
     key: String,
     shadow: Option<WindowShadow>,
     surface: u32,
@@ -282,6 +285,9 @@ impl Host {
             changes: VecDeque::new(),
             frame: None,
             backdrop: None,
+            content_cache: None,
+            content_key: String::new(),
+            content_hits: vec![],
             key: String::new(),
             shadow: None,
             surface: 0x24201e,
@@ -342,6 +348,7 @@ impl Host {
     pub fn set_rows(&mut self, rows: Vec<Row>) {
         let mut s = self.state.borrow_mut();
         s.rows = rows;
+        s.content_cache = None;
         unsafe {
             if IsWindowVisible(s.hwnd) != 0 {
                 InvalidateRect(s.hwnd, null(), 0);
@@ -357,6 +364,7 @@ impl Host {
         s.surface = fixed;
         s.light = false;
         s.key.clear();
+        s.content_cache = None;
         unsafe {
             if IsWindowVisible(s.hwnd) != 0 {
                 InvalidateRect(s.hwnd, null(), 0);
@@ -369,6 +377,7 @@ impl Host {
     pub fn refresh(&mut self) {
         let mut s = self.state.borrow_mut();
         s.key.clear();
+        s.content_cache = None;
         unsafe {
             if IsWindowVisible(s.hwnd) != 0 {
                 InvalidateRect(s.hwnd, null(), 0);
@@ -472,17 +481,16 @@ impl State {
         if GetCapture() == self.hwnd {
             ReleaseCapture();
         }
-        if GetCapture() == self.hwnd {
-            ReleaseCapture();
-        }
         ShowWindow(self.hwnd, SW_HIDE);
         KillTimer(self.hwnd, 1);
         self.scroll_clock = None;
         self.frame_queued = false;
         self.frame = None;
         self.backdrop = None;
+        self.content_cache = None;
         self.shadow = None;
         self.key.clear();
+        self.content_key.clear();
     }
     unsafe fn scrollbar(&self) -> Option<[f32; 4]> {
         let [w, h] = self.size();
@@ -534,6 +542,7 @@ impl State {
                         }
                     }
                     self.emit(id, Value::Choice(key));
+                    self.content_cache = None;
                 }
                 InvalidateRect(self.hwnd, null(), 0);
                 return;
@@ -584,6 +593,7 @@ impl State {
         }
         if let Some((id, value)) = change {
             self.emit(id, value);
+            self.content_cache = None;
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
@@ -611,6 +621,7 @@ impl State {
         }
         if let Some(value) = change {
             self.emit(id, Value::Number(value));
+            self.content_cache = None;
             InvalidateRect(self.hwnd, null(), 0);
         }
     }
@@ -638,18 +649,16 @@ impl State {
             return;
         };
         let dc = frame.dc;
-        let mut pos: RECT = zeroed();
-        GetWindowRect(self.hwnd, &mut pos);
+        let white = if self.light { 0x312720 } else { 0xf8f2f1 };
+        let dim = if self.light { 0x706358 } else { 0xc7bcac };
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
-            pos.left,
-            pos.top,
+            "{}:{}:{}:{}:{}:{}",
             rect.right,
             rect.bottom,
             self.dpi,
             self.surface,
             self.light,
-            self.glass.borrow().revision()
+            self.title
         );
         let frozen = self.drag.is_some()
             && self.backdrop.as_ref().is_some_and(|b| {
@@ -660,11 +669,18 @@ impl State {
             let brush = CreateSolidBrush(bg);
             FillRect(dc, &rect, brush);
             DeleteObject(brush);
+            self.light = false;
             let c = Canvas::new(dc, self.dpi);
             c.round([0., 0., w, h], 30., bg, 255, false, false);
             c.round([0.5, 0.5, w - 0.5, h - 0.5], 30., 0xffffff, 22, true, false);
+            c.round([17., 16., 45., 44.], 14., white, 14, false, false);
+            c.round([17., 16., 45., 44.], 14., white, 24, true, false);
+            c.line(&[(33., 23.), (27., 30.), (33., 37.)], white, 200, 1.3);
+            c.text(&self.title, [54., 14., w - 58., 46.], 13., true, white, 0);
+            c.line(&[(w - 37., 25.), (w - 29., 33.)], dim, 210, 1.2);
+            c.line(&[(w - 29., 25.), (w - 37., 33.)], dim, 210, 1.2);
             drop(c);
-            self.light = false;
+            crate::render::flush(dc);
             if let Some(back) = Buffer::plain(rect.right, rect.bottom, self.dpi) {
                 back.copy_from(dc);
                 self.backdrop = Some(back);
@@ -687,16 +703,6 @@ impl State {
             self.smooth_scroll.max = max_scroll;
             self.smooth_scroll.snap(self.scroll);
         }
-        let white = if self.light { 0x312720 } else { 0xf8f2f1 };
-        let dim = if self.light { 0x706358 } else { 0xc7bcac };
-        let c = Canvas::new(dc, self.dpi);
-        c.round([17., 16., 45., 44.], 14., white, 14, false, false);
-        c.round([17., 16., 45., 44.], 14., white, 24, true, false);
-        c.line(&[(33., 23.), (27., 30.), (33., 37.)], white, 200, 1.3);
-        c.text(&self.title, [54., 14., w - 58., 46.], 13., true, white, 0);
-        c.line(&[(w - 37., 25.), (w - 29., 33.)], dim, 210, 1.2);
-        c.line(&[(w - 29., 25.), (w - 37., 33.)], dim, 210, 1.2);
-        drop(c);
         self.hits = vec![
             Hit {
                 rect: [16., 14., 46., 46.],
@@ -707,77 +713,95 @@ impl State {
                 target: Target::Close,
             },
         ];
+        let clip_top = (58. * self.dpi) as i32;
+        let clip_bottom = rect.bottom - (12. * self.dpi) as i32;
         let saved = SaveDC(dc);
-        IntersectClipRect(
-            dc,
-            0,
-            (58. * self.dpi) as i32,
-            rect.right,
-            rect.bottom - (12. * self.dpi) as i32,
+        IntersectClipRect(dc, 0, clip_top, rect.right, clip_bottom);
+        let content_h_px = ((self.content_height(w) - 58. + 18.).max(1.) * self.dpi).ceil() as i32;
+        let active_press = self
+            .pressed
+            .filter(|t| matches!(t, Target::Button(_) | Target::Toggle(_)));
+        let content_key = format!(
+            "{}:{}:{}:{}:{}:{:?}",
+            rect.right, self.dpi, self.light, self.subtitle, content_h_px, active_press
         );
-        let c = Canvas::new(dc, self.dpi);
-        let shift = |r: [f32; 4]| [r[0], r[1] - self.scroll, r[2], r[3] - self.scroll];
-        c.text(
-            &self.subtitle,
-            shift([24., 62., w - 24., 87.]),
-            11.,
-            false,
-            dim,
-            0,
-        );
-        let cols = if w < 480. { 2 } else { 3 };
-        let positions = row_layout(&self.rows, w);
-        for (i, row) in self.rows.iter().enumerate() {
-            if matches!(row, Row::Section(_)) {
-                let end = self.rows[i + 1..]
-                    .iter()
-                    .position(|r| matches!(r, Row::Section(_)))
-                    .map_or(self.rows.len(), |n| i + 1 + n);
-                if end > i + 1 && !matches!(self.rows[i + 1], Row::Widget { .. }) {
-                    let r = shift([16., positions[i][3], w - 16., positions[end - 1][3] + 4.]);
-                    c.round(r, 16., white, 10, false, false);
-                    c.round(r, 16., white, 35, true, false);
-                }
-            }
-        }
-        let mut hits = vec![];
-        for (i, row) in self.rows.iter().enumerate() {
-            let bounds = positions[i];
-            let y = bounds[1];
-            let rh = bounds[3] - y;
-            match row {
-                Row::Section(label) => c.text(
-                    &label
-                        .to_uppercase()
-                        .chars()
-                        .map(|c| c.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    shift([25., y + 4., w - 25., y + 20.]),
-                    9.,
-                    true,
+        if self.content_cache.is_none() || self.content_key != content_key {
+            if let Some(cache_buf) = Buffer::plain(rect.right, content_h_px, self.dpi) {
+                let cdc = cache_buf.dc;
+                let bg = 0x24201e;
+                let brush = CreateSolidBrush(bg);
+                let cache_rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rect.right,
+                    bottom: content_h_px,
+                };
+                FillRect(cdc, &cache_rect, brush);
+                DeleteObject(brush);
+                let c = Canvas::new(cdc, self.dpi);
+                let shift = |r: [f32; 4]| [r[0], r[1] - 58., r[2], r[3] - 58.];
+                c.text(
+                    &self.subtitle,
+                    shift([24., 62., w - 24., 87.]),
+                    11.,
+                    false,
                     dim,
                     0,
-                ),
-                Row::Widget {
-                    id,
-                    settings_id,
-                    pin_id,
-                    label,
-                    hint,
-                    value,
-                    pinned,
-                } => {
-                    let left = bounds[0];
-                    let right = bounds[2];
-                    c.round(shift(bounds), 16., white, 12, false, false);
-                    c.round(shift(bounds), 16., white, 25, true, false);
-                    let preview = shift([left + 12., y + 12., left + 72., y + 59.]);
-                    let mini = Canvas::new(dc, self.dpi);
-                    mini.transform_about([preview[0], preview[1]], 60. / 112., 0.);
-                    widget_preview(
-                        &mini,
-                        [preview[0], preview[1], preview[0] + 112., preview[1] + 88.],
+                );
+                let cols = if w < 480. { 2 } else { 3 };
+                let positions = row_layout(&self.rows, w);
+                for (i, row) in self.rows.iter().enumerate() {
+                    if matches!(row, Row::Section(_)) {
+                        let end = self.rows[i + 1..]
+                            .iter()
+                            .position(|r| matches!(r, Row::Section(_)))
+                            .map_or(self.rows.len(), |n| i + 1 + n);
+                        if end > i + 1 && !matches!(self.rows[i + 1], Row::Widget { .. }) {
+                            let r =
+                                shift([16., positions[i][3], w - 16., positions[end - 1][3] + 4.]);
+                            c.round(r, 16., white, 10, false, false);
+                            c.round(r, 16., white, 35, true, false);
+                        }
+                    }
+                }
+                let mut hits = vec![];
+                for (i, row) in self.rows.iter().enumerate() {
+                    let bounds = positions[i];
+                    let y = bounds[1];
+                    let rh = bounds[3] - y;
+                    match row {
+                        Row::Section(label) => c.text(
+                            &label
+                                .to_uppercase()
+                                .chars()
+                                .map(|c| c.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            shift([25., y + 4., w - 25., y + 20.]),
+                            9.,
+                            true,
+                            dim,
+                            0,
+                        ),
+                        Row::Widget {
+                            id,
+                            settings_id,
+                            pin_id,
+                            label,
+                            hint,
+                            value,
+                            pinned,
+                        } => {
+                            let left = bounds[0];
+                            let right = bounds[2];
+                            c.round(shift(bounds), 16., white, 12, false, false);
+                            c.round(shift(bounds), 16., white, 25, true, false);
+                            let preview = shift([left + 12., y + 12., left + 72., y + 59.]);
+                            let mini = Canvas::new(cdc, self.dpi);
+                            mini.transform_about([preview[0], preview[1]], 60. / 112., 0.);
+                            widget_preview(
+                                &mini,
+                                [preview[0], preview[1], preview[0] + 112., preview[1] + 88.],
                         label,
                         self.dpi * 60. / 112.,
                         white,
@@ -819,7 +843,7 @@ impl State {
                             target: Target::Button(*settings_id),
                         });
                     }
-                    if *pin_id != 0 {
+                        if *pin_id != 0 {
                         let pin_btn = shift([right - 86., y + 67., right - 64., y + 89.]);
                         let pressed = self.pressed == Some(Target::Toggle(*pin_id));
                         c.round(
@@ -836,16 +860,17 @@ impl State {
                             false,
                             false,
                         );
-                        if let Some(icon) = header_icon(
+                        with_header_icon(
                             if *pinned { 3 } else { 2 },
                             self.dpi,
                             if *pinned { white } else { dim },
-                        ) {
-                            c.image(
-                                &icon,
-                                shift([right - 81.5, y + 71.5, right - 68.5, y + 84.5]),
-                            );
-                        }
+                            |icon| {
+                                c.image(
+                                    icon,
+                                    shift([right - 81.5, y + 71.5, right - 68.5, y + 84.5]),
+                                );
+                            },
+                        );
                         hits.push(Hit {
                             rect: shift([right - 90., y + 63., right - 60., y + 93.]),
                             target: Target::Toggle(*pin_id),
@@ -1057,31 +1082,64 @@ impl State {
                     c.text(text, r, 10.5, true, 0xffffff, 1);
                 }
             }
-            if !matches!(
-                row,
-                Row::Section(_) | Row::Choices { .. } | Row::Widget { .. }
-            ) && self
-                .rows
-                .get(i + 1)
-                .is_some_and(|r| !matches!(r, Row::Section(_)))
-            {
-                c.line(
-                    &[(16., y + rh - self.scroll), (w - 16., y + rh - self.scroll)],
-                    white,
-                    20,
-                    0.5,
+                    if !matches!(
+                        row,
+                        Row::Section(_) | Row::Choices { .. } | Row::Widget { .. }
+                    ) && self
+                        .rows
+                        .get(i + 1)
+                        .is_some_and(|r| !matches!(r, Row::Section(_)))
+                    {
+                        c.line(
+                            &[(16., y + rh - 58.), (w - 16., y + rh - 58.)],
+                            white,
+                            20,
+                            0.5,
+                        );
+                    }
+                }
+                drop(c);
+                crate::render::flush(cdc);
+                self.content_cache = Some(cache_buf);
+                self.content_key = content_key;
+                self.content_hits = hits;
+            }
+        }
+        if let Some(cache) = &self.content_cache {
+            frame.copy_scrolled_vertical(cache, clip_top, clip_bottom, self.scroll * self.dpi);
+            if let Some(back) = &self.backdrop {
+                frame.fade_list_edges(
+                    back,
+                    58.,
+                    h - 12.,
+                    self.scroll > 0.5,
+                    self.scroll + 0.5 < max_scroll,
                 );
             }
         }
-        for mut hit in hits {
-            hit.rect[1] = hit.rect[1].max(58.);
-            hit.rect[3] = hit.rect[3].min(h - 12.);
-            if hit.rect[3] > hit.rect[1] {
+        let mut focus_rect = None;
+        for hit in &self.content_hits {
+            let mut rect_h = [
+                hit.rect[0],
+                hit.rect[1] + 58. - self.scroll,
+                hit.rect[2],
+                hit.rect[3] + 58. - self.scroll,
+            ];
+            rect_h[1] = rect_h[1].max(58.);
+            rect_h[3] = rect_h[3].min(h - 12.);
+            if rect_h[3] > rect_h[1] {
                 if self.focus == Some(hit.target) {
-                    c.round(hit.rect, 7., white, 130, true, false);
+                    focus_rect = Some(rect_h);
                 }
-                self.hits.push(hit);
+                self.hits.push(Hit {
+                    rect: rect_h,
+                    target: hit.target,
+                });
             }
+        }
+        if let Some(rect_h) = focus_rect {
+            let c = Canvas::new(dc, self.dpi);
+            c.round(rect_h, 7., white, 130, true, false);
         }
         if self.content_height(w) > h {
             let track = h - 84.;
@@ -1096,7 +1154,6 @@ impl State {
                 });
             }
         }
-        drop(c);
         RestoreDC(dc, saved);
         frame.present(self.hwnd);
         self.frame = Some(frame);
@@ -1244,7 +1301,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_LBUTTONUP => {
             let pressed = s.pressed.take();
             let moved = s.drag.take().is_some();
-            s.key.clear();
+            if moved {
+                s.key.clear();
+            }
             let hit = s.hit(point(lp));
             drop(s);
             ReleaseCapture();
@@ -1261,9 +1320,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
-            s.drag = None;
+            if s.drag.take().is_some() {
+                s.key.clear();
+            }
             s.pressed = None;
-            s.key.clear();
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1280,7 +1340,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.smooth_scroll
                 .by(-((wp >> 16) as i16 as f32 / 120. * 72.), now);
             s.scroll = s.smooth_scroll.value(now);
-            SetTimer(hwnd, 1, 10, None);
+            SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1357,6 +1417,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 if let Some(v) = change {
                     s.emit(id, Value::Number(v));
+                    s.content_cache = None;
                 }
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -1375,18 +1436,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             s.smooth_scroll
                 .by(if wp == 0x21 { -240. } else { 240. }, now);
             s.scroll = s.smooth_scroll.value(now);
-            SetTimer(hwnd, 1, 10, None);
+            SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_SIZE => {
             s.key.clear();
+        s.content_cache = None;
             InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_DPICHANGED => {
             s.dpi = wp as u16 as f32 / 96.;
             s.key.clear();
+        s.content_cache = None;
             let r = *(lp as *const RECT);
             drop(s);
             SetWindowPos(
@@ -1548,6 +1611,39 @@ const SETTINGS_SVG: &str = include_str!("../assets/toolbar/5.svg");
 const CLOSE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>"##;
 const PIN_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"##;
 const PIN_FILLED_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path fill="currentColor" d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"##;
+thread_local! {
+    static HEADER_IMAGES: RefCell<Vec<(usize, u32, u32, crate::render::Image)>> =
+        const { RefCell::new(Vec::new()) };
+}
+pub fn clear_cache() {
+    HEADER_IMAGES.with(|cache| cache.borrow_mut().clear());
+}
+fn with_header_icon(kind: usize, dpi: f32, ink: u32, f: impl Fn(&crate::render::Image)) {
+    let px = (16. * dpi * 2.).ceil().max(1.) as u32;
+    let hit = HEADER_IMAGES.with(|cache| {
+        let cache = cache.borrow();
+        if let Some((_, _, _, img)) = cache.iter().find(|e| e.0 == kind && e.1 == px && e.2 == ink)
+        {
+            f(img);
+            true
+        } else {
+            false
+        }
+    });
+    if hit {
+        return;
+    }
+    if let Some(image) = header_icon(kind, dpi, ink) {
+        f(&image);
+        HEADER_IMAGES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= 16 {
+                cache.remove(0);
+            }
+            cache.push((kind, px, ink, image));
+        });
+    }
+}
 fn header_icon(kind: usize, dpi: f32, ink: u32) -> Option<crate::render::Image> {
     let px = (16. * dpi * 2.).ceil().max(1.) as u32;
     thread_local! {static PIXELS:RefCell<Vec<(usize,u32,u32,Vec<u8>)>>=const {RefCell::new(Vec::new())};}
@@ -1648,15 +1744,15 @@ pub unsafe fn draw_widget_header(
                 false,
             );
         }
-        if let Some(image) = header_icon(i, dpi, ink) {
+        with_header_icon(i, dpi, ink, |image| {
             let icon = Canvas::new(dc, dpi);
             icon.transform_about([r[0] + 16., r[1] + 16.], 1., motion.rotation[i]);
             icon.image_alpha(
-                &image,
+                image,
                 [r[0] + 8., r[1] + 8., r[0] + 24., r[1] + 24.],
                 motion.alpha * (0.62 + amount * 0.28),
             );
-        }
+        });
     }
 }
 pub unsafe fn retain_header_backing(frame: &mut Buffer, backing: &Buffer, hwnd: HWND, w: f32) {

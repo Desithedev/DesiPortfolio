@@ -5,7 +5,7 @@ impl State {
         let [w, h] = size;
         let color = self.surface_color();
         let light = crate::accent::light(color);
-        let tint = if self.config.frosted_glass {
+        let tint = if crate::glass::frosted_glass() {
             self.config.tint
         } else {
             100.
@@ -19,16 +19,8 @@ impl State {
             [4., 4., w - 4., h - 4.]
         };
         let radius = if fused { 0. } else { 34. };
-        // Exactly Dock's coating order/units. pane_overlay already includes
+        // Exactly Dock's coating order/units. draw_pane_overlay already includes
         // reflection_gradient: calling both makes the material doubly smoky.
-        if self.overlay.is_none() {
-            self.overlay = Canvas::pane_overlay(
-                [bg.width as u32, bg.height as u32],
-                self.dpi,
-                tint / 100.,
-                light,
-            );
-        }
         let c = Canvas::new(bg.dc, self.dpi);
         if self.config.design == "disc" {
             // Disc's warm printed backing is part of its graphic identity.
@@ -48,9 +40,13 @@ impl State {
         }
         crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
         c.coating(pane, radius);
-        if let Some(image) = &self.overlay {
-            c.image(image, [0., 0., w, h]);
-        }
+        c.draw_pane_overlay(
+            [bg.width as u32, bg.height as u32],
+            self.dpi,
+            tint / 100.,
+            light,
+            [0., 0., w, h],
+        );
         c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
     }
     pub(super) unsafe fn rounded_cover(&self, c: &Canvas, url: &str, r: [f32; 4], radius: f32) {

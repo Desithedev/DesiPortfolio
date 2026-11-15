@@ -57,12 +57,20 @@ impl Worker {
                 super::display_restore::configure(&root);
                 super::input_source::configure(&root);
                 let initialized = CoInitializeEx(null(), COINIT_MULTITHREADED as u32) >= 0;
+                let mut last_snapshot: Option<Snapshot> = None;
                 while let Ok(command) = requests.recv() {
                     let error = command.as_ref().and_then(|c| execute(c).err());
-                    let mut state = snapshot();
+                    let audio_only = command.as_ref().is_some_and(|c| {
+                        !matches!(c.control.kind, Kind::Display | Kind::Hdr | Kind::Source)
+                    });
+                    let mut state = match (audio_only, last_snapshot.take()) {
+                        (true, Some(prev)) => snapshot_audio_only(prev),
+                        _ => snapshot(),
+                    };
                     if let Some(error) = error {
                         state.errors.insert(0, error);
                     }
+                    last_snapshot = Some(state.clone());
                     if results.send(state).is_err() {
                         break;
                     }
@@ -547,6 +555,26 @@ pub unsafe fn snapshot() -> Snapshot {
         }
         Err(e) => s.errors.push(e),
     }
+    match audio(None, 0) {
+        Ok((d, v, m)) => {
+            s.outputs = d;
+            s.volume = v;
+            s.muted = m;
+        }
+        Err(e) => s.errors.push(e),
+    }
+    match audio(None, 1) {
+        Ok((d, v, m)) => {
+            s.inputs = d;
+            s.mic_volume = v;
+            s.mic_muted = m;
+        }
+        Err(e) => s.errors.push(e),
+    }
+    s
+}
+unsafe fn snapshot_audio_only(mut s: Snapshot) -> Snapshot {
+    s.errors.clear();
     match audio(None, 0) {
         Ok((d, v, m)) => {
             s.outputs = d;

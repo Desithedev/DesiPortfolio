@@ -5,15 +5,8 @@ pub const MESSAGE: u32 = WM_APP + 104;
 pub fn rows(b: &model::Board) -> Vec<Row> {
     vec![
         Row::section("Background"),
-        Row::toggle(
-            1,
-            "Frosted glass",
-            "Blend this widget with the wallpaper",
-            b.frosted,
-        ),
         Row::slider(2, "Glass tint", b.tint, 0., 100., "%"),
         Row::slider(3, "Frost strength", b.frost_strength, 0., 100., "%"),
-        Row::slider(4, "Blur size", b.blur.unwrap_or(13.), 0., 64., "px"),
         Row::slider(5, "Background opacity", b.opacity, 0., 100., "%"),
         Row::choices(
             6,
@@ -96,18 +89,10 @@ impl State {
         }
     }
     pub(super) fn source_glass(&self) -> Rc<RefCell<Glass>> {
-        self.local_glass.as_ref().unwrap_or(&self.glass).clone()
+        self.glass.clone()
     }
     pub(super) unsafe fn update_local_blur(&mut self) {
-        if let Some(blur) = self.board.blur {
-            if let Some(glass) = &self.local_glass {
-                glass.borrow_mut().set_blur(blur, self.dpi);
-            } else {
-                let mut glass = Glass::new(blur, self.dpi);
-                glass.refresh();
-                self.local_glass = Some(Rc::new(RefCell::new(glass)));
-            }
-        }
+        self.local_glass = None;
     }
     pub(super) unsafe fn open_settings(&mut self) {
         // Do not hide, move, re-theme or replace the board when settings opens.
@@ -167,6 +152,8 @@ impl State {
         }
         if backdrop_changed {
             self.background_key.clear();
+            self.header_base_key.clear();
+            self.bg_ink = None;
             self.overlay = None;
         }
         self.schedule();

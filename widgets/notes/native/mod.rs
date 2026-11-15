@@ -130,6 +130,7 @@ struct State {
     frame_queued: bool,
     started: std::time::Instant,
     moving: bool,
+    resizing: bool,
     scrollbar_drag: Option<f32>,
     scrollbar_visible: bool,
     smoke: bool,
@@ -266,6 +267,7 @@ impl Host {
             frame_queued: false,
             started: std::time::Instant::now(),
             moving: false,
+            resizing: false,
             scrollbar_drag: None,
             scrollbar_visible: false,
             smoke,
@@ -304,7 +306,7 @@ impl Host {
         let w = r.right - r.left;
         let h = r.bottom - r.top;
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED
+            crate::gpu::window_ex_style()
                 | if inspect {
                     WS_EX_APPWINDOW
                 } else {
@@ -383,6 +385,8 @@ impl Host {
             glass.borrow_mut().refresh();
         }
         s.background_key.clear();
+        s.header_base_key.clear();
+        s.bg_ink = None;
         s.overlay = None;
         if IsWindowVisible(s.hwnd) != 0 {
             InvalidateRect(s.hwnd, null(), 0);
@@ -896,7 +900,7 @@ impl State {
             if self.scroll_clock.is_none() {
                 self.scroll_clock = Some(crate::motion::FrameClock::start());
             }
-            SetTimer(self.hwnd, ANIMATE, 10, None);
+            SetTimer(self.hwnd, ANIMATE, crate::motion::frame_interval_ms(), None);
             InvalidateRect(self.hwnd, null(), 0);
         }
     }
@@ -1379,36 +1383,37 @@ impl State {
         // position for this frame, even when rendering takes several ms.
         self.paint_scroll = Some(self.scroll.value(self.now()));
         let [w, h] = self.dimensions();
-        let mut wr: RECT = zeroed();
-        GetWindowRect(self.hwnd, &mut wr);
+        let wr = crate::fusion::window_rect(self.hwnd);
         let paper = self.board.design == "notebook";
         let index = self.board.design == "index";
         let honey = self.board.design == "honey";
         let type_scale = self.type_scale();
         let base = self.surface_color();
+        let frosted = crate::glass::frosted_glass();
         let source_glass = self.source_glass();
         let key = format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            wr.left,
-            wr.top,
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            if frosted { wr.left } else { 0 },
+            if frosted { wr.top } else { 0 },
             r.right,
             r.bottom,
             self.dpi,
             self.board.design,
             self.board.palette,
+            base,
             self.content_top(),
-            self.board.frosted,
+            frosted,
             self.board.tint,
             self.board.frost_strength,
             source_glass.borrow().revision(),
-            crate::fusion::revision(self.hwnd)
+            crate::fusion::revision(self.hwnd),
+            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
         );
         let cached = self
             .background
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        let bg_reused = cached
-            && ((self.moving && crate::motion::low_power()) || self.background_key == key);
+        let bg_reused = cached && self.background_key == key;
         let own_alpha = (self.board.opacity * 2.55) as u8;
         let group_op = crate::fusion::group_opacities(self.hwnd, own_alpha);
         let header_action_key = |a: Option<&Action>| match a {
@@ -1427,7 +1432,7 @@ impl State {
         {
             let hv = crate::widget_header::visual(self.hwnd);
             let mut hk = format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
                 self.background_key,
                 own_alpha,
                 self.chrome().tiny(),
@@ -1441,6 +1446,8 @@ impl State {
                 hv.hover[1].to_bits(),
                 hv.rotation[0].to_bits(),
                 hv.rotation[1].to_bits(),
+                self.board.notes.len(),
+                self.status,
             );
             if let Some((_, ops)) = &group_op {
                 for o in ops {
@@ -1480,26 +1487,27 @@ impl State {
                     &c,
                     [0., 0., w, h],
                     &self.board.palette,
-                    if self.board.frosted {
+                    if frosted {
                         self.board.tint / 100.
                     } else {
                         1.
                     },
                 );
             } else {
-                if !(self.moving && crate::motion::low_power()) {
+                if frosted {
                     source_glass.borrow().draw_blended(
                         frame.dc,
                         self.hwnd,
                         r.right,
                         r.bottom,
-                        if self.board.frosted {
-                            (self.board.frost_strength * 2.55) as u8
-                        } else {
-                            0
-                        },
+                        (self.board.frost_strength * 2.55).round() as u8,
                     );
                 }
+                let tint = if frosted {
+                    self.board.tint / 100.
+                } else {
+                    1.
+                };
                 {
                     let c = Canvas::new(frame.dc, self.dpi);
                     let pane = [0., 0., w, h];
@@ -1508,11 +1516,7 @@ impl State {
                             pane,
                             30.,
                             base,
-                            (if self.board.frosted {
-                                self.board.tint
-                            } else {
-                                100.
-                            } * 2.55) as u8,
+                            (tint * 255.).round() as u8,
                             false,
                             false,
                         );
@@ -1521,34 +1525,16 @@ impl State {
                         &c,
                         pane,
                         &self.board.palette,
-                        if self.board.frosted {
-                            self.board.tint / 100.
-                        } else {
-                            1.
-                        },
+                        tint,
                     );
                     c.coating(pane, 30.);
-                }
-                let overlay_key = format!(
-                    "{}:{}:{}:{}:{}",
-                    r.right, r.bottom, self.dpi, self.board.tint, paper
-                );
-                if (!self.moving && self.overlay.as_ref().is_none_or(|(k, _)| *k != overlay_key))
-                    || self.overlay.is_none()
-                {
-                    self.overlay = Canvas::pane_overlay(
+                    c.draw_pane_overlay(
                         [r.right as u32, r.bottom as u32],
                         self.dpi,
-                        self.board.tint / 100.,
+                        tint,
                         paper,
-                    )
-                    .map(|v| (overlay_key, v));
-                }
-                {
-                    let c = Canvas::new(frame.dc, self.dpi);
-                    if let Some((_, image)) = &self.overlay {
-                        c.image(image, [0., 0., w, h]);
-                    }
+                        [0., 0., w, h],
+                    );
                     c.widget_corner_reflection_for(self.hwnd, [0., 0., w, h], 30., paper);
                 }
             }
@@ -1760,6 +1746,39 @@ impl State {
             }
         }
         crate::settings_ui::retain_header_backing(&mut frame, backing, self.hwnd, w);
+        {
+            let c = Canvas::new(frame.dc, self.dpi);
+            c.text(
+                &if self.status.is_empty() {
+                    format!("{} notes", self.board.notes.len())
+                } else {
+                    self.status.clone()
+                },
+                if self.chrome().tiny() {
+                    [16., h - 32., w - 80., h - 10.]
+                } else {
+                    [24., h - 41., w - 168., h - 19.]
+                },
+                11.,
+                false,
+                muted,
+                0,
+            );
+            if self.chrome().tiny() {
+                icons::folder(&c, w - 34., h - 30., muted);
+            } else {
+                icons::folder(&c, w - 124., h - 40., muted);
+                c.text(
+                    "Open folder",
+                    [w - 104., h - 41., w - 24., h - 19.],
+                    11.,
+                    false,
+                    muted,
+                    1,
+                );
+            }
+        }
+        crate::render::flush(frame.dc);
         if !header_key.is_empty() {
             if let Some(hb) = self
                 .header_base
@@ -1817,12 +1836,13 @@ impl State {
                 if rect[3] < self.viewport()[0] || rect[1] > self.viewport()[1] {
                     continue;
                 }
-                let Some(note) = self.board.notes.iter().find(|n| n.id == *id).cloned() else {
+                let Some(note_idx) = self.board.notes.iter().position(|n| n.id == *id) else {
                     continue;
                 };
-                let [x, y, right, bottom] = *rect;
-                let color = Self::color(&note);
                 let hover_t = if scrolling { 0. } else { self.card_hover(id, now) };
+                let note = &self.board.notes[note_idx];
+                let [x, y, right, bottom] = *rect;
+                let color = Self::color(note);
                 let has_editor = self
                     .editor
                     .as_ref()
@@ -2062,82 +2082,51 @@ impl State {
             frame.fade_list(base, top, bottom);
         }
         self.list_base = fade_base;
-        {
+        if let Some((id, r)) = &palette_rect {
             let c = Canvas::new(frame.dc, self.dpi);
-            if let Some((id, r)) = &palette_rect {
-                backing.restore_glass_card(frame.dc, *r, 12.);
-                c.glass_surface(*r, 12., 100, paper);
-                if let Some(note) = self.board.notes.iter().find(|n| n.id == *id) {
-                    for (i, color) in model::COLORS.iter().enumerate() {
-                        let mut swatch = note.clone();
-                        swatch.color = (*color).into();
-                        let cols = layout::palette_columns(*r);
-                        let x = r[0] + 8. + (i % cols) as f32 * 24.;
-                        let y = r[1] + 10. + (i / cols) as f32 * 24.;
-                        icons::bead(&c, x, y, Self::color(&swatch));
-                        if note.color == *color {
-                            c.round(
-                                [x - 3., y - 3., x + 19., y + 19.],
-                                11.,
-                                ink,
-                                220,
-                                true,
-                                false,
-                            );
-                        }
+            backing.restore_glass_card(frame.dc, *r, 12.);
+            c.glass_surface(*r, 12., 100, paper);
+            if let Some(note) = self.board.notes.iter().find(|n| n.id == *id) {
+                for (i, color) in model::COLORS.iter().enumerate() {
+                    let mut swatch = note.clone();
+                    swatch.color = (*color).into();
+                    let cols = layout::palette_columns(*r);
+                    let x = r[0] + 8. + (i % cols) as f32 * 24.;
+                    let y = r[1] + 10. + (i / cols) as f32 * 24.;
+                    icons::bead(&c, x, y, Self::color(&swatch));
+                    if note.color == *color {
+                        c.round(
+                            [x - 3., y - 3., x + 19., y + 19.],
+                            11.,
+                            ink,
+                            220,
+                            true,
+                            false,
+                        );
                     }
                 }
             }
         }
-
-        {
-            let c = Canvas::new(frame.dc, self.dpi);
-            if self.scrollbar_visible {
-                if let Some(bar) = crate::geometry::scrollbar(
-                    w as i32,
-                    (self.viewport()[1] + 40.) as i32,
-                    self.viewport()[0] as i32,
-                    self.scroll.max,
-                    self.scroll.value(self.now()),
-                ) {
-                    frame.fill_round(bar, 2., ink, 120);
-                }
-            }
-            c.text(
-                &if self.status.is_empty() {
-                    format!("{} notes", self.board.notes.len())
-                } else {
-                    self.status.clone()
-                },
-                if self.chrome().tiny() {
-                    [16., h - 32., w - 80., h - 10.]
-                } else {
-                    [24., h - 41., w - 168., h - 19.]
-                },
-                11.,
-                false,
-                muted,
-                0,
-            );
-            if self.chrome().tiny() {
-                icons::folder(&c, w - 34., h - 30., muted);
-            } else {
-                icons::folder(&c, w - 124., h - 40., muted);
-                c.text(
-                    "Open folder",
-                    [w - 104., h - 41., w - 24., h - 19.],
-                    11.,
-                    false,
-                    muted,
-                    1,
-                );
+        if self.scrollbar_visible {
+            if let Some(bar) = crate::geometry::scrollbar(
+                w as i32,
+                (self.viewport()[1] + 40.) as i32,
+                self.viewport()[0] as i32,
+                self.scroll.max,
+                self.scroll.value(self.now()),
+            ) {
+                frame.fill_round(bar, 2., ink, 120);
             }
         }
         self.paint_scroll = None;
         frame.present_with_alpha(self.hwnd, true);
         self.frame = Some(frame);
         EndPaint(self.hwnd, &ps);
-        if let Some(shadow) = &mut self.shadow {
+        if self.resizing {
+            if let Some(shadow) = &self.shadow {
+                shadow.hide();
+            }
+        } else if let Some(shadow) = &mut self.shadow {
             shadow.sync_with_radius(self.hwnd, self.dpi, (self.board.opacity * 2.55) as u8, 30.);
         }
         if IsWindowVisible(self.hwnd) != 0 && self.animating(self.now()) {
@@ -2170,6 +2159,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         return 1;
     }
     if msg == WM_NCDESTROY {
+        crate::gpu::remove_surface(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         return DefWindowProcW(hwnd, msg, w, l);
     }
@@ -2406,7 +2396,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             if s.scroll_clock.is_none() {
                 s.scroll_clock = Some(crate::motion::FrameClock::start());
             }
-            SetTimer(hwnd, ANIMATE, 10, None);
+            SetTimer(hwnd, ANIMATE, crate::motion::frame_interval_ms(), None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -2463,12 +2453,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         WM_ENTERSIZEMOVE => {
-            s.moving = true;
+            crate::widget_interaction::enter_size_move(&mut s.moving);
             s.finish_editor();
             0
         }
+        WM_SIZING => {
+            {
+                let s = &mut *s;
+                crate::widget_interaction::start_resize(hwnd, &mut s.resizing, s.shadow.as_ref());
+            }
+            drop(s);
+            DefWindowProcW(hwnd, msg, w, l)
+        }
         WM_EXITSIZEMOVE => {
-            s.moving = false;
+            let s = &mut *s;
+            crate::widget_interaction::exit_size_move(hwnd, &mut s.moving, &mut s.resizing);
             s.background_key.clear();
             s.overlay = None;
             s.bounds();
@@ -2476,10 +2475,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (!s.moving || !crate::motion::low_power())
-                && (s.board.frosted || crate::glass::liquid_glass())
-                && crate::glass::move_paint_due(hwnd)
-            {
+            if crate::widget_interaction::should_paint_move(hwnd, s.resizing) {
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -2487,11 +2483,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         WM_SIZE => {
             let width = (l as u32 & 0xffff) as i32;
             let height = ((l as u32 >> 16) & 0xffff) as i32;
+            if s.moving {
+                let s = &mut *s;
+                crate::widget_interaction::start_resize(hwnd, &mut s.resizing, s.shadow.as_ref());
+            }
             if width > 0
                 && height > 0
                 && s.frame
                     .as_ref()
                     .is_none_or(|b| !b.matches_geometry(width, height, s.dpi, 30.))
+                && crate::widget_interaction::should_paint_resize(
+                    hwnd,
+                    s.moving,
+                    s.frame.is_some(),
+                )
             {
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -2499,9 +2504,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         WM_WINDOWPOSCHANGING => {
             let dpi = s.dpi;
-            if let Some(shadow) = &mut s.shadow {
-                shadow.follow_position(&*(l as *const WINDOWPOS), dpi);
-            }
+            let resizing = s.resizing;
+            crate::widget_interaction::on_window_pos_changed(
+                &*(l as *const WINDOWPOS),
+                resizing,
+                &mut s.shadow,
+                dpi,
+            );
             drop(s);
             DefWindowProcW(hwnd, msg, w, l)
         }
@@ -2960,8 +2969,8 @@ mod tests {
             );
             s.update_local_blur();
             assert!(
-                !Rc::ptr_eq(&s.source_glass(), &glass),
-                "Notes blur must never mutate the shared Dock Glass"
+                Rc::ptr_eq(&s.source_glass(), &glass),
+                "Notes shares the global Lumen Glass instance"
             );
             s.hide();
             assert!(s.editor.is_none());

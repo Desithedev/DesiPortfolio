@@ -41,15 +41,8 @@ impl State {
         let c = &self.config;
         let mut rows = vec![
             Row::section("Background"),
-            Row::toggle(
-                FROST,
-                "Frosted glass",
-                "Use the wallpaper behind this clock",
-                c.frosted_glass,
-            ),
             Row::slider(TINT, "Glass tint", c.tint, 0., 100., "%"),
             Row::slider(STRENGTH, "Frost strength", c.frost_strength, 0., 100., "%"),
-            Row::slider(BLUR, "Blur size", c.blur, 0., 80., " px"),
             Row::slider(OPACITY, "Background opacity", c.opacity, 0., 100., "%"),
             Row::choices(
                 PALETTE,
@@ -169,10 +162,6 @@ impl State {
         if changed {
             if backdrop_changed {
                 self.key.clear();
-            }
-            if !self.config.frosted_glass {
-                self.frost = None;
-                self.frost_key.clear();
             }
             self.arm();
             SetTimer(self.hwnd, 99, 180, None);

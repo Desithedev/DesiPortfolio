@@ -11,6 +11,8 @@ mod fusion;
 mod general;
 mod geometry;
 mod glass;
+mod gpu;
+mod lenses;
 mod logger;
 mod model;
 mod motion;
@@ -25,6 +27,7 @@ mod text_prompt;
 mod tray;
 mod update;
 mod widget_header;
+mod widget_interaction;
 mod widget_packages;
 
 // Win32 z-order/activation are process/desktop-wide, whereas production uses
@@ -38,6 +41,9 @@ pub(crate) fn native_ui_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 fn main() {
     if update::dispatch() {
+        return;
+    }
+    if startup::dispatch() {
         return;
     }
     logger::init(&model::root());

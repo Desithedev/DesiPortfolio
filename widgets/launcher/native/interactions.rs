@@ -63,7 +63,7 @@ impl App {
             self.motion.clock = Some(crate::motion::FrameClock::start());
             // 16 ms rounds to two system ticks on some Windows configurations.
             // A 10 ms wake-up plus DWM presentation pacing avoids the 31 ms cadence.
-            SetTimer(hwnd, MOTION_TIMER, 10, None);
+            SetTimer(hwnd, MOTION_TIMER, crate::motion::frame_interval_ms(), None);
             self.motion.timer_running = true;
             InvalidateRect(hwnd, null(), 0);
         }
@@ -76,6 +76,7 @@ impl App {
         if self.pointer == p && self.hover == hover {
             return;
         }
+        let hover_changed = self.hover != hover;
         self.pointer = p;
         self.hover = hover;
         let now = self.now();
@@ -94,6 +95,9 @@ impl App {
         });
         self.motion.hover(id, p, self.now());
         self.arm_motion(hwnd);
+        if hover_changed {
+            InvalidateRect(hwnd, null(), 0);
+        }
     }
     pub(super) unsafe fn pointer_down(&mut self, hwnd: HWND, pos: usize, p: Point) {
         let visible = self.visible(hwnd);
@@ -325,7 +329,7 @@ impl App {
             || self.tile_drag.as_ref().is_some_and(|d| d.active)
             || self.popup.as_ref().is_some_and(|p| p.moving(now))
             || self.group_selection_moving(now);
-        let timer_active = active || self.resize_drag.is_some();
+        let timer_active = active;
         if !timer_active {
             KillTimer(hwnd, MOTION_TIMER);
             self.motion.timer_running = false;
@@ -731,7 +735,10 @@ impl App {
                         x + cell as f32 * count as f32 - 6.,
                         y + row as f32 - 4.,
                     ];
-                    if self.dock.opacity < 100. || crate::glass::liquid_glass() {
+                    if (self.dock.opacity < 100. || crate::glass::liquid_glass())
+                        && !self.moving_window
+                        && !crate::fusion::is_moving(hwnd)
+                    {
                         if let Some(background) = &self.background {
                             background.restore_glass_card(dc, r, 20.);
                         }

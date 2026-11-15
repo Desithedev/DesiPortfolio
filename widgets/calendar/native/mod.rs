@@ -47,6 +47,7 @@ enum Action {
 }
 const APPLY_MODE: u32 = WM_APP + 82;
 const SETTINGS_CHANGED: u32 = WM_APP + 84;
+const WALLPAPER_READY: u32 = WM_APP + 85;
 struct Button {
     rect: [f32; 4],
     action: Action,
@@ -81,6 +82,7 @@ struct State {
     pressed: Option<Action>,
     hover: Option<Action>,
     hover_alpha: f32,
+    hover_updated: std::time::Instant,
     hover_clock: Option<crate::motion::FrameClock>,
     frame_queued: bool,
     drag: Option<Drag>,
@@ -95,7 +97,7 @@ pub fn should_open(root: &Path) -> bool {
 impl Host {
     pub unsafe fn create(
         root: &Path,
-        _glass: Rc<RefCell<Glass>>,
+        glass: Rc<RefCell<Glass>>,
         inspect: bool,
         smoke: bool,
     ) -> Result<Self, String> {
@@ -114,8 +116,9 @@ impl Host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         let dpi = GetDpiForSystem() as f32 / 96.;
-        let glass = Rc::new(RefCell::new(Glass::new(config.blur, dpi)));
-        glass.borrow_mut().refresh();
+        if smoke {
+            glass.borrow_mut().refresh();
+        }
         let mut state = Box::new(RefCell::new(State {
             #[cfg(test)]
             size_events: 0,
@@ -141,6 +144,7 @@ impl Host {
             pressed: None,
             hover: None,
             hover_alpha: 0.,
+            hover_updated: std::time::Instant::now(),
             hover_clock: None,
             frame_queued: false,
             drag: None,
@@ -172,7 +176,7 @@ impl Host {
             );
         }
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED
+            crate::gpu::window_ex_style()
                 | if inspect {
                     WS_EX_APPWINDOW
                 } else {
@@ -200,6 +204,9 @@ impl Host {
             let mut s = state.borrow_mut();
             s.hwnd = hwnd;
             s.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
+            if !smoke {
+                s.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+            }
         }
         Ok(Self { state })
     }
@@ -319,17 +326,10 @@ impl State {
     fn settings_rows(&self) -> Vec<crate::settings_ui::Row> {
         use crate::settings_ui::{Choice, Row};
         let c = &self.config;
-        let mut rows = vec![
+        let rows = vec![
             Row::section("Background"),
-            Row::toggle(
-                1,
-                "Frosted glass",
-                "Blend this widget's design with the wallpaper",
-                c.frosted,
-            ),
             Row::slider(2, "Glass tint", c.tint, 0., 100., "%"),
             Row::slider(3, "Frost strength", c.frost_strength, 0., 100., "%"),
-            Row::slider(4, "Blur size", c.blur, 0., 80., "px"),
             Row::slider(5, "Background opacity", c.opacity, 0., 100., "%"),
             Row::note("Background opacity lets desktop windows show through; dates stay clear."),
             Row::choices(
@@ -417,7 +417,6 @@ impl State {
                 (3, Value::Number(v)) => self.config.frost_strength = v.clamp(0., 100.),
                 (4, Value::Number(v)) => {
                     self.config.blur = v.clamp(0., 80.);
-                    self.glass.borrow_mut().set_blur(self.config.blur, self.dpi);
                 }
                 (5, Value::Number(v)) => self.config.opacity = v.clamp(0., 100.),
                 (6, Value::Choice(v)) if crate::surface::valid(&v) => {
@@ -614,6 +613,7 @@ impl State {
                 self.pressed = None;
                 self.hover = None;
                 self.drag = None;
+                crate::glass::set_resizing(self.hwnd, false);
                 self.save();
                 ShowWindow(self.hwnd, SW_HIDE);
                 self.frame = None;
@@ -651,8 +651,7 @@ impl State {
             EndPaint(self.hwnd, &ps);
             return;
         };
-        let mut position: RECT = zeroed();
-        GetWindowRect(self.hwnd, &mut position);
+        let position = crate::fusion::window_rect(self.hwnd);
         let theme = self.config.theme.as_str();
         let wallpaper_accent = self.glass.borrow().wallpaper_accent();
         let accent = if self.config.palette == crate::accent::THEME {
@@ -678,33 +677,32 @@ impl State {
                 color(c[0] as u32, c[1] as u32, c[2] as u32)
             })
             .unwrap_or(color(18, 22, 30));
+        let frosted = crate::glass::frosted_glass();
         let key = format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
-            position.left,
-            position.top,
+            if frosted { position.left } else { 0 },
+            if frosted { position.top } else { 0 },
             r.right,
             r.bottom,
             self.dpi,
             theme,
-            self.config.frosted,
+            frosted,
             self.config.tint,
             self.glass.borrow().revision(),
             crate::fusion::revision(self.hwnd),
-            self.config.blur,
             self.config.frost_strength,
-            self.config.palette
+            self.config.palette,
+            crate::motion::low_power() && crate::fusion::is_moving(self.hwnd)
         );
         let backdrop_reusable = self
             .backdrop
             .as_ref()
             .is_some_and(|b| b.width == r.right && b.height == r.bottom && b.dpi == self.dpi);
-        if !backdrop_reusable
-            || (!(self.drag.is_some() && crate::motion::low_power()) && self.key != key)
-        {
+        if !backdrop_reusable || self.key != key {
             let brush = CreateSolidBrush(base);
             FillRect(frame.dc, &r, brush);
             DeleteObject(brush);
-            if self.config.frosted && !(self.drag.is_some() && crate::motion::low_power()) {
+            if frosted {
                 self.glass.borrow().draw_blended(
                     frame.dc,
                     self.hwnd,
@@ -717,7 +715,7 @@ impl State {
             // contour; independently rounding this material multiplies edge alpha.
             let pane = layout::background_rect(w, h);
             let chrome = [4., 4., w - 4., h - 4.];
-            let blend = if self.config.frosted {
+            let blend = if frosted {
                 self.config.tint / 100.
             } else {
                 1.
@@ -736,14 +734,13 @@ impl State {
             crate::surface::paint(&c, pane, &self.config.palette, blend);
             self.paint_agenda_sidebar(frame.dc, w, h);
             c.coating(chrome, radius);
-            if let Some(overlay) = Canvas::pane_overlay(
+            c.draw_pane_overlay(
                 [r.right as u32, r.bottom as u32],
                 self.dpi,
                 self.config.tint / 100.,
                 light,
-            ) {
-                c.image(&overlay, [0., 0., w, h]);
-            }
+                [0., 0., w, h],
+            );
             c.widget_corner_reflection_for(self.hwnd, chrome, radius, light);
             drop(c);
             frame.bevel_for(self.hwnd);
@@ -849,12 +846,16 @@ impl State {
         frame.present_with_alpha(self.hwnd, true);
         self.frame = Some(frame);
         if let Some(shadow) = &mut self.shadow {
-            shadow.sync_with_radius(
-                self.hwnd,
-                self.dpi,
-                (self.config.opacity * 2.55).round() as u8,
-                radius,
-            );
+            if self.drag.as_ref().is_some_and(|d| d.edge != HTCAPTION) {
+                shadow.hide();
+            } else {
+                shadow.sync_with_radius(
+                    self.hwnd,
+                    self.dpi,
+                    (self.config.opacity * 2.55).round() as u8,
+                    radius,
+                );
+            }
         }
         EndPaint(self.hwnd, &ps);
         if IsWindowVisible(self.hwnd) != 0 && self.hover_clock.is_some() {
@@ -922,8 +923,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             GetWindowRect(hwnd, &mut r);
             let mut p = zeroed();
             GetCursorPos(&mut p);
+            let edge = wp as u32;
+            if edge != HTCAPTION {
+                crate::glass::set_resizing(hwnd, true);
+                if let Some(shadow) = &s.shadow {
+                    shadow.hide();
+                }
+            }
             s.drag = Some(Drag {
-                edge: wp as u32,
+                edge,
                 start: p,
                 bounds: r,
             });
@@ -975,7 +983,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         ],
                     )
                 };
-                if d.edge != HTCAPTION {
+                if d.edge == HTCAPTION {
+                    drop(s);
+                    crate::fusion::move_captured_widget(hwnd, r);
+                } else {
                     crate::fusion::snap_resize_rect(
                         hwnd,
                         &mut r,
@@ -985,39 +996,35 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             (model::MIN_HEIGHT as f32 * s.dpi).ceil() as i32,
                         ],
                     );
-                }
-                drop(s);
-                SetWindowPos(
-                    hwnd,
-                    null_mut(),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                let Ok(mut s) = (*ptr).try_borrow_mut() else {
-                    return 0;
-                };
-                let dpi = s.dpi;
-                let opacity = (s.config.opacity * 2.55).round() as u8;
-                let radius = s.frame_radius;
-                if let Some(shadow) = &mut s.shadow {
-                    shadow.sync_with_radius(hwnd, dpi, opacity, radius);
-                }
-                let resize = s.drag.as_ref().is_some_and(|d| d.edge != HTCAPTION);
-                if resize || !crate::motion::low_power() {
-                    InvalidateRect(hwnd, null(), 0);
+                    drop(s);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    if let Ok(s) = (*ptr).try_borrow_mut() {
+                        if let Some(shadow) = &s.shadow {
+                            shadow.hide();
+                        }
+                    }
+                    if crate::glass::resize_paint_due(hwnd) {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
                 }
             } else {
                 let hover = s.hit(p);
                 if hover != s.hover {
                     s.hover = hover;
                     s.hover_alpha = 0.;
+                    s.hover_updated = std::time::Instant::now();
                     if s.hover_clock.is_none() {
                         s.hover_clock = Some(crate::motion::FrameClock::start());
                     }
-                    SetTimer(hwnd, 2, 10, None);
+                    SetTimer(hwnd, 2, crate::motion::frame_interval_ms(), None);
                     InvalidateRect(hwnd, null(), 0);
                 }
                 let mut track = TRACKMOUSEEVENT {
@@ -1033,6 +1040,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONUP => {
             let a = s.pressed.take();
             let moved = s.drag.take().is_some();
+            crate::glass::set_resizing(hwnd, false);
             ReleaseCapture();
             if moved {
                 s.key.clear();
@@ -1047,6 +1055,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             if s.drag.take().is_some() {
+                crate::glass::set_resizing(hwnd, false);
                 s.key.clear();
                 s.bounds();
             }
@@ -1068,7 +1077,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_TIMER if wp == 2 => {
-            s.hover_alpha = (s.hover_alpha + 0.08).min(1.);
+            let dt = s.hover_updated.elapsed().as_secs_f32().clamp(0., 0.1);
+            s.hover_updated = std::time::Instant::now();
+            s.hover_alpha = (s.hover_alpha + dt / 0.14).min(1.);
             if s.hover_alpha >= 1. {
                 KillTimer(hwnd, 2);
                 s.hover_clock = None;
@@ -1081,11 +1092,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         m if m == crate::motion::VSYNC_FRAME => {
             s.frame_queued = false;
             if s.hover_clock.is_some() {
-                s.hover_alpha = (s.hover_alpha + 0.08).min(1.);
+                let dt = s.hover_updated.elapsed().as_secs_f32().clamp(0., 0.1);
+                s.hover_updated = std::time::Instant::now();
+                s.hover_alpha = (s.hover_alpha + dt / 0.14).min(1.);
                 if s.hover_alpha >= 1. {
                     KillTimer(hwnd, 2);
                     s.hover_clock = None;
                 }
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        m if m == WALLPAPER_READY => {
+            if s.glass.borrow_mut().finish_async() {
+                s.key.clear();
                 InvalidateRect(hwnd, null(), 0);
             }
             0
@@ -1110,6 +1130,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     s.pressed = None;
 
                     if let Some(d) = s.drag.take() {
+                        crate::glass::set_resizing(hwnd, false);
                         s.key.clear();
                         drop(s);
                         SetWindowPos(
@@ -1169,19 +1190,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
-            if (s.drag.is_none() || !crate::motion::low_power())
-                && (s.config.frosted || crate::glass::liquid_glass())
+            if !crate::fusion::is_atomic_moving(hwnd)
+                && crate::glass::frosted_glass()
                 && crate::glass::move_paint_due(hwnd)
             {
                 InvalidateRect(hwnd, null(), 0);
             }
             0
         }
-        WM_WINDOWPOSCHANGED => {
+        WM_WINDOWPOSCHANGING | WM_WINDOWPOSCHANGED => {
             let dpi = s.dpi;
-            if let Some(shadow) = &mut s.shadow {
-                shadow.follow_position(&*(lp as *const WINDOWPOS), dpi);
-            }
+            let resizing = s.drag.as_ref().is_some_and(|d| d.edge != HTCAPTION);
+            crate::widget_interaction::on_window_pos_changed(
+                &*(lp as *const WINDOWPOS),
+                resizing,
+                &mut s.shadow,
+                dpi,
+            );
             drop(s);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
@@ -1214,6 +1239,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCDESTROY => {
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
+            crate::gpu::remove_surface(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(s);
             DefWindowProcW(hwnd, msg, wp, lp)
@@ -1237,9 +1263,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         unsafe {
             let shared = Rc::new(RefCell::new(Glass::new(13., 1.)));
-            let revision = shared.borrow().revision();
             let host = Host::create(&root, shared.clone(), true, true).unwrap();
-            assert!(!Rc::ptr_eq(&host.state.borrow().glass, &shared));
+            let revision = shared.borrow().revision();
+            assert!(Rc::ptr_eq(&host.state.borrow().glass, &shared));
             for dpi in [1., 1.25, 1.5, 2.] {
                 for size in [
                     [168, 190],

@@ -25,6 +25,10 @@ pub(super) struct Hit {
 }
 pub(super) struct State {
     pub frame: Option<crate::compositor::Buffer>,
+    pub backdrop: Option<crate::compositor::Buffer>,
+    pub content_cache: Option<crate::compositor::Buffer>,
+    pub content_key: String,
+    pub content_hits: Vec<Hit>,
     pub hwnd: HWND,
     pub dpi: f32,
     pub scroll: i32,
@@ -40,6 +44,10 @@ impl Default for State {
     fn default() -> Self {
         Self {
             frame: None,
+            backdrop: None,
+            content_cache: None,
+            content_key: String::new(),
+            content_hits: vec![],
             hwnd: null_mut(),
             dpi: 1.0,
             scroll: 0,
@@ -151,11 +159,12 @@ impl App {
     }
     fn settings_content_height(&self) -> i32 {
         let extra = if self.settings.expanded { 162 } else { 0 };
-        494 + extra + 236 + 40
+        400 + extra + 236 + 40
     }
     pub(super) unsafe fn settings_changed(&mut self, layout: bool, blur: bool) {
         if blur {
-            self.glass.borrow_mut().set_blur(self.dock.blur, self.dpi);
+            let b = crate::glass::global_blur();
+            self.glass.borrow_mut().set_blur(b, self.dpi);
         }
         if layout {
             // Columns/icon size reflow content inside the user's existing
@@ -195,9 +204,6 @@ impl App {
             .expect("settings paint buffer");
         let dc = frame.dc;
         let bg = rgb(30, 32, 36);
-        let b = CreateSolidBrush(bg);
-        FillRect(dc, &rect, b);
-        DeleteObject(b);
         let scale = self.settings.dpi;
         let w = (rect.right as f32 / scale) as i32;
         let h = (rect.bottom as f32 / scale) as i32;
@@ -217,97 +223,118 @@ impl App {
                 .smooth_scroll
                 .snap(self.settings.scroll as f32);
         }
-        let c = Canvas::new(dc, scale);
         let white = rgb(241, 242, 248);
         let dim = rgb(172, 188, 199);
-        c.round(
-            [0., 0., w as f32, h as f32],
-            30.,
-            rgb(30, 32, 36),
-            255,
-            false,
-            false,
-        );
-        c.round(
-            [0.5, 0.5, w as f32 - 0.5, h as f32 - 0.5],
-            30.,
-            0xffffff,
-            22,
-            true,
-            false,
-        );
-        drop(c);
-        let c = Canvas::new(dc, scale);
-        c.round([17., 16., 45., 44.], 14., white, 14, false, false);
-        c.round([17., 16., 45., 44.], 14., white, 24, true, false);
-        c.line(&[(33., 23.), (27., 30.), (33., 37.)], white, 200, 1.3);
-        c.text(
-            "App Dock settings",
-            [54., 14., w as f32 - 58., 46.],
-            13.,
-            true,
-            white,
-            0,
-        );
-        c.line(
-            &[(w as f32 - 37., 25.), (w as f32 - 29., 33.)],
-            dim,
-            210,
-            1.2,
-        );
-        c.line(
-            &[(w as f32 - 29., 25.), (w as f32 - 37., 33.)],
-            dim,
-            210,
-            1.2,
-        );
-        drop(c);
-        let saved = SaveDC(dc);
-        IntersectClipRect(
-            dc,
-            0,
-            (58. * scale) as i32,
-            rect.right,
-            rect.bottom - (12. * scale) as i32,
-        );
-        let c = Canvas::new(dc, scale);
-        let scroll = self.settings.scroll;
-        let mut hits = vec![
-            Hit {
-                rect: [16, 14, 46, 46],
-                action: Action::Close,
-            },
-            Hit {
-                rect: [w - 46, 14, w - 16, 46],
-                action: Action::Close,
-            },
-        ];
-        let tx = |text: &str, r: [i32; 4], size: f32, bold: bool, color: u32, align: i32| {
-            c.text(
-                text,
-                [
-                    r[0] as f32,
-                    (r[1] - scroll) as f32,
-                    r[2] as f32,
-                    (r[3] - scroll) as f32,
-                ],
-                size,
-                bold,
-                color,
-                align,
-            )
-        };
-        let round = |r: [i32; 4], radius: f32, alpha: u8, outline: bool| {
+        let backdrop_ok = self.settings.backdrop.as_ref().is_some_and(|b| {
+            b.width == rect.right && b.height == rect.bottom && b.dpi == scale
+        });
+        if !backdrop_ok {
+            let b = CreateSolidBrush(bg);
+            FillRect(dc, &rect, b);
+            DeleteObject(b);
+            let c = Canvas::new(dc, scale);
             c.round(
-                [
-                    r[0] as f32,
-                    (r[1] - scroll) as f32,
-                    r[2] as f32,
-                    (r[3] - scroll) as f32,
-                ],
-                radius,
+                [0., 0., w as f32, h as f32],
+                30.,
+                rgb(30, 32, 36),
+                255,
+                false,
+                false,
+            );
+            c.round(
+                [0.5, 0.5, w as f32 - 0.5, h as f32 - 0.5],
+                30.,
+                0xffffff,
+                22,
+                true,
+                false,
+            );
+            drop(c);
+            let c = Canvas::new(dc, scale);
+            c.round([17., 16., 45., 44.], 14., white, 14, false, false);
+            c.round([17., 16., 45., 44.], 14., white, 24, true, false);
+            c.line(&[(33., 23.), (27., 30.), (33., 37.)], white, 200, 1.3);
+            c.text(
+                "App Dock settings",
+                [54., 14., w as f32 - 58., 46.],
+                13.,
+                true,
                 white,
-                alpha,
+                0,
+            );
+            c.line(
+                &[(w as f32 - 37., 25.), (w as f32 - 29., 33.)],
+                dim,
+                210,
+                1.2,
+            );
+            c.line(
+                &[(w as f32 - 29., 25.), (w as f32 - 37., 33.)],
+                dim,
+                210,
+                1.2,
+            );
+            drop(c);
+            if let Some(back) = crate::compositor::Buffer::plain(rect.right, rect.bottom, scale) {
+                back.copy_from(dc);
+                self.settings.backdrop = Some(back);
+            }
+        } else if let Some(back) = &self.settings.backdrop {
+            frame.copy_from(back.dc);
+        }
+        let clip_top = (58. * scale) as i32;
+        let clip_bottom = rect.bottom - (12. * scale) as i32;
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, 0, clip_top, rect.right, clip_bottom);
+        let content_h = self.settings_content_height();
+        let content_h_px = ((content_h - 58).max(1) as f32 * scale).ceil() as i32;
+        let content_key = format!(
+            "{}:{}:{}:{}:{}",
+            rect.right, scale, self.settings.expanded, self.accent_color, content_h_px
+        );
+        if self.settings.content_cache.is_none() || self.settings.content_key != content_key {
+            if let Some(cache_buf) =
+                crate::compositor::Buffer::plain(rect.right, content_h_px, scale)
+            {
+                let cdc = cache_buf.dc;
+                let b = CreateSolidBrush(bg);
+                let cache_rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rect.right,
+                    bottom: content_h_px,
+                };
+                FillRect(cdc, &cache_rect, b);
+                DeleteObject(b);
+                let c = Canvas::new(cdc, scale);
+                let scroll = 58;
+                let mut hits = vec![];
+                let tx = |text: &str, r: [i32; 4], size: f32, bold: bool, color: u32, align: i32| {
+                    c.text(
+                        text,
+                        [
+                            r[0] as f32,
+                            (r[1] - scroll) as f32,
+                            r[2] as f32,
+                            (r[3] - scroll) as f32,
+                        ],
+                        size,
+                        bold,
+                        color,
+                        align,
+                    )
+                };
+                let round = |r: [i32; 4], radius: f32, alpha: u8, outline: bool| {
+                    c.round(
+                        [
+                            r[0] as f32,
+                            (r[1] - scroll) as f32,
+                            r[2] as f32,
+                            (r[3] - scroll) as f32,
+                        ],
+                        radius,
+                        white,
+                        alpha,
                 outline,
                 false,
             )
@@ -324,10 +351,7 @@ impl App {
             )
         };
         let mut hit = |r: [i32; 4], action| {
-            let r = [r[0], r[1] - scroll, r[2], r[3] - scroll];
-            if r[3] > 58 && r[1] < h - 12 {
-                hits.push(Hit { rect: r, action });
-            }
+            hits.push(Hit { rect: r, action });
         };
         let toggle = |y: i32, on: bool| {
             let r = [w - 61, y + 10, w - 27, y + 30];
@@ -365,36 +389,23 @@ impl App {
             0,
         );
         let extra = if self.settings.expanded { 162 } else { 0 };
-        round([16, 112, w - 16, 462 + extra], 16., 10, false);
-        round([16, 112, w - 16, 462 + extra], 16., 35, true);
-        tx("Frosted glass", [28, 116, w - 80, 137], 12., true, white, 0);
-        tx(
-            "Blend this widget’s design with the wallpaper",
-            [28, 136, w - 80, 151],
-            9.5,
-            false,
-            dim,
-            0,
-        );
-        toggle(115, self.dock.frosted);
-        hit([w - 76, 114, w - 20, 154], Action::Frosted);
-        line(154);
+        round([16, 112, w - 16, 368 + extra], 16., 10, false);
+        round([16, 112, w - 16, 368 + extra], 16., 35, true);
         for (label, value, max, y, action, suffix) in [
-            ("Glass tint", self.dock.tint, 100., 154, Action::Tint, "%"),
+            ("Glass tint", self.dock.tint, 100., 115, Action::Tint, "%"),
             (
                 "Frost strength",
                 self.dock.frost_strength,
                 100.,
-                209,
+                170,
                 Action::Strength,
                 "%",
             ),
-            ("Blur size", self.dock.blur, 80., 264, Action::Blur, "px"),
             (
                 "Background opacity",
                 self.dock.opacity,
                 100.,
-                319,
+                225,
                 Action::Opacity,
                 "%",
             ),
@@ -461,7 +472,7 @@ impl App {
         }
         tx(
             "Background opacity lets desktop windows show through.",
-            [32, 382, w - 30, 399],
+            [32, 288, w - 30, 305],
             9.,
             false,
             dim,
@@ -469,26 +480,26 @@ impl App {
         );
         tx(
             "Search, groups, icons and labels keep their own opacity.",
-            [32, 397, w - 30, 414],
+            [32, 303, w - 30, 320],
             9.,
             false,
             dim,
             0,
         );
-        line(425);
+        line(331);
         tx(
             if self.settings.expanded {
                 "⌄ Surface palette"
             } else {
                 "› Surface palette"
             },
-            [30, 431, w - 30, 458],
+            [30, 337, w - 30, 364],
             12.,
             false,
             dim,
             0,
         );
-        hit([20, 425, w - 20, 462], Action::Palette);
+        hit([20, 331, w - 20, 368], Action::Palette);
         if self.settings.expanded {
             let cell = (w - 64) / 3;
             for (i, theme) in THEMES.iter().enumerate() {
@@ -506,7 +517,7 @@ impl App {
                 } else {
                     rgb(248, 250, 253)
                 };
-                let y = 470 + (i / 3) as i32 * 36;
+                let y = 376 + (i / 3) as i32 * 36;
                 let chip = [
                     x as f32,
                     (y - scroll) as f32,
@@ -547,7 +558,7 @@ impl App {
                 hit([x, y, x + width, y + 29], Action::Theme(i));
             }
         }
-        let start = 494 + extra;
+        let start = 400 + extra;
         tx(
             "A P P  L A Y O U T",
             [25, start - 20, w - 25, start - 4],
@@ -707,15 +718,63 @@ impl App {
             2,
         );
         hit([w - 82, footer_y - 5, w - 22, footer_y + 32], Action::Quit);
-        drop(c);
+                drop(c);
+                render::flush(cdc);
+                self.settings.content_cache = Some(cache_buf);
+                self.settings.content_key = content_key;
+                self.settings.content_hits = hits;
+            }
+        }
+        let scroll_f = if self.settings.scroll_clock.is_some() {
+            self.settings.smooth_scroll.value(now)
+        } else {
+            self.settings.scroll as f32
+        };
+        if let Some(cache) = &self.settings.content_cache {
+            frame.copy_scrolled_vertical(cache, clip_top, clip_bottom, scroll_f * scale);
+            if let Some(back) = &self.settings.backdrop {
+                frame.fade_list_edges(
+                    back,
+                    58.,
+                    (h - 12) as f32,
+                    scroll_f > 0.5,
+                    scroll_f + 0.5 < max_scroll as f32,
+                );
+            }
+        }
         RestoreDC(dc, saved);
+        let scroll_i = scroll_f.round() as i32;
+        let mut hits = vec![
+            Hit {
+                rect: [16, 14, 46, 46],
+                action: Action::Close,
+            },
+            Hit {
+                rect: [w - 46, 14, w - 16, 46],
+                action: Action::Close,
+            },
+        ];
+        for h_item in &self.settings.content_hits {
+            let r = [
+                h_item.rect[0],
+                h_item.rect[1] - scroll_i,
+                h_item.rect[2],
+                h_item.rect[3] - scroll_i,
+            ];
+            if r[3] > 58 && r[1] < h - 12 {
+                hits.push(Hit {
+                    rect: r,
+                    action: h_item.action,
+                });
+            }
+        }
         self.settings.hits = hits;
-        let content = footer_y + 40;
+        let content = content_h;
         if content > h - 14 {
             let track = (h - 90).max(30) as f32;
             let thumb = (track * (h - 60) as f32 / content as f32).max(35.);
             let max = (content - h + 18).max(1) as f32;
-            let y = 70. + (track - thumb) * scroll as f32 / max;
+            let y = 70. + (track - thumb) * scroll_f / max;
             frame.fill_round([w as f32 - 8., y, w as f32 - 5., y + thumb], 1.5, white, 70);
         }
         frame.present(hwnd);
@@ -731,6 +790,7 @@ impl App {
         }
     }
     unsafe fn settings_action(&mut self, action: Action, x: i32) {
+        self.settings.content_cache = None;
         let w = client_dips(self.settings.hwnd, self.settings.dpi).0;
         let t = ((x - 28) as f32 / (w - 92).max(1) as f32).clamp(0., 1.);
         let mut layout = false;
@@ -738,6 +798,8 @@ impl App {
             Action::Close => {
                 ShowWindow(self.settings.hwnd, SW_HIDE);
                 self.settings.frame = None;
+                self.settings.backdrop = None;
+                self.settings.content_cache = None;
                 return;
             }
             Action::Frosted => self.dock.frosted = !self.dock.frosted,
@@ -1012,7 +1074,7 @@ unsafe extern "system" fn settings_proc(
             }
             app.settings.smooth_scroll.by(-delta * 72., now);
             app.settings.scroll = app.settings.smooth_scroll.value(now).round() as i32;
-            SetTimer(hwnd, 1, 10, None);
+            SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1044,11 +1106,15 @@ unsafe extern "system" fn settings_proc(
         WM_KEYDOWN if wparam == 0x1b => {
             ShowWindow(hwnd, SW_HIDE);
             app.settings.frame = None;
+            app.settings.backdrop = None;
+            app.settings.content_cache = None;
             0
         }
         WM_CLOSE => {
             ShowWindow(hwnd, SW_HIDE);
             app.settings.frame = None;
+            app.settings.backdrop = None;
+            app.settings.content_cache = None;
             0
         }
         WM_DESTROY => {

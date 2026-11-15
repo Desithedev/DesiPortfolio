@@ -699,7 +699,7 @@ unsafe extern "system" fn input_proc(
         PostMessageW(board, super::EDITOR_HOVER, 0, 0);
     }
     if !PRINTING.with(|p| p.get())
-        && matches!(
+        && (matches!(
             msg,
             WM_PAINT
                 | WM_KEYDOWN
@@ -709,13 +709,12 @@ unsafe extern "system" fn input_proc(
                 | WM_LBUTTONUP
                 | WM_LBUTTONDBLCLK
                 | WM_RBUTTONDOWN
-                | WM_MOUSEMOVE
                 | WM_MOUSEWHEEL
                 | WM_SETFOCUS
                 | WM_KILLFOCUS
                 | WM_IME_COMPOSITION
                 | WM_IME_ENDCOMPOSITION
-        )
+        ) || (msg == WM_MOUSEMOVE && (w & 1) != 0))
     {
         PostMessageW(parent, REDRAW, 0, 0);
     }

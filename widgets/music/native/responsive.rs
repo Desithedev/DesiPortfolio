@@ -4,11 +4,32 @@ pub(super) fn advance_spin(angle: f32, seconds: f32) -> f32 {
     (angle + seconds.clamp(0., 0.1) * 12.).rem_euclid(360.)
 }
 
+thread_local! {
+    static CLIENT_AREA_ANIM_CACHE: std::cell::RefCell<Option<(Instant, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+unsafe fn client_area_animations_enabled() -> bool {
+    let now = Instant::now();
+    if let Some(cached) = CLIENT_AREA_ANIM_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|(at, v)| (now.duration_since(*at).as_secs() < 5).then_some(*v))
+    }) {
+        return cached;
+    }
+    let mut animate = 1i32;
+    SystemParametersInfoW(0x1042, 0, &mut animate as *mut i32 as _, 0);
+    let enabled = animate != 0;
+    CLIENT_AREA_ANIM_CACHE.with(|c| {
+        *c.borrow_mut() = Some((now, enabled));
+    });
+    enabled
+}
+
 impl State {
     pub(super) unsafe fn sync_spin_timer(&mut self) {
-        let mut animate = 1i32;
-        SystemParametersInfoW(0x1042, 0, &mut animate as *mut i32 as _, 0);
-        let enabled = animate != 0
+        let enabled = !crate::motion::low_power()
+            && client_area_animations_enabled()
             && self.playback.playing
             && !self.moving
             && IsWindowVisible(self.hwnd) != 0
@@ -20,13 +41,22 @@ impl State {
                 if self.anim_clock.is_none() {
                     self.anim_clock = Some(crate::motion::FrameClock::start());
                 }
-                SetTimer(self.hwnd, 93, 10, None);
+                SetTimer(self.hwnd, 93, crate::motion::frame_interval_ms(), None);
             } else {
                 KillTimer(self.hwnd, 93);
                 if self.coverflow_anim.is_none() {
                     self.anim_clock = None;
                 }
             }
+        }
+        if self.coverflow_anim.is_some_and(|a| !a.finished())
+            && self.config.design == "coverflow"
+            && IsWindowVisible(self.hwnd) != 0
+        {
+            if self.anim_clock.is_none() {
+                self.anim_clock = Some(crate::motion::FrameClock::start());
+            }
+            SetTimer(self.hwnd, 94, crate::motion::frame_interval_ms(), None);
         }
     }
     pub(super) unsafe fn responsive_content(&mut self, dc: HDC, w: f32, h: f32) {

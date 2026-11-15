@@ -17,7 +17,7 @@ use windows_sys::Win32::{
 };
 const SUBCLASS: usize = 0x4c484452;
 const TIMER: usize = 0x4c4844;
-const HEADER_FRAME: u32 = WM_APP + 18;
+pub(crate) const HEADER_FRAME: u32 = WM_APP + 18;
 const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.];
 pub struct Visual {
     pub alpha: f32,
@@ -182,9 +182,10 @@ unsafe fn schedule(hwnd: HWND, s: &mut Reveal, time: f64) {
         if s.clock.is_none() {
             s.clock = Some(FrameClock::start());
         }
-        if s.period != 10 {
-            SetTimer(hwnd, TIMER, 10, None);
-            s.period = 10;
+        let interval = crate::motion::frame_interval_ms();
+        if s.period != interval {
+            SetTimer(hwnd, TIMER, interval, None);
+            s.period = interval;
         }
     } else {
         s.clock = None;
@@ -281,7 +282,7 @@ unsafe extern "system" fn proc(
             if let Some(s) = h.borrow_mut().get_mut(&(hwnd as usize)) {
                 let old = s.visual(time);
                 let was_moving = s.moving(time);
-                let final_tick = msg == WM_TIMER && s.period == 10;
+                let final_tick = msg == WM_TIMER && s.period > 0 && s.period < 50;
                 s.child_poll = child;
                 s.target(inside, hit, time);
                 // Invalidate only during a transition. Native children need a cheap
@@ -328,9 +329,7 @@ unsafe extern "system" fn proc(
             if let Some(s) = h.borrow_mut().get_mut(&(hwnd as usize)) {
                 s.frame_queued = false;
                 let time = now();
-                if s.moving(time) {
-                    InvalidateRect(hwnd, null(), 0);
-                }
+                InvalidateRect(hwnd, null(), 0);
                 schedule(hwnd, s, time);
             }
         });
@@ -425,7 +424,7 @@ mod tests {
                 let s = h.get_mut(&(hwnd as usize)).unwrap();
                 s.target(true, Some(0), now());
                 schedule(hwnd, s, now());
-                assert_eq!(s.period, 10);
+                assert_eq!(s.period, crate::motion::frame_interval_ms());
                 assert!(s.clock.is_some());
             });
             SendMessageW(hwnd, WM_SHOWWINDOW, 0, 0);

@@ -311,10 +311,14 @@ impl State {
             }
         }
         let d = layout.deck;
-        if let Some(bg) = &self.background {
-            bg.restore_glass_card(dc, d, 24.);
+        let live_nested =
+            crate::widget_interaction::use_live_nested_glass(self.hwnd, self.moving, self.resizing);
+        if !live_nested {
+            if let Some(bg) = &self.background {
+                bg.restore_glass_card(dc, d, 24.);
+            }
+            c.soft_shadow(d, 24., 24., 10., 4.);
         }
-        c.soft_shadow(d, 24., 24., 10., 4.);
         c.round(d, 24., self.ink, 24, false, false);
         c.coating(d, 24.);
         // Keep the lens and its soft shadow inside the rounded deck. Narrow
@@ -360,25 +364,29 @@ impl State {
         let mut buffer = Buffer::plain(pw, ph, self.dpi)?;
         let batch = render::AlphaBatch::new(buffer.dc, self.dpi);
         let c = Canvas::new(buffer.dc, self.dpi);
-        if let Some(frost) = self
-            .background
-            .as_ref()
-            .and_then(|bg| bg.frosted_piece(r, 20. * scale, 3., [0., 0.], self.surface_color()))
-        {
-            c.image(&frost, [0., 0., w, h]);
+        let live_nested =
+            crate::widget_interaction::use_live_nested_glass(self.hwnd, self.moving, self.resizing);
+        let frosted = if !live_nested && crate::glass::frosted_glass() {
+            self.background.as_ref().and_then(|bg| {
+                bg.frosted_piece(r, 20. * scale, 3., [0., 0.], self.surface_color())
+            })
         } else {
-            c.round(
+            None
+        };
+        if let Some(frost) = &frosted {
+            c.image(frost, [0., 0., w, h]);
+            c.coating([0., 0., w, h], 20. * scale);
+        } else {
+            crate::widget_interaction::draw_translucent_nested_glass(
+                &c,
                 [0., 0., w, h],
                 20. * scale,
                 self.surface_color(),
-                255,
-                false,
-                false,
+                self.config.tint,
             );
         }
-        c.coating([0., 0., w, h], 20. * scale);
         render::flush(buffer.dc);
-        if crate::glass::liquid_glass() {
+        if crate::glass::liquid_glass() && !live_nested {
             crate::glass::apply_liquid_glass_premul_bgra(
                 buffer.pixels_mut(),
                 pw as usize,

@@ -84,11 +84,17 @@ pub(super) fn draw_location(c: &Canvas, w: f32, h: f32, label: &str, ink: u32) {
         }
         layout::Mode::Wide if w >= 220. && h >= 135. => {
             c.round([22., 26.5, 25., 29.5], 1.5, ink, 170, false, false);
-            c.text_medium(label, [30., 19., w * 0.56, 37.], 10.5, ink, 0);
+            c.text_medium(
+                label,
+                [30., 19., (w * 0.56).min(w - 78.).max(54.), 37.],
+                10.5,
+                ink,
+                0,
+            );
         }
         layout::Mode::Tall if w >= 140. && h >= 210. => {
             c.round([22., 29.5, 25., 32.5], 1.5, ink, 170, false, false);
-            c.text_medium(label, [30., 22., w - 22., 40.], 10.5, ink, 0);
+            c.text_medium(label, [30., 22., (w - 78.).max(54.), 40.], 10.5, ink, 0);
         }
         layout::Mode::CompactSquare if w >= 165. && h >= 165. => {
             c.round([20., 25.5, 23., 28.5], 1.5, ink, 170, false, false);

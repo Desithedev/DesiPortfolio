@@ -32,8 +32,11 @@ struct Config {
     floating: bool,
     snap_fuse: bool,
     start_with_windows: bool,
+    fast_startup: bool,
     low_power: bool,
     liquid_glass: bool,
+    frosted_glass: bool,
+    blur: f32,
     position: Option<[i32; 2]>,
 }
 impl Default for Config {
@@ -44,8 +47,11 @@ impl Default for Config {
             floating: false,
             snap_fuse: true,
             start_with_windows: true,
-            low_power: true,
+            fast_startup: false,
+            low_power: false,
             liquid_glass: true,
+            frosted_glass: true,
+            blur: 13.,
             position: None,
         }
     }
@@ -63,9 +69,16 @@ impl Config {
             return Err("Unsupported General Settings. File left untouched.".into());
         }
         c.opacity = c.opacity.clamp(0., 100.);
+        c.blur = if c.blur.is_finite() {
+            c.blur.clamp(0., 80.)
+        } else {
+            13.
+        };
         crate::fusion::set_enabled(c.snap_fuse);
         crate::motion::set_low_power(c.low_power);
         crate::glass::set_liquid_glass(c.liquid_glass);
+        crate::glass::set_frosted_glass(c.frosted_glass);
+        crate::glass::set_global_blur(c.blur);
         Ok(c)
     }
     fn save(&self, root: &Path) -> Result<(), String> {
@@ -180,6 +193,12 @@ impl Host {
                 self.config.start_with_windows,
             ),
             Row::toggle(
+                15,
+                "Fast startup (no OS delay)",
+                "Use Task Scheduler (Admin) to launch immediately at logon; restarts app",
+                self.config.fast_startup,
+            ),
+            Row::toggle(
                 3,
                 "Snap & fuse widgets",
                 "Join nearby widgets; drag apart to separate",
@@ -197,6 +216,13 @@ impl Host {
                 "Subtle edge refraction and chromatic shift on glass surfaces",
                 self.config.liquid_glass,
             ),
+            Row::toggle(
+                16,
+                "Frosted glass",
+                "Blend widget backgrounds with the desktop wallpaper",
+                self.config.frosted_glass,
+            ),
+            Row::slider(17, "Blur size", self.config.blur, 0., 80., "px"),
         ]);
         const UPDATE_ACCENT: u32 = 0xe5881e;
         rows.push(Row::section("Updates"));
@@ -373,6 +399,28 @@ impl Host {
                 (13, Value::Bool(v)) => {
                     self.config.liquid_glass = v;
                     crate::glass::set_liquid_glass(v);
+                    actions.push(Action::RefreshGlass);
+                    dirty = true;
+                }
+                (15, Value::Bool(v)) => {
+                    match crate::startup::set_fast_startup_elevated(v) {
+                        Ok(()) => {
+                            self.config.fast_startup = v;
+                            dirty = true;
+                            self.error.clear();
+                        }
+                        Err(error) => self.error = error,
+                    }
+                }
+                (16, Value::Bool(v)) => {
+                    self.config.frosted_glass = v;
+                    crate::glass::set_frosted_glass(v);
+                    actions.push(Action::RefreshGlass);
+                    dirty = true;
+                }
+                (17, Value::Number(v)) => {
+                    self.config.blur = v.clamp(0., 80.);
+                    crate::glass::set_global_blur(self.config.blur);
                     actions.push(Action::RefreshGlass);
                     dirty = true;
                 }

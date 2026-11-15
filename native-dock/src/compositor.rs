@@ -281,12 +281,13 @@ impl Buffer {
                     && (fx < inset + radius || fx > w - inset - radius)
                     && (fy < inset + radius || fy > h - inset - radius)
                 {
+                    let sub = if crate::motion::low_power() { 4 } else { 16 };
                     let mut inside = 0;
-                    for sy in 0..16 {
-                        for sx in 0..16 {
+                    for sy in 0..sub {
+                        for sx in 0..sub {
                             if distance(
-                                x as f32 + (sx as f32 + 0.5) / 16.,
-                                y as f32 + (sy as f32 + 0.5) / 16.,
+                                x as f32 + (sx as f32 + 0.5) / sub as f32,
+                                y as f32 + (sy as f32 + 0.5) / sub as f32,
                                 w,
                                 h,
                                 radius,
@@ -297,7 +298,7 @@ impl Buffer {
                             }
                         }
                     }
-                    coverage = inside as f32 / 256.;
+                    coverage = inside as f32 / (sub * sub) as f32;
                 }
                 let index = (y * width + x) as usize;
                 cover[index] = (coverage * 255.).round() as u8;
@@ -364,18 +365,20 @@ impl Buffer {
     /// outline controls both the bevel and the final antialiased coverage.
     pub unsafe fn bevel_for(&mut self, hwnd: HWND) {
         crate::fusion::prepare(hwnd, self.radius);
-        GdiFlush();
-        let source = std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize);
-        crate::fusion::publish_material(
-            hwnd,
-            crate::fusion::material::Material::from_bgra(
-                self.width as usize,
-                self.height as usize,
-                source,
-            ),
-        );
-        let mut rect: RECT = zeroed();
-        GetWindowRect(hwnd, &mut rect);
+        if crate::fusion::may_fuse() && !crate::fusion::is_moving(hwnd) {
+            GdiFlush();
+            let source =
+                std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize);
+            crate::fusion::publish_material(
+                hwnd,
+                crate::fusion::material::Material::from_bgra(
+                    self.width as usize,
+                    self.height as usize,
+                    source,
+                ),
+            );
+        }
+        let rect = crate::fusion::window_rect(hwnd);
         let group = crate::fusion::group(hwnd);
         if let Some(ref panes) = group {
             if let Some(material) =
@@ -568,37 +571,88 @@ impl Buffer {
             });
             return;
         }
-        let source = bytes.to_vec();
-        for rim in &self.rim {
-            let spec = if liquid { rim.liquid_spec } else { 0. };
-            if rim.light == 0. && spec == 0. {
-                continue;
-            }
-            if rim.light == 0. {
-                for channel in 0..3 {
-                    let v = source[rim.index + channel] as f32 + spec;
-                    bytes[rim.index + channel] = v.min(255.) as u8;
+        thread_local! {
+            static BEVEL_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        BEVEL_SCRATCH.with(|scratch| {
+            let mut source = scratch.borrow_mut();
+            source.clear();
+            source.extend_from_slice(bytes);
+            for rim in &self.rim {
+                let spec = if liquid { rim.liquid_spec } else { 0. };
+                if rim.light == 0. && spec == 0. {
+                    continue;
                 }
+                if rim.light == 0. {
+                    for channel in 0..3 {
+                        let v = source[rim.index + channel] as f32 + spec;
+                        bytes[rim.index + channel] = v.min(255.) as u8;
+                    }
+                    continue;
+                }
+                let [x, y] = rim.sample;
+                let x0 = x as usize;
+                let y0 = y as usize;
+                let x1 = (x0 + 1).min(self.width as usize - 1);
+                let y1 = (y0 + 1).min(self.height as usize - 1);
+                let fx = x - x0 as f32;
+                let fy = y - y0 as f32;
+                for channel in 0..3 {
+                    let at = |x: usize, y: usize| {
+                        source[(y * self.width as usize + x) * 4 + channel] as f32
+                    };
+                    let sample = (at(x0, y0) * (1. - fx) + at(x1, y0) * fx) * (1. - fy)
+                        + (at(x0, y1) * (1. - fx) + at(x1, y1) * fx) * fy;
+                    let lit = if rim.light > 0. {
+                        sample + (255. - sample) * rim.light
+                    } else {
+                        sample * (1. + rim.light)
+                    };
+                    bytes[rim.index + channel] = (lit + spec).clamp(0., 255.) as u8;
+                }
+            }
+            if crate::motion::low_power() && source.capacity() > 1024 * 1024 {
+                *source = Vec::new();
+            }
+        });
+    }
+    pub unsafe fn copy_scrolled_vertical(
+        &mut self,
+        cache: &Self,
+        clip_top: i32,
+        clip_bottom: i32,
+        scroll_px: f32,
+    ) {
+        if self.width != cache.width || clip_top >= clip_bottom {
+            return;
+        }
+        GdiFlush();
+        let stride = self.width as usize * 4;
+        let dst_pixels =
+            std::slice::from_raw_parts_mut(self.bits, (self.width * self.height * 4) as usize);
+        let src_pixels =
+            std::slice::from_raw_parts(cache.bits, (cache.width * cache.height * 4) as usize);
+        let y0_src = scroll_px.floor() as i32;
+        let fy = ((scroll_px - y0_src as f32) * 256.).round().clamp(0., 256.) as u32;
+        let wy0 = 256 - fy;
+        let wy1 = fy;
+        let top = clip_top.max(0);
+        let bottom = clip_bottom.min(self.height);
+        for dst_y in top..bottom {
+            let src_y = y0_src + (dst_y - clip_top);
+            if src_y < 0 || src_y >= cache.height {
                 continue;
             }
-            let [x, y] = rim.sample;
-            let x0 = x as usize;
-            let y0 = y as usize;
-            let x1 = (x0 + 1).min(self.width as usize - 1);
-            let y1 = (y0 + 1).min(self.height as usize - 1);
-            let fx = x - x0 as f32;
-            let fy = y - y0 as f32;
-            for channel in 0..3 {
-                let at =
-                    |x: usize, y: usize| source[(y * self.width as usize + x) * 4 + channel] as f32;
-                let sample = (at(x0, y0) * (1. - fx) + at(x1, y0) * fx) * (1. - fy)
-                    + (at(x0, y1) * (1. - fx) + at(x1, y1) * fx) * fy;
-                let lit = if rim.light > 0. {
-                    sample + (255. - sample) * rim.light
-                } else {
-                    sample * (1. + rim.light)
-                };
-                bytes[rim.index + channel] = (lit + spec).clamp(0., 255.) as u8;
+            let dst_row = &mut dst_pixels[dst_y as usize * stride..(dst_y as usize + 1) * stride];
+            let src_row0 = &src_pixels[src_y as usize * stride..(src_y as usize + 1) * stride];
+            if fy == 0 || src_y + 1 >= cache.height {
+                dst_row.copy_from_slice(src_row0);
+            } else {
+                let src_row1 =
+                    &src_pixels[(src_y as usize + 1) * stride..(src_y as usize + 2) * stride];
+                for ((d, s0), s1) in dst_row.iter_mut().zip(src_row0).zip(src_row1) {
+                    *d = ((*s0 as u32 * wy0 + *s1 as u32 * wy1 + 128) >> 8) as u8;
+                }
             }
         }
     }
@@ -855,8 +909,7 @@ impl Buffer {
             self.background_alpha(alpha);
             return;
         };
-        let mut r: RECT = zeroed();
-        GetWindowRect(hwnd, &mut r);
+        let r = crate::fusion::window_rect(hwnd);
         let reach = 120. * self.dpi;
         let own_id = hwnd as usize;
         let mut bx0 = self.width;
@@ -1065,8 +1118,7 @@ impl Buffer {
         crate::fusion::prepare(hwnd, self.radius);
         let group = crate::fusion::group(hwnd);
         if let Some(panes) = group {
-            let mut r: RECT = zeroed();
-            GetWindowRect(hwnd, &mut r);
+            let r = crate::fusion::window_rect(hwnd);
             let bounds = [r.left, r.top, self.width, self.height];
             if self
                 .fusion_cover
@@ -1154,6 +1206,35 @@ impl Buffer {
         self.upload_alpha(hwnd, 255)
     }
     pub unsafe fn upload_alpha(&self, hwnd: HWND, opacity: u8) -> bool {
+        let pending = crate::fusion::pending_move_point(hwnd);
+        if crate::gpu::is_gpu_window(hwnd) {
+            if let Some(pt) = pending {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    pt.x,
+                    pt.y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            GdiFlush();
+            let len = self.width as usize * self.height as usize * 4;
+            let pixels = std::slice::from_raw_parts(self.bits, len);
+            if opacity == 255 {
+                return crate::gpu::present_bgra(hwnd, self.width, self.height, pixels);
+            }
+            let a = opacity as u32;
+            let mut scaled = vec![0u8; len];
+            for (dst, src) in scaled.chunks_exact_mut(4).zip(pixels.chunks_exact(4)) {
+                dst[0] = ((src[0] as u32 * a + 127) / 255) as u8;
+                dst[1] = ((src[1] as u32 * a + 127) / 255) as u8;
+                dst[2] = ((src[2] as u32 * a + 127) / 255) as u8;
+                dst[3] = ((src[3] as u32 * a + 127) / 255) as u8;
+            }
+            return crate::gpu::present_bgra(hwnd, self.width, self.height, &scaled);
+        }
         let origin = POINT { x: 0, y: 0 };
         let size = SIZE {
             cx: self.width,
@@ -1168,7 +1249,7 @@ impl Buffer {
         let result = UpdateLayeredWindow(
             hwnd,
             null_mut(),
-            std::ptr::null(),
+            pending.as_ref().map_or(std::ptr::null(), |p| p as *const POINT),
             &size,
             self.dc,
             &origin,
@@ -1196,7 +1277,7 @@ unsafe extern "system" fn shadow_proc(
     }
 }
 pub struct WindowShadow {
-    hwnd: HWND,
+    pub(crate) hwnd: HWND,
     owner: HWND,
     template: Vec<u8>,
     side: usize,
@@ -1276,6 +1357,11 @@ impl WindowShadow {
         self.rect[0] = x;
         self.rect[1] = y;
     }
+    pub unsafe fn hide(&self) {
+        if IsWindowVisible(self.hwnd) != 0 {
+            ShowWindow(self.hwnd, SW_HIDE);
+        }
+    }
     pub unsafe fn new(owner: HWND) -> Option<Self> {
         let class = crate::model::wide("LumenNativeGlassShadow");
         let instance =
@@ -1331,8 +1417,7 @@ impl WindowShadow {
             ShowWindow(self.hwnd, SW_HIDE);
             return;
         }
-        let mut r: RECT = zeroed();
-        GetWindowRect(owner, &mut r);
+        let r = crate::fusion::window_rect(owner);
         let pad = (40. * dpi).ceil() as i32;
         let width = r.right - r.left + pad * 2;
         let height = r.bottom - r.top + pad * 2;

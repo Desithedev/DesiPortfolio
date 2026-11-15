@@ -214,8 +214,6 @@ fn all_faces_render_at_minimum_and_mixed_dpi_without_losing_content_or_hit_targe
                 {
                     let mut s = host.state.borrow_mut();
                     s.dpi = dpi;
-                    s.frost = None;
-                    s.frost_key.clear();
                 }
                 let (pw, ph) = (
                     (width as f32 * dpi).round() as i32,
@@ -304,12 +302,7 @@ fn all_faces_render_at_minimum_and_mixed_dpi_without_losing_content_or_hit_targe
         host.hide();
         {
             let s = host.state.borrow();
-            assert!(
-                s.frame.is_none()
-                    && s.background.is_none()
-                    && s.shadow.is_none()
-                    && s.frost.is_none()
-            );
+            assert!(s.frame.is_none() && s.background.is_none() && s.shadow.is_none());
         }
         host.apply_common(Some(25.), Some(true));
         assert!(!host.is_visible());
@@ -411,13 +404,13 @@ fn settings_adapter_rejects_invalid_values_and_preserves_geometry_theme_and_shar
         assert_eq!((s.config.position, s.config.size), geometry);
         assert_eq!(glass.borrow().revision(), rev);
         let rows = s.settings_rows();
-        for id in [2, 3, 4, 5] {
+        for id in [2, 3, 5] {
             assert!(rows
                 .iter()
                 .any(|r| matches!(r,crate::settings_ui::Row::Slider{id:key,..}if *key==id)));
         }
         assert!(!rows.iter().any(|r|matches!(r,crate::settings_ui::Row::Toggle{id:14,..})));
-        for id in [1, 12, 13] {
+        for id in [12, 13] {
             assert!(rows
                 .iter()
                 .any(|r| matches!(r,crate::settings_ui::Row::Toggle{id:key,..}if *key==id)));
@@ -434,6 +427,7 @@ fn selected_surface_rebuilds_cached_backdrop_and_reuses_it_between_ticks() {
         host.show();
         let mut s = host.state.borrow_mut();
         s.config.frosted_glass = false;
+        crate::glass::set_frosted_glass(false);
         let mut previous = String::new();
         let mut previous_pixels = Vec::new();
         for palette in ["gradient:dawn", "custom:#345678", "theme"] {
@@ -454,6 +448,7 @@ fn selected_surface_rebuilds_cached_backdrop_and_reuses_it_between_ticks() {
             previous = key;
             previous_pixels = pixels;
         }
+        crate::glass::set_frosted_glass(true);
     }
 }
 

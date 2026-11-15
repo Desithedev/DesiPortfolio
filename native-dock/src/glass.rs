@@ -15,7 +15,8 @@ use std::{
     time::SystemTime,
 };
 use windows_sys::Win32::{
-    Foundation::*, Graphics::Gdi::*, System::Registry::*, UI::WindowsAndMessaging::*,
+    Foundation::*, Graphics::Gdi::*, System::Registry::*, System::Threading::*,
+    UI::WindowsAndMessaging::*,
 };
 
 fn vertical_offset(viewport: f32, drawn: f32, style: u32, tile: bool) -> f32 {
@@ -92,7 +93,7 @@ impl WallpaperSource {
         if !existing.is_null() {
             return existing;
         }
-        let mut guard = self.small.borrow_mut();
+        let guard = self.small.borrow_mut();
         let temp;
         let rgba = if let Some(small) = guard.as_ref() {
             small
@@ -148,7 +149,20 @@ pub fn clear_cache() {
     BLURRED_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
+pub(crate) fn trim_working_set() {
+    unsafe {
+        windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            usize::MAX,
+            usize::MAX,
+            0,
+        );
+    }
+}
+
 static LIQUID_GLASS: AtomicBool = AtomicBool::new(false);
+static FROSTED_GLASS: AtomicBool = AtomicBool::new(true);
+static GLOBAL_BLUR_TENTHS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(130);
 static LIQUID_GLASS_REVISION: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_liquid_glass(enabled: bool) {
@@ -159,20 +173,66 @@ pub fn set_liquid_glass(enabled: bool) {
 pub fn liquid_glass() -> bool {
     LIQUID_GLASS.load(Ordering::Relaxed)
 }
+pub fn set_frosted_glass(enabled: bool) {
+    if FROSTED_GLASS.swap(enabled, Ordering::Relaxed) != enabled {
+        LIQUID_GLASS_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+pub fn frosted_glass() -> bool {
+    FROSTED_GLASS.load(Ordering::Relaxed)
+}
+pub fn set_global_blur(blur: f32) {
+    let tenths = (blur.clamp(0.0, 80.0) * 10.0).round() as i32;
+    if GLOBAL_BLUR_TENTHS.swap(tenths, Ordering::Relaxed) != tenths {
+        LIQUID_GLASS_REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+pub fn global_blur() -> f32 {
+    GLOBAL_BLUR_TENTHS.load(Ordering::Relaxed) as f32 / 10.0
+}
 
 pub fn move_paint_due(hwnd: HWND) -> bool {
+    paint_due(hwnd, true)
+}
+
+pub fn resize_paint_due(hwnd: HWND) -> bool {
+    paint_due(hwnd, false)
+}
+
+thread_local! {
+    static RESIZING_WINDOWS: RefCell<std::collections::HashSet<isize>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+pub fn set_resizing(hwnd: HWND, resizing: bool) {
+    RESIZING_WINDOWS.with(|set| {
+        let mut set = set.borrow_mut();
+        if resizing {
+            set.insert(hwnd as isize);
+        } else {
+            set.remove(&(hwnd as isize));
+        }
+    });
+}
+
+pub fn is_resizing(hwnd: HWND) -> bool {
+    RESIZING_WINDOWS.with(|set| set.borrow().contains(&(hwnd as isize)))
+}
+
+fn paint_due(hwnd: HWND, is_move: bool) -> bool {
     use std::collections::HashMap;
     use std::time::Instant;
     thread_local! {
-        static LAST_MOVE_PAINT: RefCell<HashMap<isize, Instant>> = RefCell::new(HashMap::new());
+        static LAST_PAINT: RefCell<HashMap<(isize, bool), Instant>> = RefCell::new(HashMap::new());
     }
+    let min_ms = if crate::motion::low_power() { 16 } else { 6 };
     let now = Instant::now();
-    LAST_MOVE_PAINT.with(|map| {
+    LAST_PAINT.with(|map| {
         let mut map = map.borrow_mut();
-        let key = hwnd as isize;
+        let key = (hwnd as isize, is_move);
         if map
             .get(&key)
-            .is_some_and(|prev| now.duration_since(*prev).as_millis() < 16)
+            .is_some_and(|prev| now.duration_since(*prev).as_millis() < min_ms)
         {
             return false;
         }
@@ -232,6 +292,12 @@ impl Glass {
     pub fn available(&self) -> bool {
         self.bitmap.is_some()
     }
+    pub fn dpi(&self) -> f32 {
+        self.dpi
+    }
+    pub fn blur(&self) -> f32 {
+        self.blur
+    }
     pub fn revision(&self) -> u64 {
         self.generation
             .wrapping_add(LIQUID_GLASS_REVISION.load(Ordering::Relaxed))
@@ -275,6 +341,10 @@ impl Glass {
         self.refresh();
     }
     unsafe fn query_wallpaper() -> Option<(PathBuf, Option<SystemTime>, u32, bool)> {
+        if let Some(live_path) = resolve_live_wallpaper_file() {
+            let modified = std::fs::metadata(&live_path).and_then(|m| m.modified()).ok();
+            return Some((live_path, modified, 10, false));
+        }
         let spi_path = PATH_BUF.with(|buf| {
             let mut name = buf.borrow_mut();
             if SystemParametersInfoW(
@@ -324,7 +394,8 @@ impl Glass {
         let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
             return false;
         };
-        if path == self.path
+        if self.bitmap.is_some()
+            && path == self.path
             && modified == self.modified
             && style == self.style
             && tile == self.tile
@@ -336,11 +407,6 @@ impl Glass {
         if WALLPAPER_SOURCES.with(|c| c.borrow().contains_key(&key)) {
             return self.refresh();
         }
-        self.path = path.clone();
-        self.modified = modified;
-        self.style = style;
-        self.tile = tile;
-        self.low_power = crate::motion::low_power();
         {
             let mut loading = LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner());
             if loading.as_ref() == Some(&key) {
@@ -348,6 +414,11 @@ impl Glass {
             }
             *loading = Some(key);
         }
+        self.path = path.clone();
+        self.modified = modified;
+        self.style = style;
+        self.tile = tile;
+        self.low_power = crate::motion::low_power();
         let blur = self.blur;
         let dpi = self.dpi;
         let cap = Self::wallpaper_cap();
@@ -474,7 +545,8 @@ impl Glass {
         let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
             return false;
         };
-        if path == self.path
+        if self.bitmap.is_some()
+            && path == self.path
             && modified == self.modified
             && style == self.style
             && tile == self.tile
@@ -545,7 +617,7 @@ impl Glass {
         let owned = Rc::new(OwnedBitmap(bitmap));
         BLURRED_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.len() >= 1 {
+            if cache.len() >= 4 {
                 cache.clear();
             }
             cache.insert(key, (owned.clone(), bw, bh));
@@ -651,20 +723,23 @@ impl Glass {
         if width <= 0 || height <= 0 || width as i64 * height as i64 > 32_000_000 {
             return;
         }
-        let mut window: RECT = zeroed();
-        GetWindowRect(hwnd, &mut window);
+        let window = crate::fusion::window_rect(hwnd);
+        let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
+        let apply_liquid = liquid_glass()
+            && !(moving && crate::motion::low_power())
+            && !crate::fusion::is_surface(hwnd);
         if self.style == 0 || self.style == 6 {
             PatBlt(dc, 0, 0, width, height, BLACKNESS);
         }
         // The caller already caches the finished widget background. A second
-        // full-monitor bitmap is unnecessary now that moves freeze that cache.
+        // full-monitor bitmap is unnecessary.
         if amount == 255 {
             let mut scratch = self.blend_buffer.borrow_mut();
             if scratch.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
                 scratch.take();
             }
             self.draw_layer(dc, hwnd, width, height, bitmap, self.blur_size(), window);
-            if liquid_glass() && !crate::fusion::is_surface(hwnd) {
+            if apply_liquid {
                 self.apply_liquid_glass_with_source(dc, hwnd, width, height, window);
             }
             return;
@@ -688,7 +763,7 @@ impl Glass {
             if scratch.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
                 scratch.take();
             }
-            if liquid_glass() && !crate::fusion::is_surface(hwnd) {
+            if apply_liquid {
                 self.apply_liquid_glass_with_source(dc, hwnd, width, height, window);
             }
             return;
@@ -729,9 +804,12 @@ impl Glass {
                     AlphaFormat: 0,
                 },
             );
-            if liquid_glass() && !crate::fusion::is_surface(hwnd) {
+            if apply_liquid {
                 self.apply_liquid_glass_with_source(dc, hwnd, width, height, window);
             }
+        }
+        if crate::motion::low_power() && !moving {
+            scratch.take();
         }
     }
     unsafe fn apply_liquid_glass_with_source(
@@ -789,6 +867,9 @@ impl Glass {
                     height,
                     Some((hwnd, window)),
                 );
+                if crate::motion::low_power() {
+                    scratch.take();
+                }
                 return;
             }
         }
@@ -903,6 +984,9 @@ impl Glass {
             true,
             fusion,
         );
+        if crate::motion::low_power() {
+            *src_guard = Vec::new();
+        }
     }
 }
 
@@ -926,32 +1010,38 @@ pub fn apply_liquid_glass_rgba(
         crate::fusion::group(hwnd)
             .filter(|panes| panes.len() > 1)
             .map(|panes| {
-                let window = unsafe {
-                    let mut w: RECT = zeroed();
-                    GetWindowRect(hwnd, &mut w);
-                    w
-                };
+                let window = unsafe { crate::fusion::window_rect(hwnd) };
                 (panes, [window.left as f32, window.top as f32])
             })
     } else {
         None
     };
-    let frosted = dst.to_vec();
-    apply_liquid_glass_pixels(
-        dst,
-        w * 4,
-        w,
-        h,
-        &frosted,
-        sharp,
-        sw,
-        sh,
-        pad as f32,
-        true,
-        dpi,
-        false,
-        fusion,
-    );
+    thread_local! {
+        static RGBA_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    RGBA_SCRATCH.with(|scratch| {
+        let mut frosted = scratch.borrow_mut();
+        frosted.clear();
+        frosted.extend_from_slice(&dst[..w * h * 4]);
+        apply_liquid_glass_pixels(
+            dst,
+            w * 4,
+            w,
+            h,
+            &frosted,
+            sharp,
+            sw,
+            sh,
+            pad as f32,
+            true,
+            dpi,
+            false,
+            fusion,
+        );
+        if crate::motion::low_power() && frosted.capacity() > 1024 * 1024 {
+            *frosted = Vec::new();
+        }
+    });
 }
 
 /// Smooth rounded-rectangle SDF (`d`, `nx`, `ny`) with C¹-continuous interior
@@ -1094,56 +1184,66 @@ pub fn apply_liquid_glass_premul_bgra(
     let ry = (hh - radius).max(0.0);
     let rim_x = rim.ceil() as usize;
     let corner_y = radius.max(rim);
-    let src = buf.to_vec();
-
-    for y in 0..h {
-        let fy = y as f32 + 0.5;
-        let in_straight_band = fy >= corner_y && fy <= h as f32 - corner_y;
-        let mut x = 0usize;
-        while x < w {
-            if in_straight_band && x == rim_x && w > rim_x * 2 {
-                x = w - rim_x;
-            }
-            let fx = x as f32 + 0.5;
-            let (d, nx, ny) = rounded_rect_sdf(fx, fy, hw, hh, rx, ry, radius);
-            if d > -rim && d <= 0.5 {
-                let i = (y * w + x) * 4;
-                let a = src[i + 3];
-                if a > 0 {
-                    let u = (-d / rim).clamp(0.0, 1.0);
-                    let curve = u * u * (3.0 - 2.0 * u);
-                    let edge_align = 1.0 - curve;
-                    let disp = -bend * edge_align;
-                    let ca_u = (u * 2.2).clamp(0.0, 1.0);
-                    let ca_s = ca_u * ca_u * (3.0 - 2.0 * ca_u);
-                    let ca = 4.0 * ca_s * (1.0 - ca_s) * ca_strength;
-
-                    let sa_b = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, 3).max(1.0);
-                    let sa_g = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, 3).max(1.0);
-                    let sa_r = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, 3).max(1.0);
-
-                    let a_norm = a as f32 / 255.0;
-                    let b = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, 0) * (255.0 / sa_b);
-                    let g = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, 1) * (255.0 / sa_g);
-                    let r = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, 2) * (255.0 / sa_r);
-
-                    let spec = if u < 0.32 {
-                        let edge = (1.0 - u / 0.32).clamp(0.0, 1.0);
-                        let light_dir =
-                            (-nx * 0.55 - ny * 0.83).max(0.0) + (nx * 0.4 + ny * 0.6).max(0.0) * 0.35;
-                        edge * edge * (12.0 + 26.0 * light_dir)
-                    } else {
-                        0.0
-                    };
-
-                    buf[i] = ((b + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
-                    buf[i + 1] = ((g + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
-                    buf[i + 2] = ((r + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
-                }
-            }
-            x += 1;
-        }
+    thread_local! {
+        static CARD_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     }
+    CARD_SCRATCH.with(|scratch| {
+        let mut src = scratch.borrow_mut();
+        src.clear();
+        src.extend_from_slice(&buf[..w * h * 4]);
+
+        for y in 0..h {
+            let fy = y as f32 + 0.5;
+            let in_straight_band = fy >= corner_y && fy <= h as f32 - corner_y;
+            let mut x = 0usize;
+            while x < w {
+                if in_straight_band && x == rim_x && w > rim_x * 2 {
+                    x = w - rim_x;
+                }
+                let fx = x as f32 + 0.5;
+                let (d, nx, ny) = rounded_rect_sdf(fx, fy, hw, hh, rx, ry, radius);
+                if d > -rim && d <= 0.5 {
+                    let i = (y * w + x) * 4;
+                    let a = src[i + 3];
+                    if a > 0 {
+                        let u = (-d / rim).clamp(0.0, 1.0);
+                        let curve = u * u * (3.0 - 2.0 * u);
+                        let edge_align = 1.0 - curve;
+                        let disp = -bend * edge_align;
+                        let ca_u = (u * 2.2).clamp(0.0, 1.0);
+                        let ca_s = ca_u * ca_u * (3.0 - 2.0 * ca_u);
+                        let ca = 4.0 * ca_s * (1.0 - ca_s) * ca_strength;
+
+                        let sa_b = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, 3).max(1.0);
+                        let sa_g = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, 3).max(1.0);
+                        let sa_r = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, 3).max(1.0);
+
+                        let a_norm = a as f32 / 255.0;
+                        let b = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, 0) * (255.0 / sa_b);
+                        let g = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, 1) * (255.0 / sa_g);
+                        let r = sample_disp_2d(&src, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, 2) * (255.0 / sa_r);
+
+                        let spec = if u < 0.32 {
+                            let edge = (1.0 - u / 0.32).clamp(0.0, 1.0);
+                            let light_dir =
+                                (-nx * 0.55 - ny * 0.83).max(0.0) + (nx * 0.4 + ny * 0.6).max(0.0) * 0.35;
+                            edge * edge * (12.0 + 26.0 * light_dir)
+                        } else {
+                            0.0
+                        };
+
+                        buf[i] = ((b + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
+                        buf[i + 1] = ((g + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
+                        buf[i + 2] = ((r + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
+                    }
+                }
+                x += 1;
+            }
+        }
+        if crate::motion::low_power() && src.capacity() > 1024 * 1024 {
+            *src = Vec::new();
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1497,6 +1597,237 @@ unsafe fn resolve_wallpaper_path(spi_path: PathBuf) -> PathBuf {
     }
     spi_path
 }
+
+fn is_supported_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "bmp"
+            )
+        })
+        && path.is_file()
+}
+
+unsafe fn window_class_name(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    let len = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
+
+unsafe fn find_live_child_pid(parent: HWND, depth: u8) -> Option<u32> {
+    if parent.is_null() || depth > 3 {
+        return None;
+    }
+    let mut child = null_mut();
+    for _ in 0..64 {
+        child = FindWindowExW(parent, child, std::ptr::null(), std::ptr::null());
+        if child.is_null() {
+            break;
+        }
+        if IsWindowVisible(child) == 0 {
+            continue;
+        }
+        let class = window_class_name(child);
+        if matches!(
+            class.as_str(),
+            "SHELLDLL_DefView" | "FolderView" | "SysListView32"
+        ) {
+            continue;
+        }
+        if class == "WorkerW" {
+            if let Some(pid) = find_live_child_pid(child, depth + 1) {
+                return Some(pid);
+            }
+            continue;
+        }
+        let mut rect: RECT = zeroed();
+        if GetWindowRect(child, &mut rect) != 0
+            && rect.right - rect.left >= 200
+            && rect.bottom - rect.top >= 200
+        {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(child, &mut pid);
+            if pid != 0 {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+unsafe fn find_live_wallpaper_pid() -> Option<u32> {
+    let progman = FindWindowW(wide("Progman").as_ptr(), std::ptr::null());
+    if let Some(pid) = find_live_child_pid(progman, 0) {
+        return Some(pid);
+    }
+    let worker_class = wide("WorkerW");
+    let mut worker = null_mut();
+    for _ in 0..64 {
+        worker = FindWindowExW(null_mut(), worker, worker_class.as_ptr(), std::ptr::null());
+        if worker.is_null() {
+            break;
+        }
+        if IsWindowVisible(worker) == 0 {
+            continue;
+        }
+        if let Some(pid) = find_live_child_pid(worker, 0) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+unsafe fn process_image_path(pid: u32) -> Option<PathBuf> {
+    let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    if handle.is_null() {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) != 0;
+    CloseHandle(handle);
+    if !ok || len == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+}
+
+fn resolve_project_json_image(project_path: &Path) -> Option<PathBuf> {
+    let dir = project_path.parent()?;
+    let raw = std::fs::read_to_string(project_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    for key in ["file", "preview", "Thumbnail", "Preview", "FileName"] {
+        if let Some(rel) = json.get(key).and_then(|v| v.as_str()) {
+            let candidate = Path::new(rel);
+            let full = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                dir.join(candidate)
+            };
+            if is_supported_image(&full) {
+                return Some(full);
+            }
+        }
+    }
+    for fallback in ["preview.jpg", "preview.png", "preview.bmp"] {
+        let full = dir.join(fallback);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
+}
+
+fn resolve_wallpaper_engine_image(exe_dir: &Path) -> Option<PathBuf> {
+    let config_path = exe_dir.join("config.json");
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let root = json.as_object()?;
+    for profile in root.values() {
+        let Some(selected) = profile
+            .get("general")
+            .and_then(|g| g.get("wallpaperconfig"))
+            .and_then(|w| w.get("selectedwallpapers"))
+            .or_else(|| profile.get("selectedwallpapers"))
+            .and_then(|s| s.as_object())
+        else {
+            continue;
+        };
+        let entry = selected
+            .get("Monitor0")
+            .or_else(|| selected.values().next())?;
+        let Some(file_str) = entry.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let file_path = PathBuf::from(file_str);
+        if is_supported_image(&file_path) {
+            return Some(file_path);
+        }
+        if file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("project.json"))
+        {
+            if let Some(img) = resolve_project_json_image(&file_path) {
+                return Some(img);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_lively_image() -> Option<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")?;
+    let layout_path =
+        PathBuf::from(local_app_data).join("Lively Wallpaper\\SaveData\\wpdata\\WallpaperLayout.json");
+    let raw = std::fs::read_to_string(layout_path).ok()?;
+    let layouts: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let first = layouts.as_array()?.first()?;
+    if let Some(info_dir) = first.get("LivelyInfoPath").and_then(|v| v.as_str()) {
+        let info_path = Path::new(info_dir).join("LivelyInfo.json");
+        if let Some(img) = resolve_project_json_image(&info_path) {
+            return Some(img);
+        }
+    }
+    if let Some(file_str) = first.get("FilePath").and_then(|v| v.as_str()) {
+        let path = PathBuf::from(file_str);
+        if is_supported_image(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+unsafe fn resolve_live_wallpaper_file() -> Option<PathBuf> {
+    use std::time::{Duration, Instant};
+    thread_local! {
+        static LIVE_WP_CACHE: RefCell<Option<(Instant, Option<PathBuf>)>> = const { RefCell::new(None) };
+    }
+    let ttl = if crate::motion::low_power() {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(5)
+    };
+    if let Some(cached) = LIVE_WP_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(t, _)| t.elapsed() < ttl)
+            .map(|(_, p)| p.clone())
+    }) {
+        return cached;
+    }
+    let resolved = (|| {
+        let pid = find_live_wallpaper_pid()?;
+        let exe_path = process_image_path(pid)?;
+        let exe_name = exe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        if exe_name.contains("wallpaper32") || exe_name.contains("wallpaper64") {
+            if let Some(dir) = exe_path.parent() {
+                if let Some(img) = resolve_wallpaper_engine_image(dir) {
+                    return Some(img);
+                }
+            }
+        }
+        if exe_name.contains("lively") || exe_name.contains("cefsharp") {
+            if let Some(img) = resolve_lively_image() {
+                return Some(img);
+            }
+        }
+        if let Some(dir) = exe_path.parent() {
+            if let Some(img) = resolve_wallpaper_engine_image(dir) {
+                return Some(img);
+            }
+        }
+        None
+    })();
+    LIVE_WP_CACHE.with(|c| *c.borrow_mut() = Some((Instant::now(), resolved.clone())));
+    resolved
+}
 #[inline]
 fn sample_channel(src: &[u8], w: usize, h: usize, x: f32, y: f32, ch: usize) -> f32 {
     let cx = x.clamp(0.0, (w - 1) as f32);
@@ -1565,14 +1896,16 @@ mod tests {
             let other = make_window(10, 10, 16, 16);
             assert!(!hwnd.is_null() && !other.is_null());
             let mut glass = Glass::new(0., 1.);
-            struct Reset(bool);
+            struct Reset(bool, bool);
             impl Drop for Reset {
                 fn drop(&mut self) {
                     set_liquid_glass(self.0);
+                    crate::motion::set_low_power(self.1);
                 }
             }
-            let _reset = Reset(liquid_glass());
+            let _reset = Reset(liquid_glass(), crate::motion::low_power());
             set_liquid_glass(false);
+            crate::motion::set_low_power(false);
             glass.width = 512;
             glass.height = 320;
             glass.natural = [512., 320.];
@@ -1745,6 +2078,28 @@ mod tests {
             // Left rim pixel has chromatic channel separation (B, G, R sampled at different offsets).
             let rim_px = &after[(40 * 120 + 4) * 4..][..4];
             assert_ne!(rim_px[0], rim_px[2]);
+        }
+    }
+
+    #[test]
+    fn refresh_async_contended_loading_key_does_not_block_subsequent_refresh() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let Some((path, modified, _, _)) = Glass::query_wallpaper() else {
+                return;
+            };
+            clear_cache();
+            let mut glass = Glass::new(13., 1.);
+            {
+                *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some((path.clone(), modified));
+            }
+            assert!(!glass.refresh_async(null_mut(), 0));
+            assert!(glass.bitmap.is_none());
+            assert!(glass.path.as_os_str().is_empty());
+            *LOADING_KEY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            assert!(glass.refresh());
+            assert!(glass.bitmap.is_some());
         }
     }
 }

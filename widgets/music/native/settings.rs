@@ -13,10 +13,8 @@ impl State {
             Row::accent_button(204, if self.playback.signed_in { "Sign out of YouTube Music" } else { "Sign in to YouTube Music" }, 0x0000ff),
             Row::note(if self.playback.signed_in { "Sign out clears the session only in Music's dedicated browser profile." } else { "Sign in in the browser, close it, then press Play to reconnect." }),
             Row::section("Background"),
-            Row::toggle(101, "Frosted glass", "Blend Music with the wallpaper", self.config.frosted_glass),
             Row::slider(102, "Glass tint", self.config.tint, 0., 100., "%"),
             Row::slider(103, "Frost strength", self.config.frost_strength, 0., 100., "%"),
-            Row::slider(104, "Blur size", self.config.blur, 0., 40., "px"),
             Row::slider(105, "Background opacity", self.config.opacity, 0., 100., "%"),
             Row::choices(106, "Surface palette", &self.config.palette, crate::settings_ui::palette_choices()),
             Row::section("Layout"),
@@ -71,9 +69,7 @@ impl State {
             }
             (101, Value::Bool(value)) => {
                 self.config.frosted_glass = value;
-                if !value {
-                    self.local_glass = None;
-                }
+                self.local_glass = None;
             }
             (102, Value::Number(value)) if value.is_finite() => {
                 self.config.tint = value.clamp(0., 100.)
@@ -83,13 +79,8 @@ impl State {
             }
             (104, Value::Number(value)) if value.is_finite() => {
                 self.config.blur = value.clamp(0., 40.);
-                if let Some(glass) = &mut self.local_glass {
-                    unsafe {
-                        glass.set_blur(self.config.blur, self.dpi);
-                    }
-                } else {
-                    self.blur_dirty = true;
-                }
+                self.local_glass = None;
+                self.blur_dirty = false;
                 self.background = None;
                 self.overlay = None;
                 self.settings_dirty = true;

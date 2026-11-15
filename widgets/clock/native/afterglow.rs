@@ -51,7 +51,12 @@ pub(super) fn content_key(
     )
 }
 pub(super) fn interval(cfg: &Config, visible: bool, moving: bool) -> Option<u32> {
-    (visible && !moving && cfg.theme == "sunset" && cfg.dynamic_animation).then_some(40)
+    (visible
+        && !moving
+        && !crate::motion::low_power()
+        && cfg.theme == "sunset"
+        && cfg.dynamic_animation)
+        .then(|| crate::motion::frame_interval_ms())
 }
 fn outline(n: f32) -> Vec<(f32, f32)> {
     let mut points = Vec::with_capacity(83);
@@ -236,7 +241,10 @@ mod tests {
             theme: "sunset".into(),
             ..Config::default()
         };
-        assert_eq!(interval(&c, true, false), Some(40));
+        assert_eq!(
+            interval(&c, true, false),
+            Some(crate::motion::frame_interval_ms())
+        );
         assert_eq!(interval(&c, false, false), None);
         assert_eq!(interval(&c, true, true), None);
         c.dynamic_animation = false;

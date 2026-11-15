@@ -41,20 +41,18 @@ to `config/logs/python-launcher.log`.
 
 ## Run from source
 
-Double-click **Launch Lumen.pyw**, or run:
+Build prerequisites: Node.js, Rust MSVC and Visual Studio C++ Build Tools (Python is no longer required). Run `npm ci` once for the optional music playback adapter and build tools.
+
+Build and run in release mode:
 
 ```text
-python run_lumen.py
-python run_lumen.py --no-build
-python run_lumen.py --widget controls
+node scripts/check-safe.mjs
+node scripts/build-native-music.mjs
+cargo build --release --locked --manifest-path native-dock/Cargo.toml
+.\native-dock\target\release\lumen.exe
 ```
 
-Build prerequisites: Python, Node.js, Rust MSVC and Visual Studio C++ Build
-Tools. Run `npm ci` once for the optional music playback adapter and build tools.
-`python run_lumen.py --build-only` builds without opening a window. Local builds
-stay in `native-dock/target/debug/`. Portable packaging uses a separate static-CRT
-development build under `native-dock/target/portable-debug/`, writing ZIPs under
-`share/`; no installer is generated.
+Local release builds output to `native-dock/target/release/lumen.exe` (debug builds to `native-dock/target/debug/lumen.exe`). Always stop any running `lumen.exe` instance before rebuilding, then launch it again afterwards. Portable packaging uses a separate static-CRT build under `native-dock/target/portable-debug/`, writing ZIPs under `share/`; no installer is generated.
 The optional music adapter controls an owned Chrome player over JSON pipes;
 widget windows remain Rust. See [Music](docs/youtube-music.md).
 
@@ -78,8 +76,7 @@ more content remains. Soft Violet uses the raised pale glass material.
 ```text
 node scripts/check-safe.mjs
 node --test scripts/test-check-safe.mjs scripts/test-native-music.mjs
-python -I scripts/test-system-controls.py
-python run_lumen.py --check
+cargo test --locked --manifest-path native-dock/Cargo.toml
 ```
 
 Settings live in `config/`. Legacy settings are retained for import; removing

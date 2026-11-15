@@ -64,7 +64,113 @@ struct Manager {
     #[cfg(test)]
     fail_surfaces: bool,
 }
-thread_local! {static MANAGER:RefCell<Option<Manager>>=const{RefCell::new(None)};}
+thread_local! {
+    static MANAGER: RefCell<Option<Manager>> = const { RefCell::new(None) };
+    static PENDING_MOVE: std::cell::Cell<Option<(usize, RECT)>> = const { std::cell::Cell::new(None) };
+}
+
+pub unsafe fn window_rect(hwnd: HWND) -> RECT {
+    if let Some((id, rect)) = PENDING_MOVE.with(|p| p.get()) {
+        if id == hwnd as usize {
+            return rect;
+        }
+    }
+    let mut r: RECT = zeroed();
+    GetWindowRect(hwnd, &mut r);
+    r
+}
+
+pub fn pending_move_point(hwnd: HWND) -> Option<POINT> {
+    PENDING_MOVE.with(|p| {
+        p.get().and_then(|(id, r)| {
+            (id == hwnd as usize).then_some(POINT {
+                x: r.left,
+                y: r.top,
+            })
+        })
+    })
+}
+
+pub fn is_atomic_moving(hwnd: HWND) -> bool {
+    PENDING_MOVE.with(|p| p.get().is_some_and(|(id, _)| id == hwnd as usize))
+}
+
+pub fn is_moving(hwnd: HWND) -> bool {
+    if is_atomic_moving(hwnd) {
+        return true;
+    }
+    MANAGER.with(|m| {
+        m.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref()?.members.get(&(hwnd as usize)).map(|p| p.moving))
+            .unwrap_or(false)
+    })
+}
+
+pub unsafe fn commit_atomic_move(hwnd: HWND, target: RECT) {
+    let mut cur: RECT = zeroed();
+    GetWindowRect(hwnd, &mut cur);
+    if target.left == cur.left && target.top == cur.top {
+        return;
+    }
+    PENDING_MOVE.with(|p| p.set(Some((hwnd as usize, target))));
+    InvalidateRect(hwnd, null(), 0);
+    UpdateWindow(hwnd);
+    PENDING_MOVE.with(|p| p.set(None));
+    let mut after: RECT = zeroed();
+    GetWindowRect(hwnd, &mut after);
+    if after.left != target.left || after.top != target.top {
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+pub unsafe fn move_captured_widget(hwnd: HWND, mut r: RECT) {
+    let w = r.right - r.left;
+    let h = r.bottom - r.top;
+    MANAGER.with(|m| {
+        if let Ok(mut x) = m.try_borrow_mut() {
+            if let Some(s) = x.as_mut() {
+                if !s.enabled {
+                    return;
+                }
+                if let Some(p) = s.members.get(&(hwnd as usize)).cloned() {
+                    if !p.moving {
+                        if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
+                            p.moving = true;
+                        }
+                        s.changed();
+                    }
+                    let inset = 4. * p.pane.dpi;
+                    let candidate = Pane {
+                        rect: [
+                            r.left as f32 + inset,
+                            r.top as f32 + inset,
+                            (r.left + w) as f32 - inset,
+                            (r.top + h) as f32 - inset,
+                        ],
+                        ..p.pane
+                    };
+                    let d = snap_move(&candidate, &s.panes());
+                    let dx = d[0].round() as i32;
+                    let dy = d[1].round() as i32;
+                    r.left += dx;
+                    r.right += dx;
+                    r.top += dy;
+                    r.bottom += dy;
+                }
+            }
+        }
+    });
+    commit_atomic_move(hwnd, r);
+}
 
 pub unsafe fn init(glass: Rc<RefCell<Glass>>) {
     let class = wide("LumenNativeFusionSurface");
@@ -165,8 +271,7 @@ pub unsafe fn register_widget(hwnd: HWND) {
     }
 }
 unsafe fn read_member(hwnd: HWND, radius: f32) -> Member {
-    let mut r = zeroed();
-    GetWindowRect(hwnd, &mut r);
+    let r = window_rect(hwnd);
     let dpi = (GetDpiForWindow(hwnd) as f32 / 96.).max(1.);
     let inset = 4. * dpi;
     Member {
@@ -325,6 +430,14 @@ pub unsafe fn publish_material(hwnd: HWND, material: material::Material) {
         s.materials.insert(hwnd as usize, material);
         s.changed();
     });
+}
+pub fn may_fuse() -> bool {
+    MANAGER.with(|m| {
+        m.try_borrow()
+            .ok()
+            .and_then(|x| x.as_ref().map(|s| s.enabled && s.members.len() >= 2))
+            .unwrap_or(false)
+    })
 }
 pub fn group(hwnd: HWND) -> Option<Vec<Pane>> {
     MANAGER.with(|m| {
@@ -516,8 +629,7 @@ pub unsafe fn shared_material(
         {
             return None;
         }
-        let mut r: RECT = zeroed();
-        GetWindowRect(hwnd, &mut r);
+        let r = window_rect(hwnd);
         // Global pixel grid: adjacent widgets interpolate identical samples at
         // their seam. Only this small field evaluates distance/exponential;
         // rasterization uses bilinear samples inside the join band.
@@ -600,7 +712,7 @@ unsafe extern "system" fn widget_proc(
         WM_WINDOWPOSCHANGING => {
             // Calendar and Dock also have capture-based drags. Snap those in
             // the same physical-coordinate path as Windows' native move loop.
-            if GetCapture() == hwnd {
+            if GetCapture() == hwnd && !is_atomic_moving(hwnd) {
                 let pos = &mut *(lp as *mut WINDOWPOS);
                 if pos.flags & SWP_NOMOVE == 0 {
                     MANAGER.with(|m| {
@@ -693,6 +805,8 @@ unsafe extern "system" fn widget_proc(
                     }
                 }
             });
+            let target = *r;
+            commit_atomic_move(hwnd, target);
         }
         WM_EXITSIZEMOVE | WM_CAPTURECHANGED | WM_CANCELMODE => {
             MANAGER.with(|m| {

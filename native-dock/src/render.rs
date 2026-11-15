@@ -166,8 +166,12 @@ thread_local! {static FONTS:RefCell<HashMap<(i32,u16),CachedFont>>=RefCell::new(
 unsafe fn font_at(size: f32, weight: u16) -> Ptr {
     FONTS.with(|cache| {
         let mut cache = cache.borrow_mut();
+        let key = ((size * 64.).round() as i32, weight);
+        if !cache.contains_key(&key) && cache.len() >= 128 {
+            cache.clear();
+        }
         let entry = cache
-            .entry(((size * 64.).round() as i32, weight))
+            .entry(key)
             .or_insert_with(|| {
                 let base_weight = weight & 0x0fff;
                 let extra_style = ((weight >> 12) & 0x0f) as i32;
@@ -229,13 +233,17 @@ impl Runtime {
 thread_local! {
     static OVERLAYS: RefCell<HashMap<([u32; 2], u32, i32, bool), (Vec<u8>, Option<[f32; 3]>)>> =
         RefCell::new(HashMap::new());
+    static GRAIN_TILE: RefCell<Option<Image>> = RefCell::new(None);
 }
 pub fn clear_caches() {
     crate::surface::clear_cache();
+    crate::lenses::clear_cache();
+    crate::settings_ui::clear_cache();
     SHADOWS.with(|shadows| shadows.borrow_mut().clear());
     GROUPS.with(|groups| groups.borrow_mut().clear());
     REFLECTIONS.with(|cache| cache.borrow_mut().clear());
     OVERLAYS.with(|cache| cache.borrow_mut().clear());
+    GRAIN_TILE.with(|tile| *tile.borrow_mut() = None);
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
@@ -1099,6 +1107,53 @@ impl Canvas {
             });
         }
         Some(image)
+    }
+    fn draw_grain(&self, rect: [f32; 4], dpi: f32) {
+        let step = 128. / dpi.max(1.);
+        GRAIN_TILE.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                let mut pixels = vec![0u8; 128 * 128 * 4];
+                for y in 0..128u32 {
+                    for x in 0..128u32 {
+                        let mut hash = ((x / 2) % 64).wrapping_mul(374761393)
+                            ^ ((y / 2) % 64).wrapping_mul(668265263);
+                        hash = (hash ^ (hash >> 13)).wrapping_mul(1274126177);
+                        let value = ((hash ^ (hash >> 16)) & 255) as i32 - 128;
+                        let alpha = (value.abs() * 396 / 12800) as u8;
+                        let rgb = if value > 0 { alpha } else { 0 };
+                        let i = ((y * 128 + x) * 4) as usize;
+                        pixels[i] = rgb;
+                        pixels[i + 1] = rgb;
+                        pixels[i + 2] = rgb;
+                        pixels[i + 3] = alpha;
+                    }
+                }
+                *slot = Image::from_rgba(128, 128, pixels);
+            }
+            if let Some(tile) = slot.as_ref() {
+                let mut y = rect[1];
+                while y < rect[3] {
+                    let mut x = rect[0];
+                    while x < rect[2] {
+                        self.clipped_image(tile, [x, y, x + step, y + step], rect);
+                        x += step;
+                    }
+                    y += step;
+                }
+            }
+        });
+    }
+    pub fn draw_pane_overlay(
+        &self,
+        _size: [u32; 2],
+        dpi: f32,
+        tint: f32,
+        light: bool,
+        rect: [f32; 4],
+    ) {
+        self.reflection_gradient(rect, tint, light);
+        self.draw_grain(rect, dpi);
     }
     pub fn tile(
         icon: &Image,

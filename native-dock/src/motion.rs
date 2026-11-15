@@ -23,6 +23,9 @@ impl FrameClock {
         Self(unsafe { timeBeginPeriod(1) == 0 })
     }
 }
+pub fn frame_interval_ms() -> u32 {
+    if low_power() { 16 } else { 10 }
+}
 impl Drop for FrameClock {
     fn drop(&mut self) {
         if self.0 {
@@ -33,28 +36,72 @@ impl Drop for FrameClock {
     }
 }
 pub const VSYNC_FRAME: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 19;
+thread_local! {
+    static PENDING_VSYNC: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LAST_DWM_FLUSH: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
+    let queued = PENDING_VSYNC.with(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_empty() {
+            Vec::new()
+        } else {
+            std::mem::take(&mut *q)
+        }
+    });
+    if queued.is_empty() {
+        return;
+    }
+    let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
+    let flush_limit = if low_power() { 4.0 } else { 6.8 };
+    if present_ms < flush_limit {
+        let recently_flushed = LAST_DWM_FLUSH.with(|cell| {
+            cell.get()
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(4))
+        });
+        if !recently_flushed {
+            let _ = windows_sys::Win32::Graphics::Dwm::DwmFlush();
+            LAST_DWM_FLUSH.with(|cell| cell.set(Some(std::time::Instant::now())));
+        }
+    }
+    for (hwnd, message) in queued {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            hwnd as windows_sys::Win32::Foundation::HWND,
+            message,
+            0,
+            0,
+        );
+    }
+}
 pub unsafe fn pace_vsync(
     hwnd: windows_sys::Win32::Foundation::HWND,
     frame_started: std::time::Instant,
     frame_queued: &mut bool,
     message: u32,
 ) {
-    if low_power() {
+    if *frame_queued {
         return;
     }
     let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-    if present_ms < 12. {
-        let synced = if present_ms < 5.5 {
-            let flush_started = std::time::Instant::now();
-            let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
-            hr == 0 || flush_started.elapsed().as_secs_f64() * 1000. >= 0.2
-        } else {
-            true
-        };
-        if synced && !*frame_queued {
-            *frame_queued = true;
-            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, message, 0, 0);
+    let budget_ms = if low_power() { 4.5 } else { 12. };
+    if present_ms >= budget_ms {
+        return;
+    }
+    *frame_queued = true;
+    PENDING_VSYNC.with(|q| {
+        let mut q = q.borrow_mut();
+        let entry = (hwnd as usize, message);
+        if !q.contains(&entry) {
+            q.push(entry);
         }
+    });
+    let paint_pending = (windows_sys::Win32::UI::WindowsAndMessaging::GetQueueStatus(
+        windows_sys::Win32::UI::WindowsAndMessaging::QS_PAINT,
+    ) >> 16)
+        & windows_sys::Win32::UI::WindowsAndMessaging::QS_PAINT
+        != 0;
+    if !paint_pending {
+        flush_pending_vsync(frame_started);
     }
 }
 pub fn bezier(t: f32, curve: [f32; 4]) -> f32 {
@@ -187,9 +234,14 @@ impl SmoothScroll {
         }
         let (position, velocity) = self.state(now);
         self.from = position;
-        self.velocity = velocity;
+        if velocity.abs() < 1. {
+            self.velocity = (target - position) * 10.;
+            self.start = now - 8.;
+        } else {
+            self.velocity = velocity;
+            self.start = now;
+        }
         self.target = target;
-        self.start = now;
     }
     pub fn by(&mut self, delta: f32, now: f64) {
         self.to(self.target + delta, now);
@@ -337,8 +389,8 @@ impl Motion {
             node.hover.target(
                 if hovered { 1. } else { 0. },
                 now,
-                if hovered { 240. } else { 320. },
-                HOVER_FADE,
+                if hovered { 90. } else { 180. },
+                if hovered { LIFT } else { HOVER_FADE },
             );
             node.scale.target(
                 if pressed {
@@ -349,11 +401,21 @@ impl Motion {
                     1.
                 },
                 now,
-                300.,
+                if pressed {
+                    100.
+                } else if hovered {
+                    160.
+                } else {
+                    200.
+                },
                 LIFT,
             );
-            node.lift
-                .target(if hovered && !pressed { -1.5 } else { 0. }, now, 300., LIFT);
+            node.lift.target(
+                if hovered && !pressed { -1.5 } else { 0. },
+                now,
+                if hovered && !pressed { 160. } else { 200. },
+                LIFT,
+            );
         }
     }
     pub fn hover(&mut self, id: Option<String>, pointer: Point, now: f64) {
@@ -612,5 +674,20 @@ mod tests {
         assert_eq!(bezier(0., LIFT), 0.);
         assert_eq!(bezier(1., LIFT), 1.);
         assert!(bezier(0.5, LIFT) > 0.8);
+    }
+    #[test]
+    fn low_power_scroll_and_animation_stay_at_least_60hz() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_low_power(self.0);
+            }
+        }
+        let _reset = Reset(low_power());
+        set_low_power(true);
+        assert!(frame_interval_ms() <= 16);
+        set_low_power(false);
+        assert_eq!(frame_interval_ms(), 10);
     }
 }
