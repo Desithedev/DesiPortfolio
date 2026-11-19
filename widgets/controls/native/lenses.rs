@@ -44,17 +44,17 @@ impl Lenses {
         self.0.borrow_mut().clear();
     }
     pub unsafe fn draw(&self, c: &Canvas, dpi: f32, r: [f32; 4], color: u32, style: u16) {
-        let diameter = ((r[2] - r[0]) * dpi * 2.).ceil().max(8.) as u32;
-        let height = ((r[3] - r[1]) * dpi * 2.).ceil().max(8.) as u32;
+        let diameter = ((r[2] - r[0]) * dpi).round().max(8.) as u32;
+        let height = ((r[3] - r[1]) * dpi).round().max(8.) as u32;
         let key = (diameter, height, color, style, (dpi * 1000.).round() as u32);
         let mut cache = self.0.borrow_mut();
         if !cache.contains_key(&key) {
             if let Some(image) = Image::from_rgba(
                 diameter,
                 height,
-                pixels(diameter, height, dpi * 2., color, style),
+                pixels(diameter, height, dpi, color, style),
             ) {
-                if cache.len() >= 24 {
+                if cache.len() >= 128 {
                     cache.clear();
                 }
                 cache.insert(key, image);
@@ -219,7 +219,7 @@ fn pixels(diameter: u32, height: u32, scale: f32, color: u32, style: u16) -> Vec
             );
             over(
                 [0.91, 0.97, 1.],
-                rim * (0.10 + 0.46 * facing.powf(1.4)) * strength,
+                rim * (0.10 + 0.46 * (facing * facing.sqrt())) * strength,
             );
             if hover && !pressed {
                 over([1.; 3], rim * if light { 0.24 } else { 0.18 });

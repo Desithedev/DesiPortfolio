@@ -4,7 +4,10 @@ use std::{
     ffi::c_void,
     mem::{size_of, transmute_copy, zeroed},
     ptr::{null, null_mut},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
+        mpsc, Arc,
+    },
 };
 use windows_sys::{
     core::GUID,
@@ -42,15 +45,41 @@ pub struct Command {
     pub control: Control,
     pub value: f32,
 }
+enum WorkerRequest {
+    Read { include_sources: bool },
+    Command(Command),
+}
+fn post_notify(hwnd: &AtomicIsize, msg: &AtomicU32, pending: &AtomicBool) {
+    if !pending.swap(true, Ordering::AcqRel) {
+        let h = hwnd.load(Ordering::Acquire);
+        let m = msg.load(Ordering::Acquire);
+        if h != 0 && m != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(h as HWND, m, 0, 0);
+            }
+        } else {
+            pending.store(false, Ordering::Release);
+        }
+    }
+}
 pub struct Worker {
-    tx: mpsc::Sender<Option<Command>>,
+    tx: mpsc::Sender<WorkerRequest>,
     pub rx: mpsc::Receiver<Snapshot>,
+    notify_hwnd: Arc<AtomicIsize>,
+    notify_msg: Arc<AtomicU32>,
+    notify_pending: Arc<AtomicBool>,
 }
 impl Worker {
     pub fn new(root: &std::path::Path) -> Result<Self, String> {
         let root = root.to_path_buf();
-        let (tx, requests) = mpsc::channel::<Option<Command>>();
+        let (tx, requests) = mpsc::channel::<WorkerRequest>();
         let (results, rx) = mpsc::channel();
+        let notify_hwnd = Arc::new(AtomicIsize::new(0));
+        let notify_msg = Arc::new(AtomicU32::new(0));
+        let notify_pending = Arc::new(AtomicBool::new(false));
+        let n_hwnd = Arc::clone(&notify_hwnd);
+        let n_msg = Arc::clone(&notify_msg);
+        let n_pending = Arc::clone(&notify_pending);
         std::thread::Builder::new()
             .name("lumen-controls".into())
             .spawn(move || unsafe {
@@ -58,21 +87,62 @@ impl Worker {
                 super::input_source::configure(&root);
                 let initialized = CoInitializeEx(null(), COINIT_MULTITHREADED as u32) >= 0;
                 let mut last_snapshot: Option<Snapshot> = None;
-                while let Ok(command) = requests.recv() {
-                    let error = command.as_ref().and_then(|c| execute(c).err());
-                    let audio_only = command.as_ref().is_some_and(|c| {
-                        !matches!(c.control.kind, Kind::Display | Kind::Hdr | Kind::Source)
-                    });
-                    let mut state = match (audio_only, last_snapshot.take()) {
-                        (true, Some(prev)) => snapshot_audio_only(prev),
-                        _ => snapshot(),
-                    };
-                    if let Some(error) = error {
-                        state.errors.insert(0, error);
-                    }
-                    last_snapshot = Some(state.clone());
-                    if results.send(state).is_err() {
-                        break;
+                while let Ok(request) = requests.recv() {
+                    match request {
+                        WorkerRequest::Read { include_sources } => {
+                            let prev_sources = last_snapshot
+                                .as_ref()
+                                .map(|s| s.sources.clone())
+                                .unwrap_or_default();
+                            let mut fast = snapshot_fast(prev_sources);
+                            last_snapshot = Some(fast.clone());
+                            if results.send(fast.clone()).is_err() {
+                                break;
+                            }
+                            post_notify(&n_hwnd, &n_msg, &n_pending);
+                            if include_sources {
+                                let sources = super::input_source::snapshot(&fast.displays);
+                                if sources != fast.sources {
+                                    fast.sources = sources;
+                                    last_snapshot = Some(fast.clone());
+                                    if results.send(fast).is_err() {
+                                        break;
+                                    }
+                                    post_notify(&n_hwnd, &n_msg, &n_pending);
+                                }
+                            }
+                        }
+                        WorkerRequest::Command(c) => {
+                            let error = execute(&c).err();
+                            let audio_only = !matches!(
+                                c.control.kind,
+                                Kind::Display | Kind::Hdr | Kind::Source
+                            );
+                            let mut state = if audio_only {
+                                match last_snapshot.take() {
+                                    Some(prev) => snapshot_audio_only(prev),
+                                    None => snapshot_fast(Default::default()),
+                                }
+                            } else {
+                                let prev_sources = last_snapshot
+                                    .as_ref()
+                                    .map(|s| s.sources.clone())
+                                    .unwrap_or_default();
+                                let mut s = snapshot_fast(prev_sources);
+                                if c.control.kind == Kind::Source {
+                                    s.sources = super::input_source::snapshot(&s.displays);
+                                }
+                                s
+                            };
+                            if let Some(error) = error {
+                                state.errors.insert(0, error);
+                            }
+                            last_snapshot = Some(state.clone());
+                            if results.send(state).is_err() {
+                                break;
+                            }
+                            post_notify(&n_hwnd, &n_msg, &n_pending);
+                        }
                     }
                 }
                 if initialized {
@@ -80,13 +150,32 @@ impl Worker {
                 }
             })
             .map_err(|error| error.to_string())?;
-        Ok(Self { tx, rx })
+        Ok(Self {
+            tx,
+            rx,
+            notify_hwnd,
+            notify_msg,
+            notify_pending,
+        })
+    }
+    pub fn set_notify(&self, hwnd: HWND, msg: u32) {
+        self.notify_hwnd.store(hwnd as isize, Ordering::Release);
+        self.notify_msg.store(msg, Ordering::Release);
+        if hwnd.is_null() || msg == 0 {
+            self.notify_pending.store(false, Ordering::Release);
+        }
+    }
+    pub fn clear_notify_pending(&self) {
+        self.notify_pending.store(false, Ordering::Release);
     }
     pub fn read(&self) {
-        let _ = self.tx.send(None);
+        self.read_with_sources(false);
+    }
+    pub fn read_with_sources(&self, include_sources: bool) {
+        let _ = self.tx.send(WorkerRequest::Read { include_sources });
     }
     pub fn command(&self, command: Command) {
-        let _ = self.tx.send(Some(command));
+        let _ = self.tx.send(WorkerRequest::Command(command));
     }
 }
 fn hr(value: i32) -> Result<(), String> {
@@ -537,10 +626,12 @@ pub unsafe fn execute(command: &Command) -> Result<(), String> {
         }
     }
 }
-pub unsafe fn snapshot() -> Snapshot {
+pub unsafe fn snapshot_fast(
+    cached_sources: std::collections::BTreeMap<String, Vec<Device>>,
+) -> Snapshot {
     let mut s = Snapshot::default();
     s.displays = displays();
-    s.sources = super::input_source::snapshot(&s.displays);
+    s.sources = cached_sources;
     match hdr_targets() {
         Ok(targets) => {
             for d in &mut s.displays {
@@ -571,6 +662,11 @@ pub unsafe fn snapshot() -> Snapshot {
         }
         Err(e) => s.errors.push(e),
     }
+    s
+}
+pub unsafe fn snapshot() -> Snapshot {
+    let mut s = snapshot_fast(Default::default());
+    s.sources = super::input_source::snapshot(&s.displays);
     s
 }
 unsafe fn snapshot_audio_only(mut s: Snapshot) -> Snapshot {
@@ -637,6 +733,62 @@ mod tests {
                 value: 101.
             })
             .is_err());
+        }
+    }
+    #[test]
+    fn worker_posts_coalesced_wakeup_when_fast_snapshot_completes() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, DispatchMessageW, PeekMessageW, TranslateMessage,
+            MSG, PM_REMOVE, WM_APP, WS_POPUP,
+        };
+        let _ui = crate::native_ui_test_lock();
+        let notify_msg = WM_APP + 180;
+        let class: Vec<u16> = "Static\0".encode_utf16().collect();
+        let root =
+            std::env::temp_dir().join(format!("lumen-controls-notify-{}", std::process::id()));
+        unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            let worker = Worker::new(&root).unwrap();
+            worker.set_notify(hwnd, notify_msg);
+            worker.read_with_sources(false);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut got_notify = false;
+            let mut msg: MSG = zeroed();
+            while std::time::Instant::now() < deadline && !got_notify {
+                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                    if msg.message == notify_msg {
+                        got_notify = true;
+                        break;
+                    }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if !got_notify {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            assert!(got_notify, "expected WM_APP+180 wakeup within 2s");
+            assert!(
+                worker.rx.try_recv().is_ok(),
+                "fast snapshot should be queued immediately when wakeup arrives"
+            );
+            worker.set_notify(null_mut(), 0);
+            DestroyWindow(hwnd);
         }
     }
     #[test]

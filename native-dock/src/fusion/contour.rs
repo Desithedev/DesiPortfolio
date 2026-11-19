@@ -302,6 +302,54 @@ impl Outline {
         (0.09 + 0.28 * ((-nx * 0.6 - ny * 0.8) / length).max(0.))
             * (1. + d.min(0.) / band).clamp(0., 1.)
     }
+    pub(crate) fn pack_gpu_segments(
+        &self,
+        origin: [f32; 2],
+    ) -> Option<([[f32; 4]; 32], u32, [[f32; 4]; 32], [[f32; 4]; 32], u32)> {
+        let line_count = self.h_lines.len() + self.v_lines.len();
+        let corner_count = self.corners.len();
+        if line_count > 32 || corner_count > 32 {
+            return None;
+        }
+        let mut lines = [[0.0f32; 4]; 32];
+        let mut idx = 0usize;
+        for &[y0, x0, x1] in &self.h_lines {
+            lines[idx] = [
+                x0 - origin[0],
+                y0 - origin[1],
+                x1 - origin[0],
+                y0 - origin[1],
+            ];
+            idx += 1;
+        }
+        for &[x0, y0, y1] in &self.v_lines {
+            lines[idx] = [
+                x0 - origin[0],
+                y0 - origin[1],
+                x0 - origin[0],
+                y1 - origin[1],
+            ];
+            idx += 1;
+        }
+        let mut corner_c = [[0.0f32; 4]; 32];
+        let mut corner_uv = [[0.0f32; 4]; 32];
+        for (i, c) in self.corners.iter().enumerate() {
+            corner_c[i] = [
+                c.center[0] - origin[0],
+                c.center[1] - origin[1],
+                c.radius,
+                if c.convex { 1.0 } else { -1.0 },
+            ];
+            corner_uv[i] = [-c.v[0], -c.v[1], c.u[0], c.u[1]];
+        }
+        Some((
+            lines,
+            line_count as u32,
+            corner_c,
+            corner_uv,
+            corner_count as u32,
+        ))
+    }
 }
 #[inline]
 pub fn with_outline<R>(panes: &[Pane], f: impl FnOnce(&Outline) -> R) -> R {

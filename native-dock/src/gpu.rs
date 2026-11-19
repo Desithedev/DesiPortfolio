@@ -72,7 +72,9 @@ const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
 const DXGI_USAGE_RENDER_TARGET_OUTPUT: u32 = 0x20;
 const DXGI_SCALING_STRETCH: u32 = 0;
+#[allow(dead_code)]
 const DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL: u32 = 3;
+const DXGI_SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
 const DXGI_ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 
 const D3D11_USAGE_DEFAULT: u32 = 0;
@@ -271,10 +273,49 @@ pub struct GlassConstants {
     pub has_content: u32,
     pub fuse_line_count: u32,
     pub fuse_corner_count: u32,
+    pub content_uv_scale: [f32; 4],
     pub nested: [NestedGlassRect; 8],
     pub fuse_lines: [[f32; 4]; 32],
     pub fuse_corner_c: [[f32; 4]; 32],
     pub fuse_corner_uv: [[f32; 4]; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FusionBridgeConstants {
+    pub bridge_rect: [f32; 4],          // l, t, w, h in desktop pixels
+    pub desktop_rect: [f32; 4],         // origin_x, origin_y, desktop_w, desktop_h
+    pub params: [f32; 4],               // [dpi, pad_f, liquid, morph_k]
+    pub accent_flags: [f32; 4],         // [accent_r, accent_g, accent_b, has_wallpaper]
+    pub counts: [u32; 4],               // [pane_count, member_win_count, fuse_line_count, fuse_corner_count]
+    pub pane_rects: [[f32; 4]; 16],     // l, t, r, b in local bridge pixels
+    pub pane_meta: [[f32; 4]; 16],      // [radius, opacity, dpi, 0.0]
+    pub pane_delta: [[f32; 4]; 16],     // [dr, dg, db, has_delta] in -1.0..1.0
+    pub member_windows: [[f32; 4]; 16], // l, t, r, b in local bridge pixels
+    pub fuse_lines: [[f32; 4]; 32],     // x0, y0, x1, y1 in local bridge pixels
+    pub fuse_corner_c: [[f32; 4]; 32],  // cx, cy, radius, +1 convex / -1 concave
+    pub fuse_corner_uv: [[f32; 4]; 32], // -v.x, -v.y, u.x, u.y
+    pub field_uv: [f32; 4],             // [tex_w, tex_h, step_px, active]
+}
+
+impl Default for FusionBridgeConstants {
+    fn default() -> Self {
+        Self {
+            bridge_rect: [0.0; 4],
+            desktop_rect: [0.0; 4],
+            params: [1.0, 48.0, 0.0, 0.0],
+            accent_flags: [0.0; 4],
+            counts: [0; 4],
+            pane_rects: [[0.0; 4]; 16],
+            pane_meta: [[0.0; 4]; 16],
+            pane_delta: [[0.0; 4]; 16],
+            member_windows: [[0.0; 4]; 16],
+            fuse_lines: [[0.0; 4]; 32],
+            fuse_corner_c: [[0.0; 4]; 32],
+            fuse_corner_uv: [[0.0; 4]; 32],
+            field_uv: [0.0; 4],
+        }
+    }
 }
 
 #[repr(C)]
@@ -297,6 +338,7 @@ cbuffer GlassCB : register(b0) {
     uint has_content;
     uint fuse_line_count;
     uint fuse_corner_count;
+    float4 content_uv_scale;
     float4 nested_rect[8];
     float4 nested_meta[8]; // x=radius, y=tint_alpha
     float4 fuse_lines[32];     // x0, y0, x1, y1 in local window px
@@ -310,9 +352,30 @@ cbuffer BlurCB : register(b1) {
     float _bpad;
 };
 
+cbuffer FusionBridgeCB : register(b2) {
+    float4 fb_bridge_rect;
+    float4 fb_desktop_rect;
+    float4 fb_params;
+    float4 fb_accent_flags;
+    uint4 fb_counts;
+    float4 fb_pane_rects[16];
+    float4 fb_pane_meta[16];
+    float4 fb_pane_delta[16];
+    float4 fb_member_windows[16];
+    float4 fb_fuse_lines[32];
+    float4 fb_fuse_corner_c[32];
+    float4 fb_fuse_corner_uv[32];
+    float4 fb_field_uv;
+};
+
 Texture2D sharp_tex : register(t0);
 Texture2D blurred_tex : register(t1);
+#ifdef FUSION_BRIDGE_PS
+Texture2D bridge_field_tex : register(t2);
+#else
 Texture2D content_tex : register(t2);
+#define bridge_field_tex content_tex
+#endif
 Texture2D grain_tex : register(t3);
 SamplerState samp_clamp : register(s0);
 SamplerState samp_wrap : register(s1);
@@ -358,6 +421,9 @@ float sd_round_rect(float2 p, float2 half_size, float r) {
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
 
+// The fusion variant binds t2 as bridge_field_tex. HLSL validates even
+// non-entry functions, so it must not see the widget-only content_tex access.
+#ifndef FUSION_BRIDGE_PS
 float4 glass_composite_ps(VSOut i) : SV_Target {
     float2 local_px = i.uv * win_rect.zw;
     float2 half_size = win_rect.zw * 0.5;
@@ -418,7 +484,7 @@ float4 glass_composite_ps(VSOut i) : SV_Target {
 
     // Premultiplied content layer composite
     if (has_content > 0u) {
-        float4 c = content_tex.Sample(samp_clamp, i.uv);
+        float4 c = content_tex.Sample(samp_clamp, min(i.uv * content_uv_scale.xy, content_uv_scale.zw));
         if (flags.w <= 0.001) {
             return c;
         }
@@ -426,6 +492,313 @@ float4 glass_composite_ps(VSOut i) : SV_Target {
     }
 
     return out_col;
+}
+
+#endif
+
+float fb_smin(float a, float b, float k) {
+    float h = saturate(0.5 + 0.5 * (b - a) / max(k, 1e-4));
+    return lerp(b, a, h) - k * h * (1.0 - h);
+}
+
+float fb_contour_sdf(float2 p) {
+    uint lc = min(fb_counts.z, 32u);
+    uint cc = min(fb_counts.w, 32u);
+    float d_sq = 1e20;
+    bool inside = false;
+
+    [loop]
+    for (uint li = 0u; li < lc; li++) {
+        float4 seg = fb_fuse_lines[li];
+        float2 a = seg.xy;
+        float2 b = seg.zw;
+        float2 ab = b - a;
+        float len2 = dot(ab, ab);
+        float t = (len2 > 1e-8) ? saturate(dot(p - a, ab) / len2) : 0.0;
+        float2 diff = p - (a + ab * t);
+        d_sq = min(d_sq, dot(diff, diff));
+
+        if (abs(ab.y) > abs(ab.x)) {
+            float y0 = min(a.y, b.y);
+            float y1 = max(a.y, b.y);
+            if (p.y >= y0 && p.y < y1 && a.x > p.x) {
+                inside = !inside;
+            }
+        }
+    }
+
+    float d = sqrt(d_sq);
+    bool corner_override = false;
+    bool corner_inside = false;
+
+    [loop]
+    for (uint ci = 0u; ci < cc; ci++) {
+        float4 cc4 = fb_fuse_corner_c[ci];
+        float4 cuv = fb_fuse_corner_uv[ci];
+        float2 center = cc4.xy;
+        float r = cc4.z;
+        float convex = cc4.w;
+        float2 neg_v = cuv.xy;
+        float2 u_vec = cuv.zw;
+
+        float2 v_pt = center + (u_vec + neg_v) * r;
+        float2 cmin = min(v_pt, center);
+        float2 cmax = max(v_pt, center);
+        if (p.y >= cmin.y && p.y < cmax.y) {
+            float sx = u_vec.x + neg_v.x;
+            float dy = p.y - center.y;
+            float dx = sqrt(max(0.0, r * r - dy * dy));
+            if (center.x + sx * dx > p.x) {
+                inside = !inside;
+            }
+        }
+
+        float2 q = p - center;
+        float box_d = max(abs(q.x) - r, abs(q.y) - r);
+        if (!(box_d > 0.0 && box_d >= d)) {
+            float q_len = length(q);
+            bool on_quad = (dot(q, neg_v) >= 0.0) && (dot(q, u_vec) >= 0.0);
+            if (on_quad) {
+                d = min(d, abs(q_len - r));
+            } else {
+                float2 pa = p - (center + neg_v * r);
+                float2 pb = p - (center + u_vec * r);
+                d = min(d, sqrt(min(dot(pa, pa), dot(pb, pb))));
+            }
+            if (p.x >= cmin.x && p.x <= cmax.x && p.y >= cmin.y && p.y <= cmax.y) {
+                corner_override = true;
+                corner_inside = (convex > 0.0) ? (q_len <= r) : (q_len >= r);
+            }
+        }
+    }
+
+    if (corner_override) {
+        inside = corner_inside;
+    }
+    return inside ? -d : d;
+}
+
+float fb_smin_sdf(float2 p, float k) {
+    uint pc = min(fb_counts.x, 16u);
+    if (pc == 0u) {
+        return 1e6;
+    }
+    float d = 1e6;
+    [loop]
+    for (uint j = 0u; j < pc; j++) {
+        float4 pr = fb_pane_rects[j];
+        float2 ph = (pr.zw - pr.xy) * 0.5;
+        float2 pcen = (pr.xy + pr.zw) * 0.5;
+        float dj = sd_round_rect(p - pcen, ph, fb_pane_meta[j].x);
+        d = (j == 0u) ? dj : fb_smin(d, dj, k);
+    }
+    return d;
+}
+
+float fb_sdf(float2 p) {
+    float morph_k = fb_params.w;
+    bool has_contour = (fb_counts.z > 0u || fb_counts.w > 0u);
+    if (morph_k > 0.001 && fb_counts.x > 0u) {
+        return fb_smin_sdf(p, morph_k);
+    }
+    if (has_contour) {
+        return fb_contour_sdf(p);
+    }
+    return fb_smin_sdf(p, 0.0);
+}
+
+float fb_sample_ca_channel(
+    Texture2D tex,
+    float2 screen_uv,
+    float2 n,
+    float2 desk_size,
+    float disp,
+    float signed_ca,
+    float fb_dpi,
+    float3 ch_mask
+) {
+    if (abs(signed_ca) <= 0.05) {
+        return dot(tex.Sample(samp_clamp, screen_uv + n * disp / desk_size).rgb, ch_mask);
+    }
+    float d0 = disp + signed_ca * 0.35;
+    float d1 = disp + signed_ca;
+    float d2 = disp + signed_ca * 1.65;
+    float spread = max(abs(signed_ca) * 0.45, 0.75 * fb_dpi);
+    float2 t_uv = float2(-n.y, n.x) * spread / desk_size;
+    float2 n_uv = n / desk_size;
+    return 0.20 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d0).rgb, ch_mask)
+         + 0.30 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d1).rgb, ch_mask)
+         + 0.15 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d1 + t_uv).rgb, ch_mask)
+         + 0.15 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d1 - t_uv).rgb, ch_mask)
+         + 0.20 * dot(tex.Sample(samp_clamp, screen_uv + n_uv * d2).rgb, ch_mask);
+}
+
+float4 fusion_bridge_ps(VSOut i) : SV_Target {
+    float2 local_px = i.uv * fb_bridge_rect.zw;
+    float fb_dpi = max(fb_params.x, 1.0);
+    float pad_f = max(fb_params.y, 1.0);
+
+    float d = fb_sdf(local_px);
+    if (d >= pad_f) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float coverage = saturate(0.5 - d);
+    float underlap = 3.0 * fb_dpi;
+    uint wc = min(fb_counts.y, 16u);
+    bool in_window = false;
+    bool in_deep_window = false;
+    [loop]
+    for (uint wi = 0u; wi < wc; wi++) {
+        float4 mw = fb_member_windows[wi];
+        if (local_px.x >= mw.x && local_px.x < mw.z && local_px.y >= mw.y && local_px.y < mw.w) {
+            in_window = true;
+            if (local_px.x >= mw.x + underlap && local_px.x < mw.z - underlap
+                && local_px.y >= mw.y + underlap && local_px.y < mw.w - underlap)
+            {
+                in_deep_window = true;
+                break;
+            }
+        }
+    }
+    if ((in_window && d >= -1.0 && coverage > 0.0) || (in_deep_window && d < -1.0)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float alpha = 1.0;
+    float3 delta_rgb = float3(0.0, 0.0, 0.0);
+    float frost_mix = 1.0;
+    uint pc = min(fb_counts.x, 16u);
+    if (pc > 0u) {
+        float sum_w = 0.0;
+        float sum_a = 0.0;
+        float3 sum_delta = float3(0.0, 0.0, 0.0);
+        float sum_wf = 0.0;
+        float sum_sharp = 0.0;
+        [loop]
+        for (uint pi = 0u; pi < pc; pi++) {
+            float4 pr = fb_pane_rects[pi];
+            float2 ph = (pr.zw - pr.xy) * 0.5;
+            float2 pcen = (pr.xy + pr.zw) * 0.5;
+            float dp = sd_round_rect(local_px - pcen, ph, fb_pane_meta[pi].x);
+            float w = exp(-max(dp - d, 0.0) / (20.0 * fb_dpi));
+            sum_w += w;
+            sum_a += w * fb_pane_meta[pi].y;
+            sum_delta += w * fb_pane_delta[pi].rgb * fb_pane_delta[pi].w;
+
+            float pdpi = max(fb_pane_meta[pi].z, 1.0);
+            float srad = min(4.0 * pdpi, min(ph.x, ph.y));
+            float d_seam = sd_round_rect(local_px - pcen, ph, srad);
+            float wf = exp(-max(d_seam, 0.0) / (96.0 * pdpi));
+            sum_wf += wf;
+            sum_sharp += wf * fb_pane_meta[pi].w;
+        }
+        alpha = (sum_w > 0.0) ? (sum_a / sum_w) : 0.0;
+        delta_rgb = (sum_w > 0.0) ? (sum_delta / sum_w) : float3(0.0, 0.0, 0.0);
+        frost_mix = 1.0 - ((sum_wf > 0.0) ? saturate(sum_sharp / sum_wf) : 0.0);
+    }
+
+    float sd = fb_sdf(local_px - float2(5.0 * fb_dpi, 8.0 * fb_dpi));
+    float fade = saturate((pad_f - d) / (8.0 * fb_dpi));
+    float tx = clamp(sd / (17.0 * fb_dpi), -4.8, 4.8);
+    float tx2 = tx * tx;
+    float th = clamp(
+        tx * (135135.0 + tx2 * (17325.0 + tx2 * (378.0 + tx2)))
+            / (135135.0 + tx2 * (62370.0 + tx2 * (3150.0 + tx2 * 28.0))),
+        -1.0,
+        1.0
+    );
+    float shadow_a = saturate(0.5 * (1.0 - th) * (96.0 / 255.0) * alpha * fade);
+    if (coverage <= 0.0) {
+        return float4(0.0, 0.0, 0.0, shadow_a);
+    }
+
+    float dx = fb_sdf(local_px + float2(0.5, 0.0)) - fb_sdf(local_px - float2(0.5, 0.0));
+    float dy = fb_sdf(local_px + float2(0.0, 0.5)) - fb_sdf(local_px - float2(0.0, 0.5));
+    float2 grad = float2(dx, dy);
+    float glen = max(length(grad), 1e-4);
+    float2 n = grad / glen;
+
+    float band = 2.5 * fb_dpi;
+    float rim_edge = (d >= -band)
+        ? ((0.09 + 0.28 * max(-n.x * 0.6 - n.y * 0.8, 0.0)) * saturate(1.0 + min(d, 0.0) / band))
+        : 0.0;
+
+    float liquid_spec = 0.0;
+    if (fb_params.z > 0.5 && d <= 0.5) {
+        float spec_w = 0.32 * max(min(44.0 * fb_dpi, min(fb_bridge_rect.z, fb_bridge_rect.w) * 0.45), 1.0);
+        if (-d < spec_w) {
+            float ledge = saturate(1.0 - max(-d, 0.0) / spec_w);
+            float light_dir = max(-n.x * 0.55 - n.y * 0.83, 0.0) + max(n.x * 0.4 + n.y * 0.6, 0.0) * 0.35;
+            liquid_spec = (ledge * ledge * ledge * (16.0 + 34.0 * light_dir)) / 255.0;
+        }
+    }
+
+    float3 wall = fb_accent_flags.rgb;
+    if (fb_accent_flags.w > 0.5) {
+        float2 desk_size = max(fb_desktop_rect.zw, float2(1.0, 1.0));
+        float2 screen_uv = (fb_bridge_rect.xy + local_px - fb_desktop_rect.xy) / desk_size;
+        float3 blur_base = blurred_tex.Sample(samp_clamp, screen_uv).rgb;
+        wall = (frost_mix < 0.999)
+            ? lerp(sharp_tex.Sample(samp_clamp, screen_uv).rgb, blur_base, frost_mix)
+            : blur_base;
+
+        if (fb_params.z > 0.5) {
+            float bridge_rim = clamp(40.0 * fb_dpi, 12.0, min(fb_bridge_rect.z, fb_bridge_rect.w) * 0.40);
+            if (d > -bridge_rim) {
+                float u = saturate(-d / bridge_rim);
+                float k = saturate(1.0 - u);
+                float edge_align = k * k * (2.0 - k);
+                float colour_k = saturate(1.0 - u / 0.65);
+                float ca_factor = (0.45 * 0.65) * colour_k * colour_k * (2.0 - colour_k);
+                float lens_strength = min(1.0, 0.65 * bridge_rim / ((4.0 / 3.0) * (12.5 + 1.65 * 4.5) * fb_dpi));
+                float disp = -12.5 * fb_dpi * edge_align * lens_strength;
+                float ca = ca_factor * 4.5 * fb_dpi * lens_strength;
+
+                float2 refract_uv = screen_uv + n * disp / desk_size;
+                float3 blur_col;
+                blur_col.r = fb_sample_ca_channel(blurred_tex, screen_uv, n, desk_size, disp, -ca, fb_dpi, float3(1.0, 0.0, 0.0));
+                blur_col.g = blurred_tex.Sample(samp_clamp, refract_uv).g;
+                blur_col.b = fb_sample_ca_channel(blurred_tex, screen_uv, n, desk_size, disp, ca, fb_dpi, float3(0.0, 0.0, 1.0));
+                if (frost_mix < 0.999) {
+                    float3 sharp_refr;
+                    sharp_refr.r = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, -ca, fb_dpi, float3(1.0, 0.0, 0.0));
+                    sharp_refr.g = sharp_tex.Sample(samp_clamp, refract_uv).g;
+                    sharp_refr.b = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, ca, fb_dpi, float3(0.0, 0.0, 1.0));
+                    wall = lerp(sharp_refr, blur_col, frost_mix);
+                } else {
+                    wall = blur_col;
+                }
+
+                if (u < 0.88) {
+                    float s = saturate(1.0 - u / 0.88);
+                    float clarity = 0.52 * s * s * s * (s * (s * 6.0 - 15.0) + 10.0);
+                    float ca_s = ca * 0.45;
+                    float3 sharp_col;
+                    sharp_col.r = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, -ca_s, fb_dpi, float3(1.0, 0.0, 0.0));
+                    sharp_col.g = sharp_tex.Sample(samp_clamp, refract_uv).g;
+                    sharp_col.b = fb_sample_ca_channel(sharp_tex, screen_uv, n, desk_size, disp, ca_s, fb_dpi, float3(0.0, 0.0, 1.0));
+                    wall = lerp(wall, sharp_col, clarity);
+                }
+            }
+        }
+    }
+    if (fb_field_uv.x > 0.0 && fb_field_uv.y > 0.0 && fb_field_uv.z > 0.0) {
+        float2 field_uv = (local_px / fb_field_uv.z + 0.5) / fb_field_uv.xy;
+        float4 gf = bridge_field_tex.Sample(samp_clamp, field_uv);
+        if (fb_field_uv.w > 1.5) {
+            wall = saturate(wall * gf.a + gf.rgb);
+        } else {
+            wall = saturate(wall * gf.a + (gf.rgb - 0.5) * 2.0);
+        }
+    } else {
+        wall = saturate(wall + delta_rgb);
+    }
+
+    float3 lit = min(wall + (1.0 - wall) * rim_edge + liquid_spec, 1.0);
+    float fg_a = coverage * alpha;
+    float out_a = fg_a + shadow_a * (1.0 - fg_a);
+    return float4(lit * fg_a, out_a);
 }
 "#;
 
@@ -438,10 +811,12 @@ pub struct GpuDevice {
     ps_down: ComPtr,
     ps_up: ComPtr,
     ps_glass: ComPtr,
+    ps_fusion: ComPtr,
     samp_clamp: ComPtr,
     samp_wrap: ComPtr,
     glass_cb: ComPtr,
     blur_cb: ComPtr,
+    fusion_cb: ComPtr,
     grain_srv: ComPtr,
     sharp_tex: Option<(i32, i32, ComPtr, ComPtr)>,   // w, h, tex, srv
     blurred_tex: Option<(i32, i32, ComPtr, ComPtr)>, // w, h, tex, srv
@@ -509,16 +884,19 @@ impl GpuDevice {
             let ps_down_blob = compile_shader("kawase_down_ps\0", "ps_5_0\0")?;
             let ps_up_blob = compile_shader("kawase_up_ps\0", "ps_5_0\0")?;
             let ps_glass_blob = compile_shader("glass_composite_ps\0", "ps_5_0\0")?;
+            let ps_fusion_blob = compile_shader("fusion_bridge_ps\0", "ps_5_0\0")?;
 
             let vs = create_vs(&device, &vs_blob)?;
             let ps_down = create_ps(&device, &ps_down_blob)?;
             let ps_up = create_ps(&device, &ps_up_blob)?;
             let ps_glass = create_ps(&device, &ps_glass_blob)?;
+            let ps_fusion = create_ps(&device, &ps_fusion_blob)?;
 
             let samp_clamp = create_sampler(&device, D3D11_TEXTURE_ADDRESS_CLAMP)?;
             let samp_wrap = create_sampler(&device, D3D11_TEXTURE_ADDRESS_WRAP)?;
             let glass_cb = create_cb(&device, size_of::<GlassConstants>() as u32)?;
             let blur_cb = create_cb(&device, size_of::<BlurConstants>() as u32)?;
+            let fusion_cb = create_cb(&device, size_of::<FusionBridgeConstants>() as u32)?;
             let grain_srv = create_grain_srv(&device)?;
 
             Some(Self {
@@ -530,10 +908,12 @@ impl GpuDevice {
                 ps_down,
                 ps_up,
                 ps_glass,
+                ps_fusion,
                 samp_clamp,
                 samp_wrap,
                 glass_cb,
                 blur_cb,
+                fusion_cb,
                 grain_srv,
                 sharp_tex: None,
                 blurred_tex: None,
@@ -585,6 +965,50 @@ impl GpuDevice {
 
         self.sharp_tex = Some((w, h, sharp_tex, sharp_srv));
         self.blurred_tex = Some((bw, bh, blur_tex, blur_srv));
+        true
+    }
+
+    /// Upload a pre-blurred monitor wallpaper and optional sharp monitor wallpaper directly.
+    pub unsafe fn set_wallpaper_pair_bgra(
+        &mut self,
+        w: i32,
+        h: i32,
+        blurred_bgra: &[u8],
+        sharp_bgra: Option<&[u8]>,
+    ) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
+        let expected = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if blurred_bgra.len() < expected {
+            return false;
+        }
+        let sharp_slice = sharp_bgra.unwrap_or(blurred_bgra);
+        if sharp_slice.len() < expected {
+            return false;
+        }
+        let Some((blur_tex, blur_srv)) = create_texture2d(
+            &self.device,
+            w,
+            h,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            Some(blurred_bgra),
+            false,
+        ) else {
+            return false;
+        };
+        let Some((sharp_tex, sharp_srv)) = create_texture2d(
+            &self.device,
+            w,
+            h,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            Some(sharp_slice),
+            false,
+        ) else {
+            return false;
+        };
+        self.blurred_tex = Some((w, h, blur_tex, blur_srv));
+        self.sharp_tex = Some((w, h, sharp_tex, sharp_srv));
         true
     }
 
@@ -653,12 +1077,59 @@ impl GpuDevice {
         ps_set_srv(&self.context, 2, null_mut());
         om_set_render_targets(&self.context, null_mut());
     }
+
+    /// Render the fused junction bridge (contour SDF / optional smin liquid morph,
+    /// member window cutout, liquid rim refraction/CA, and tanh cluster shadow).
+    pub unsafe fn render_fusion_bridge(
+        &self,
+        dst_rtv: &ComPtr,
+        w: i32,
+        h: i32,
+        constants: &FusionBridgeConstants,
+        field_srv: Option<&ComPtr>,
+    ) {
+        update_subresource(
+            &self.context,
+            &self.fusion_cb,
+            constants as *const _ as *const c_void,
+        );
+
+        let clear = [0.0f32, 0.0, 0.0, 0.0];
+        clear_rtv(&self.context, dst_rtv.as_ptr(), &clear);
+        set_viewport(&self.context, w as f32, h as f32);
+        om_set_render_targets(&self.context, dst_rtv.as_ptr());
+        ia_set_topology(&self.context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        vs_set_shader(&self.context, self.vs.as_ptr());
+        ps_set_shader(&self.context, self.ps_fusion.as_ptr());
+        ps_set_cb(&self.context, 2, self.fusion_cb.as_ptr());
+        ps_set_sampler(&self.context, 0, self.samp_clamp.as_ptr());
+        ps_set_sampler(&self.context, 1, self.samp_wrap.as_ptr());
+
+        if let Some((_, _, _, srv)) = &self.sharp_tex {
+            ps_set_srv(&self.context, 0, srv.as_ptr());
+        }
+        if let Some((_, _, _, srv)) = &self.blurred_tex {
+            ps_set_srv(&self.context, 1, srv.as_ptr());
+        }
+        if let Some(fsrv) = field_srv {
+            ps_set_srv(&self.context, 2, fsrv.as_ptr());
+        } else {
+            ps_set_srv(&self.context, 2, null_mut());
+        }
+        draw(&self.context, 3, 0);
+
+        ps_set_srv(&self.context, 0, null_mut());
+        ps_set_srv(&self.context, 1, null_mut());
+        ps_set_srv(&self.context, 2, null_mut());
+        om_set_render_targets(&self.context, null_mut());
+    }
 }
 
 /// Per-widget DirectComposition surface with bucketed swapchain sizing
 /// (`IDXGISwapChain2::SetSourceSize`) for zero-reallocation 120Hz resize.
 pub struct GpuSurface {
     pub swapchain: ComPtr,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub swapchain2: Option<ComPtr>,
     #[allow(dead_code)]
     pub target: ComPtr,
@@ -670,6 +1141,7 @@ pub struct GpuSurface {
     pub source_w: i32,
     pub source_h: i32,
     content_tex: Option<(i32, i32, ComPtr, ComPtr)>,
+    bridge_field_tex: Option<(u32, u32, ComPtr, ComPtr)>,
 }
 
 fn bucket_dim(px: i32) -> i32 {
@@ -690,9 +1162,9 @@ impl GpuSurface {
             sample_count: 1,
             sample_quality: 0,
             buffer_usage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            buffer_count: 2,
+            buffer_count: 3,
             scaling: DXGI_SCALING_STRETCH,
-            swap_effect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            swap_effect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
             alpha_mode: DXGI_ALPHA_MODE_PREMULTIPLIED,
             flags: 0,
         };
@@ -763,6 +1235,7 @@ impl GpuSurface {
             source_w: w.max(1),
             source_h: h.max(1),
             content_tex: None,
+            bridge_field_tex: None,
         };
         s.resize(gpu, w, h);
         Some(s)
@@ -806,6 +1279,10 @@ impl GpuSurface {
                 }
             }
         }
+        // Keep full backbuffer source size; CreateSwapChainForComposition uses DXGI_SCALING_STRETCH
+        // so calling SetSourceSize(w, h) without an inverse visual scale zooms [0..w, 0..h]
+        // up to (alloc_w, alloc_h) and crops right/bottom widget edges. Rendering with a (w, h)
+        // viewport over a cleared backbuffer keeps exact 1:1 pixels with zero reallocation.
         self.source_w = w;
         self.source_h = h;
         reallocated
@@ -818,11 +1295,13 @@ impl GpuSurface {
         let need_new = self
             .content_tex
             .as_ref()
-            .is_none_or(|(cw, ch, _, _)| *cw != w || *ch != h);
+            .is_none_or(|(cw, ch, _, _)| w > *cw || h > *ch);
         if need_new {
+            let bw = bucket_dim(w);
+            let bh = bucket_dim(h);
             self.content_tex =
-                create_texture2d(&gpu.device, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, None, true)
-                    .map(|(t, s)| (w, h, t, s));
+                create_texture2d(&gpu.device, bw, bh, DXGI_FORMAT_B8G8R8A8_UNORM, None, true)
+                    .map(|(t, s)| (bw, bh, t, s));
         }
         if let Some((_, _, tex, _)) = &self.content_tex {
             let map: extern "system" fn(
@@ -861,8 +1340,97 @@ impl GpuSurface {
     }
 
     pub unsafe fn present(&self, gpu: &GpuDevice, constants: &GlassConstants) {
+        let mut cb = *constants;
+        cb.content_uv_scale = if let Some((cw, ch, _, _)) = &self.content_tex {
+            let w = self.source_w as f32;
+            let h = self.source_h as f32;
+            let cw = (*cw).max(1) as f32;
+            let ch = (*ch).max(1) as f32;
+            [
+                w / cw,
+                h / ch,
+                (w - 0.5).max(0.5) / cw,
+                (h - 0.5).max(0.5) / ch,
+            ]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
         let csrv = self.content_tex.as_ref().map(|(_, _, _, s)| s);
-        gpu.render_glass(&self.rtv, self.source_w, self.source_h, constants, csrv);
+        gpu.render_glass(&self.rtv, self.source_w, self.source_h, &cb, csrv);
+        let present: extern "system" fn(*mut c_void, u32, u32) -> HRESULT =
+            std::mem::transmute(*self.swapchain.vtable().add(8));
+        let _ = present(self.swapchain.as_ptr(), 0, 0);
+        let commit: extern "system" fn(*mut c_void) -> HRESULT =
+            std::mem::transmute(*gpu.dcomp.vtable().add(3));
+        let _ = commit(gpu.dcomp.as_ptr());
+    }
+
+    pub unsafe fn upload_bridge_field(
+        &mut self,
+        gpu: &GpuDevice,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) {
+        if width == 0 || height == 0 || rgba.len() < (width as usize).saturating_mul(height as usize).saturating_mul(4) {
+            return;
+        }
+        let need_new = self
+            .bridge_field_tex
+            .as_ref()
+            .is_none_or(|(fw, fh, _, _)| *fw != width || *fh != height);
+        if need_new {
+            self.bridge_field_tex = create_texture2d(
+                &gpu.device,
+                width as i32,
+                height as i32,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                None,
+                true,
+            )
+            .map(|(t, s)| (width, height, t, s));
+        }
+        if let Some((_, _, tex, _)) = &self.bridge_field_tex {
+            let map: extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                u32,
+                u32,
+                *mut D3D11MappedSubresource,
+            ) -> HRESULT = std::mem::transmute(*gpu.context.vtable().add(14));
+            let unmap: extern "system" fn(*mut c_void, *mut c_void, u32) =
+                std::mem::transmute(*gpu.context.vtable().add(15));
+            let mut mapped: D3D11MappedSubresource = zeroed();
+            if map(
+                gpu.context.as_ptr(),
+                tex.as_ptr(),
+                0,
+                D3D11_MAP_WRITE_DISCARD,
+                0,
+                &mut mapped,
+            ) >= 0
+                && !mapped.p_data.is_null()
+            {
+                let row_bytes = (width * 4) as usize;
+                let dst = mapped.p_data as *mut u8;
+                for y in 0..height as usize {
+                    std::ptr::copy_nonoverlapping(
+                        rgba.as_ptr().add(y * row_bytes),
+                        dst.add(y * mapped.row_pitch as usize),
+                        row_bytes,
+                    );
+                }
+                unmap(gpu.context.as_ptr(), tex.as_ptr(), 0);
+            }
+        }
+    }
+
+    pub unsafe fn present_fusion(&self, gpu: &GpuDevice, constants: &FusionBridgeConstants) {
+        let field_srv = (constants.field_uv[0] > 0.0)
+            .then(|| self.bridge_field_tex.as_ref().map(|(_, _, _, s)| s))
+            .flatten();
+        gpu.render_fusion_bridge(&self.rtv, self.source_w, self.source_h, constants, field_srv);
         let present: extern "system" fn(*mut c_void, u32, u32) -> HRESULT =
             std::mem::transmute(*self.swapchain.vtable().add(8));
         let _ = present(self.swapchain.as_ptr(), 0, 0);
@@ -875,6 +1443,7 @@ impl GpuSurface {
 struct GpuCompositor {
     device: Option<GpuDevice>,
     surfaces: std::collections::HashMap<isize, GpuSurface>,
+    wallpaper_key: Option<(u64, [i32; 4])>,
 }
 
 thread_local! {
@@ -886,10 +1455,15 @@ fn with_compositor<R>(f: impl FnOnce(&mut GpuCompositor) -> R) -> R {
     GPU_COMPOSITOR.with(|cell| {
         let mut slot = cell.borrow_mut();
         let comp = slot.get_or_insert_with(|| {
-            let force_cpu = std::env::var_os("LUMEN_FORCE_CPU").is_some();
+            // Widget backgrounds are still rasterized on the CPU. Enabling
+            // composition adds uploads/presents rather than replacing that
+            // work, so keep this path opt-in until it is measured end-to-end.
+            let force_cpu = std::env::var_os("LUMEN_FORCE_CPU").is_some()
+                || std::env::var("LUMEN_GPU_COMPOSITOR").as_deref() != Ok("1");
             GpuCompositor {
                 device: if force_cpu { None } else { GpuDevice::new() },
                 surfaces: std::collections::HashMap::new(),
+                wallpaper_key: None,
             }
         });
         f(comp)
@@ -946,12 +1520,107 @@ pub unsafe fn present_bgra(hwnd: HWND, w: i32, h: i32, bgra: &[u8]) -> bool {
             has_content: 1,
             fuse_line_count: 0,
             fuse_corner_count: 0,
+            content_uv_scale: [1.0, 1.0, 1.0, 1.0],
             nested: [NestedGlassRect::default(); 8],
             fuse_lines: [[0.0; 4]; 32],
             fuse_corner_c: [[0.0; 4]; 32],
             fuse_corner_uv: [[0.0; 4]; 32],
         };
         surface.present(gpu, &constants);
+        true
+    })
+}
+
+pub(crate) fn wallpaper_revision_synced(revision: u64, area: [i32; 4]) -> bool {
+    with_compositor(|comp| {
+        comp.wallpaper_key == Some((revision, area))
+            && comp
+                .device
+                .as_ref()
+                .is_some_and(|g| g.sharp_tex.is_some() && g.blurred_tex.is_some())
+    })
+}
+
+pub unsafe fn sync_wallpaper_pair(
+    revision: u64,
+    area: [i32; 4],
+    blurred: &[u8],
+    sharp: Option<&[u8]>,
+) -> bool {
+    with_compositor(|comp| {
+        if comp.wallpaper_key == Some((revision, area))
+            && comp
+                .device
+                .as_ref()
+                .is_some_and(|g| g.sharp_tex.is_some() && g.blurred_tex.is_some())
+        {
+            return true;
+        }
+        let Some(gpu) = comp.device.as_mut() else {
+            return false;
+        };
+        if gpu.set_wallpaper_pair_bgra(area[2], area[3], blurred, sharp) {
+            comp.wallpaper_key = Some((revision, area));
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[allow(dead_code)]
+pub unsafe fn sync_wallpaper_bgra(revision: u64, w: i32, h: i32, bgra: &[u8]) -> bool {
+    with_compositor(|comp| {
+        let area = [0, 0, w, h];
+        if comp.wallpaper_key == Some((revision, area))
+            && comp.device.as_ref().is_some_and(|g| g.sharp_tex.is_some())
+        {
+            return true;
+        }
+        let Some(gpu) = comp.device.as_mut() else {
+            return false;
+        };
+        if gpu.set_wallpaper_bgra(w, h, bgra) {
+            comp.wallpaper_key = Some((revision, area));
+            true
+        } else {
+            false
+        }
+    })
+}
+
+pub unsafe fn present_fusion_bridge(hwnd: HWND, constants: &FusionBridgeConstants) -> bool {
+    present_fusion_bridge_with_field(hwnd, constants, None)
+}
+
+pub unsafe fn present_fusion_bridge_with_field(
+    hwnd: HWND,
+    constants: &FusionBridgeConstants,
+    field: Option<(u32, u32, &[u8])>,
+) -> bool {
+    let w = constants.bridge_rect[2].round().max(1.0) as i32;
+    let h = constants.bridge_rect[3].round().max(1.0) as i32;
+    with_compositor(|comp| {
+        let Some(gpu) = comp.device.as_ref() else {
+            return false;
+        };
+        let key = hwnd as isize;
+        if !comp.surfaces.contains_key(&key) {
+            let Some(surface) = GpuSurface::new(gpu, hwnd, w, h) else {
+                return false;
+            };
+            comp.surfaces.insert(key, surface);
+        }
+        let Some(surface) = comp.surfaces.get_mut(&key) else {
+            return false;
+        };
+        if surface.source_w != w || surface.source_h != h {
+            surface.resize(gpu, w, h);
+        }
+        if let Some((fw, fh, rgba)) = field {
+            surface.upload_bridge_field(gpu, fw, fh, rgba);
+        }
+        surface.present_fusion(gpu, constants);
         true
     })
 }
@@ -974,24 +1643,67 @@ pub fn shutdown() {
     });
 }
 
+#[repr(C)]
+struct D3dShaderMacro {
+    name: *const u8,
+    definition: *const u8,
+}
+
 unsafe fn compile_shader(entry: &str, target: &str) -> Option<ComPtr> {
+    let fusion_macros = [
+        D3dShaderMacro {
+            name: b"FUSION_BRIDGE_PS\0".as_ptr(),
+            definition: b"1\0".as_ptr(),
+        },
+        D3dShaderMacro {
+            name: null(),
+            definition: null(),
+        },
+    ];
+    let p_defines = if entry == "fusion_bridge_ps\0" {
+        fusion_macros.as_ptr() as *const c_void
+    } else {
+        null()
+    };
     let mut blob = null_mut();
+    let mut errors = null_mut();
     let hr = D3DCompile(
         SHADER_SRC.as_ptr(),
         SHADER_SRC.len(),
         b"lumen_glass.hlsl\0".as_ptr(),
-        null(),
+        p_defines,
         null(),
         entry.as_ptr(),
         target.as_ptr(),
         1 << 15, // D3DCOMPILE_OPTIMIZATION_LEVEL3
         0,
         &mut blob,
-        null_mut(),
+        &mut errors,
     );
+    let errors = (!errors.is_null()).then(|| ComPtr(errors));
     if hr >= 0 && !blob.is_null() {
         Some(ComPtr(blob))
     } else {
+        let detail = errors
+            .as_ref()
+            .map(|errors| {
+                let (ptr, len) = blob_bytes(errors);
+                String::from_utf8_lossy(std::slice::from_raw_parts(ptr as *const u8, len))
+                    .trim_end_matches('\0')
+                    .to_owned()
+            })
+            .unwrap_or_default();
+        let message = format!(
+            "shader {} failed hr=0x{:08x}: {}",
+            entry.trim_end_matches('\0'),
+            hr as u32,
+            detail
+        );
+        crate::logger::error("gpu", &message);
+        eprintln!("{message}");
+        if !blob.is_null() {
+            drop(ComPtr(blob));
+        }
         None
     }
 }
@@ -1291,6 +2003,24 @@ mod tests {
         WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
+    #[test]
+    fn all_shader_entry_points_compile_without_a_gpu() {
+        // Do not put this behind GpuDevice::new(): a shader failure used to
+        // disable the compositor and silently skip the GPU integration tests.
+        for (entry, target) in [
+            ("fullscreen_vs\0", "vs_5_0\0"),
+            ("kawase_down_ps\0", "ps_5_0\0"),
+            ("kawase_up_ps\0", "ps_5_0\0"),
+            ("glass_composite_ps\0", "ps_5_0\0"),
+            ("fusion_bridge_ps\0", "ps_5_0\0"),
+        ] {
+            assert!(
+                unsafe { compile_shader(entry, target) }.is_some(),
+                "{entry:?}"
+            );
+        }
+    }
+
     unsafe fn read_rt_pixel(gpu: &GpuDevice, tex: &ComPtr, w: i32, h: i32, x: i32, y: i32) -> [u8; 4] {
         let desc = D3D11Texture2dDesc {
             width: w as u32,
@@ -1373,6 +2103,7 @@ mod tests {
                 has_content: 0,
                 fuse_line_count: 0,
                 fuse_corner_count: 0,
+                content_uv_scale: [1.0, 1.0, 1.0, 1.0],
                 nested: [NestedGlassRect::default(); 8],
                 fuse_lines: [[0.0; 4]; 32],
                 fuse_corner_c: [[0.0; 4]; 32],
@@ -1420,21 +2151,283 @@ mod tests {
             );
             assert!(!hwnd.is_null());
             if let Some(mut surface) = GpuSurface::new(&gpu, hwnd, 160, 120) {
+                let assert_source_size = |surface: &GpuSurface| {
+                    if let Some(sc2) = &surface.swapchain2 {
+                        let get_source_size: extern "system" fn(
+                            *mut c_void,
+                            *mut u32,
+                            *mut u32,
+                        ) -> HRESULT = std::mem::transmute(*sc2.vtable().add(30));
+                        let (mut sw, mut sh) = (0u32, 0u32);
+                        assert!(get_source_size(sc2.as_ptr(), &mut sw, &mut sh) >= 0);
+                        assert_eq!((sw as i32, sh as i32), (surface.alloc_w, surface.alloc_h));
+                    }
+                };
                 assert_eq!(surface.alloc_w, 256);
                 assert_eq!(surface.alloc_h, 128);
-                // Resizing within 256x128 bucket must NOT reallocate swapchain.
+                assert_source_size(&surface);
+
+                let content_160 = vec![0u8; 160 * 120 * 4];
+                surface.upload_content(&gpu, 160, 120, &content_160);
+                let (cw0, ch0, tex_ptr0) = surface
+                    .content_tex
+                    .as_ref()
+                    .map(|(cw, ch, tex, _)| (*cw, *ch, tex.as_ptr()))
+                    .expect("bucketed content_tex");
+                assert_eq!((cw0, ch0), (256, 128));
+
+                // Resizing within 256x128 bucket must NOT reallocate swapchain or content_tex.
                 assert!(!surface.resize(&gpu, 200, 125));
                 assert_eq!(surface.source_w, 200);
                 assert_eq!(surface.source_h, 125);
+                assert_source_size(&surface);
+
+                let mut content_200 = vec![0u8; 200 * 125 * 4];
+                let marker = ((124 * 200) + 199) * 4;
+                content_200[marker..marker + 4].copy_from_slice(&[10, 240, 250, 255]);
+                surface.upload_content(&gpu, 200, 125, &content_200);
+                let (cw1, ch1, tex_ptr1) = surface
+                    .content_tex
+                    .as_ref()
+                    .map(|(cw, ch, tex, _)| (*cw, *ch, tex.as_ptr()))
+                    .expect("reused content_tex");
+                assert_eq!((cw1, ch1, tex_ptr1), (cw0, ch0, tex_ptr0));
+
+                // Verify 1:1 bucketed pixel mapping without SetSourceSize zoom or right/bottom crop.
+                let (bucket_tex, _bucket_rt_srv, bucket_rtv) =
+                    create_rt_texture(&gpu.device, 256, 128).expect("bucket rt");
+                let (bucket_content, bucket_srv) = create_texture2d(
+                    &gpu.device,
+                    256,
+                    128,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    None,
+                    true,
+                )
+                .expect("bucket content");
+                let map: extern "system" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    u32,
+                    u32,
+                    u32,
+                    *mut D3D11MappedSubresource,
+                ) -> HRESULT = std::mem::transmute(*gpu.context.vtable().add(14));
+                let unmap: extern "system" fn(*mut c_void, *mut c_void, u32) =
+                    std::mem::transmute(*gpu.context.vtable().add(15));
+                let mut mapped: D3D11MappedSubresource = zeroed();
+                assert!(
+                    map(
+                        gpu.context.as_ptr(),
+                        bucket_content.as_ptr(),
+                        0,
+                        D3D11_MAP_WRITE_DISCARD,
+                        0,
+                        &mut mapped,
+                    ) >= 0
+                );
+                let row_bytes = 200 * 4;
+                let dst = mapped.p_data as *mut u8;
+                for y in 0..125usize {
+                    std::ptr::copy_nonoverlapping(
+                        content_200.as_ptr().add(y * row_bytes),
+                        dst.add(y * mapped.row_pitch as usize),
+                        row_bytes,
+                    );
+                }
+                unmap(gpu.context.as_ptr(), bucket_content.as_ptr(), 0);
+                let cb_200 = GlassConstants {
+                    win_rect: [0.0, 0.0, 200.0, 125.0],
+                    screen_size: [200.0, 125.0],
+                    radius: 0.0,
+                    dpi: 1.0,
+                    tint_color: [0.0; 4],
+                    flags: [0.0; 4],
+                    nested_count: 0,
+                    has_content: 1,
+                    fuse_line_count: 0,
+                    fuse_corner_count: 0,
+                    content_uv_scale: [200.0 / 256.0, 125.0 / 128.0, 199.5 / 256.0, 124.5 / 128.0],
+                    nested: [NestedGlassRect::default(); 8],
+                    fuse_lines: [[0.0; 4]; 32],
+                    fuse_corner_c: [[0.0; 4]; 32],
+                    fuse_corner_uv: [[0.0; 4]; 32],
+                };
+                gpu.render_glass(&bucket_rtv, 200, 125, &cb_200, Some(&bucket_srv));
+                let br_px = read_rt_pixel(&gpu, &bucket_tex, 256, 128, 199, 124);
+                assert!(
+                    br_px[2] >= 240 && br_px[1] >= 230 && br_px[0] <= 20 && br_px[3] == 255,
+                    "bottom-right pixel (199,124) must map 1:1 without crop/stretch: {br_px:?}"
+                );
+                let outside_px = read_rt_pixel(&gpu, &bucket_tex, 256, 128, 205, 124);
+                assert_eq!(outside_px[3], 0, "pixel outside 200x125 viewport must stay transparent");
+
                 // Exceeding 128px height bucket reallocates to 256.
                 assert!(surface.resize(&gpu, 200, 140));
                 assert_eq!(surface.alloc_h, 256);
+                assert_source_size(&surface);
 
                 let content = vec![0u8; 200 * 140 * 4];
                 surface.upload_content(&gpu, 200, 140, &content);
+                assert_eq!(
+                    surface.content_tex.as_ref().map(|(cw, ch, _, _)| (*cw, *ch)),
+                    Some((256, 256))
+                );
                 surface.present(&gpu, &constants);
             }
             DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn gpu_fusion_bridge_sdf_and_shadow() {
+        assert_eq!(size_of::<FusionBridgeConstants>() % 16, 0);
+        let _ui = crate::native_ui_test_lock();
+        let Some(mut gpu) = GpuDevice::new() else {
+            return;
+        };
+
+        unsafe {
+            let mut wall = vec![0u8; 256 * 256 * 4];
+            for y in 0..256 {
+                for x in 0..256 {
+                    let i = (y * 256 + x) * 4;
+                    wall[i] = 40;
+                    wall[i + 1] = 120;
+                    wall[i + 2] = 200;
+                    wall[i + 3] = 255;
+                }
+            }
+            assert!(gpu.set_wallpaper_bgra(256, 256, &wall));
+
+            // L-junction cluster: top-left pane [40..140, 40..120] and wider bottom pane [40..200, 120..200].
+            // Concave corner forms at (140, 120), leaving a bridge fillet outside member_windows.
+            let panes = [
+                crate::fusion::geometry::Pane {
+                    id: 1,
+                    rect: [40.0, 40.0, 140.0, 120.0],
+                    radius: 20.0,
+                    dpi: 1.0,
+                    topmost: false,
+                },
+                crate::fusion::geometry::Pane {
+                    id: 2,
+                    rect: [40.0, 120.0, 200.0, 200.0],
+                    radius: 20.0,
+                    dpi: 1.0,
+                    topmost: false,
+                },
+            ];
+            let (w, h) = (256, 256);
+            let (rt_tex, _rt_srv, rt_rtv) =
+                create_rt_texture(&gpu.device, w, h).expect("rt texture");
+
+            let packed = crate::fusion::geometry::with_outline(&panes, |outline| {
+                outline.pack_gpu_segments([0.0, 0.0])
+            })
+            .expect("pack_gpu_segments fits");
+            let (fuse_lines, fuse_line_count, fuse_corner_c, fuse_corner_uv, fuse_corner_count) =
+                packed;
+
+            let mut constants = FusionBridgeConstants {
+                bridge_rect: [0.0, 0.0, w as f32, h as f32],
+                desktop_rect: [0.0, 0.0, 256.0, 256.0],
+                params: [1.0, 48.0, 1.0, 0.0],
+                accent_flags: [0.2, 0.4, 0.8, 1.0],
+                counts: [2, 2, fuse_line_count, fuse_corner_count],
+                fuse_lines,
+                fuse_corner_c,
+                fuse_corner_uv,
+                ..Default::default()
+            };
+            constants.pane_rects[0] = panes[0].rect;
+            constants.pane_rects[1] = panes[1].rect;
+            constants.pane_meta[0] = [20.0, 1.0, 1.0, 0.0];
+            constants.pane_meta[1] = [20.0, 1.0, 1.0, 0.0];
+            constants.member_windows[0] = [36.0, 36.0, 144.0, 124.0];
+            constants.member_windows[1] = [36.0, 116.0, 204.0, 204.0];
+
+            // 1. Exact contour SDF mode (morph_k == 0.0)
+            gpu.render_fusion_bridge(&rt_rtv, w, h, &constants, None);
+
+            // Far outside pad_f=48 must be transparent.
+            let far = read_rt_pixel(&gpu, &rt_tex, w, h, 0, 0);
+            assert_eq!(far[3], 0);
+
+            // Member window interior must be cut out cleanly.
+            let inside_win = read_rt_pixel(&gpu, &rt_tex, w, h, 90, 80);
+            assert_eq!(inside_win[3], 0);
+
+            // Inner 3dp underlap band along member window concave/join seam (d < -1.0) stays opaque.
+            let underlap = read_rt_pixel(&gpu, &rt_tex, w, h, 142, 118);
+            assert!(
+                underlap[3] >= 240,
+                "expected 3dp inner underlap at join seam, got {underlap:?}"
+            );
+
+            // Concave fillet region just outside member_windows[0] right edge (x=145, y=115) must be opaque glass.
+            let fillet = read_rt_pixel(&gpu, &rt_tex, w, h, 145, 115);
+            assert!(fillet[3] >= 240, "expected opaque fillet, got {fillet:?}");
+
+            // Shadow below bottom edge (x=120, y=210) must be semi-transparent black.
+            let shadow = read_rt_pixel(&gpu, &rt_tex, w, h, 120, 210);
+            assert!(
+                shadow[3] > 5 && shadow[3] < 120,
+                "expected soft shadow alpha, got {shadow:?}"
+            );
+            assert_eq!(&shadow[..3], &[0, 0, 0]);
+
+            // 2. Smooth liquid morph smin mode (morph_k > 0.0)
+            constants.params[3] = 32.0;
+            gpu.render_fusion_bridge(&rt_rtv, w, h, &constants, None);
+
+            let inside_win_smin = read_rt_pixel(&gpu, &rt_tex, w, h, 90, 80);
+            assert_eq!(inside_win_smin[3], 0);
+            let fillet_smin = read_rt_pixel(&gpu, &rt_tex, w, h, 145, 115);
+            assert!(
+                fillet_smin[3] >= 240,
+                "expected opaque smin fillet, got {fillet_smin:?}"
+            );
+            let shadow_smin = read_rt_pixel(&gpu, &rt_tex, w, h, 120, 210);
+            assert!(
+                shadow_smin[3] > 5 && shadow_smin[3] < 120,
+                "expected soft smin shadow, got {shadow_smin:?}"
+            );
+
+            // 3. Per-pane delta shifts bridge color cleanly over shared wallpaper.
+            constants.pane_delta[0] = [-0.25, 0.25, 0.25, 1.0];
+            constants.pane_delta[1] = [-0.25, 0.25, 0.25, 1.0];
+            gpu.render_fusion_bridge(&rt_rtv, w, h, &constants, None);
+            let shifted = read_rt_pixel(&gpu, &rt_tex, w, h, 145, 115);
+            assert_eq!(shifted[3], fillet_smin[3]);
+            assert!(
+                shifted[2] + 20 < fillet_smin[2]
+                    && shifted[1] > fillet_smin[1] + 20
+                    && shifted[0] > fillet_smin[0] + 20,
+                "expected pane_delta to shift bridge BGR from {fillet_smin:?} to {shifted:?}"
+            );
+
+            // 4. Affine material field texture (half gain + warm bias) overrides pane_delta.
+            let field_rgba = [
+                192u8, 128, 64, 128, 192, 128, 64, 128, 192, 128, 64, 128, 192, 128, 64, 128,
+            ];
+            let (_field_tex, field_srv) = create_texture2d(
+                &gpu.device,
+                2,
+                2,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                Some(&field_rgba),
+                false,
+            )
+            .expect("field texture");
+            constants.field_uv = [2.0, 2.0, 256.0, 1.0];
+            gpu.render_fusion_bridge(&rt_rtv, w, h, &constants, Some(&field_srv));
+            let affine_px = read_rt_pixel(&gpu, &rt_tex, w, h, 145, 115);
+            assert_eq!(affine_px[3], fillet_smin[3]);
+            assert!(
+                affine_px[2] > shifted[2] + 40 && affine_px[0] + 40 < shifted[0],
+                "expected affine bridge_field_tex warm shift from {shifted:?} to {affine_px:?}"
+            );
         }
     }
 }

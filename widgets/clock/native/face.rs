@@ -731,7 +731,3 @@ pub(super) fn draw_afterglow_motion(
 ) {
     super::afterglow::draw(c, responsive::afterglow_emblem_rect(w, h), cfg, t, ink, ink);
 }
-
-pub(super) fn draw_location(c: &Canvas, w: f32, h: f32, label: &str, ink: u32) {
-    responsive::draw_location(c, w, h, label, ink);
-}

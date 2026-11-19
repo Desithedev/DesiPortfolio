@@ -452,8 +452,15 @@ fn selected_surface_rebuilds_cached_backdrop_and_reuses_it_between_ticks() {
     }
 }
 
+fn changed_rgb(p: &[u8], bg: &[u8], stride_w: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> usize {
+    (y0..y1)
+        .flat_map(|y| (x0..x1).map(move |x| (y * stride_w + x) * 4))
+        .filter(|&i| p[i..i + 3] != bg[i..i + 3])
+        .count()
+}
+
 #[test]
-fn afterglow_reference_layout_keeps_location_time_period_date_and_footer_grouped() {
+fn afterglow_reference_layout_keeps_time_period_date_and_footer_grouped() {
     let _ui = crate::native_ui_test_lock();
     unsafe {
         let _graphics = render::Runtime::start().unwrap();
@@ -464,7 +471,6 @@ fn afterglow_reference_layout_keeps_location_time_period_date_and_footer_grouped
             s.config.hour12 = true;
             s.config.show_seconds = false;
             s.config.time_zone = "Asia/Ho_Chi_Minh".into();
-            s.location_label = model::location_label(&s.config.time_zone);
         }
         host.show();
         let time = SYSTEMTIME {
@@ -490,23 +496,66 @@ fn afterglow_reference_layout_keeps_location_time_period_date_and_footer_grouped
             s.dpi = 1.;
             s.key.clear();
             s.paint();
+            let bg = s.background.as_ref().unwrap().snapshot();
+            let live = s.frame.as_ref().unwrap().snapshot();
             let mut frame = Buffer::new(w, h, 1., 34.).unwrap();
             frame.copy_from(s.background.as_ref().unwrap().dc);
             let batch = render::AlphaBatch::new(frame.dc, 1.);
             frame.background_alpha(255);
             s.afterglow_content = None;
             s.paint_content_at(frame.dc, w as f32, h as f32, &time);
-            face::draw_location(
-                &Canvas::new(frame.dc, 1.),
-                w as f32,
-                h as f32,
-                &s.location_label,
-                s.ink,
-            );
             drop(batch);
             frame.present_with_alpha(s.hwnd, true);
             let p = frame.snapshot();
             assert!(p.chunks_exact(4).all(|p| p[..3].iter().all(|v| *v <= p[3])));
+            let uw = w as usize;
+            match (w, h) {
+                (420, 420) | (380, 380) => {
+                    assert_eq!(changed_rgb(&live, &bg, uw, 20, 18, 246, 48), 0);
+                    assert_eq!(changed_rgb(&p, &bg, uw, 20, 18, 246, 48), 0);
+                    let scale = ((w as f32 - 16.) / 340.)
+                        .min((h as f32 - 16.) / 340.)
+                        .min((h as f32 - 52.) / 278.);
+                    let ox = (w as f32 - 340. * scale) / 2.;
+                    let oy = ((h as f32 - 340. * scale) / 2.).max(44. - 62. * scale);
+                    let r = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                        (
+                            (ox + x0 * scale).floor() as usize,
+                            (oy + y0 * scale).floor() as usize,
+                            (ox + x1 * scale).ceil() as usize,
+                            (oy + y1 * scale).ceil() as usize,
+                        )
+                    };
+                    let (tx0, ty0, tx1, ty1) = r(12., 86., 314., 187.);
+                    let (dx0, dy0, dx1, dy1) = r(26., 226., 226., 269.);
+                    let (ex0, ey0, ex1, ey1) = r(218., 194., 314., 263.);
+                    let (fx0, fy0, fx1, fy1) = r(26., 282., 314., 309.);
+                    assert!(ty1 < dy0 && dy1 < fy0 && ey1 < fy0);
+                    assert!(changed_rgb(&p, &bg, uw, tx0, ty0, tx1, ty1) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, dx0, dy0, dx1, dy1) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, ex0, ey0, ex1, ey1) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, fx0, fy0, fx1, fy1) > 0);
+                }
+                (480, 300) => {
+                    assert!(changed_rgb(&p, &bg, uw, 20, 18, 276, 240) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 240, 276, 263) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 287, 87, 460, 213) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 263, 460, 282) > 0);
+                }
+                (160, 320) => {
+                    assert!(changed_rgb(&p, &bg, uw, 20, 18, 140, 102) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 108, 140, 234) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 240, 140, 280) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 281, 140, 302) > 0);
+                }
+                (160, 160) => {
+                    assert!(changed_rgb(&p, &bg, uw, 20, 18, 140, 86) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 88, 82, 128) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 87, 89, 140, 129) > 0);
+                    assert!(changed_rgb(&p, &bg, uw, 20, 129, 140, 142) > 0);
+                }
+                _ => unreachable!(),
+            }
             save_pixels(
                 w as u32,
                 h as u32,

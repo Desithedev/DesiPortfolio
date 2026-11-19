@@ -36,6 +36,8 @@ use windows_sys::Win32::{
     UI::{Controls::WM_MOUSELEAVE, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
+const MUSIC_EVENT: u32 = WM_APP + 84;
+
 struct State {
     hwnd: HWND,
     root: PathBuf,
@@ -138,7 +140,7 @@ impl State {
     fn accept_smtc(&mut self, smtc: &smtc::SmtcState) {
         if let (Some(url), Some(file)) = (&smtc.art_url, &smtc.art_file) {
             if session::valid_file(file) {
-                if self.art_files.len() > 32 {
+                if self.art_files.len() > 64 {
                     self.art_files.retain(|u, _| {
                         self.last_cover.as_ref() == Some(u)
                             || self.playback.art.as_ref() == Some(u)
@@ -153,11 +155,53 @@ impl State {
         } else {
             String::new()
         };
+        let norm_smtc_title = normalize_track_text(&smtc.title);
+        let norm_smtc_artist = normalize_track_text(&smtc.artist);
+        let norm_cur_title = normalize_track_text(&self.playback.title);
+        let norm_cur_artist = normalize_track_text(&self.playback.artist);
+        let matches_active = !self.playback.queue.is_empty()
+            && !norm_smtc_title.is_empty()
+            && (norm_smtc_title == norm_cur_title
+                || (!norm_smtc_artist.is_empty()
+                    && ((norm_smtc_title == norm_cur_title && norm_smtc_artist == norm_cur_artist)
+                        || self.playback.queue.iter().any(|t| {
+                            normalize_track_text(&t.title) == norm_smtc_title
+                                && normalize_track_text(&t.artist) == norm_smtc_artist
+                        }))));
+        let (video_id, queue) = if matches_active {
+            let mut q = self.playback.queue.clone();
+            let matched_id = q
+                .iter()
+                .position(|t| {
+                    normalize_track_text(&t.title) == norm_smtc_title
+                        && (norm_smtc_artist.is_empty()
+                            || normalize_track_text(&t.artist) == norm_smtc_artist)
+                })
+                .map(|idx| {
+                    for (i, item) in q.iter_mut().enumerate() {
+                        item.selected = i == idx;
+                    }
+                    q[idx].video_id.clone()
+                })
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| {
+                    if !self.playback.video_id.is_empty()
+                        && !self.playback.video_id.starts_with("smtc:")
+                    {
+                        self.playback.video_id.clone()
+                    } else {
+                        synthetic_id.clone()
+                    }
+                });
+            (matched_id, q)
+        } else {
+            (synthetic_id, Vec::new())
+        };
         let next = Playback {
             signed_in: self.playback.signed_in,
             auth_known: false,
             album: smtc.album.clone(),
-            video_id: synthetic_id,
+            video_id,
             available: smtc.available,
             playing: smtc.playing,
             title: smtc.title.clone(),
@@ -168,7 +212,7 @@ impl State {
             can_next: smtc.can_next,
             can_previous: smtc.can_previous,
             can_seek: smtc.can_seek,
-            queue: Vec::new(),
+            queue,
             error: None,
         };
         self.error.clear();
@@ -190,7 +234,7 @@ impl State {
             self.backend.take();
         }
         if self.backend.is_none() {
-            match backend::Backend::start(&self.root) {
+            match backend::Backend::start_with_notify(&self.root, self.hwnd, MUSIC_EVENT) {
                 Ok(b) => {
                     self.backend = Some(b);
                     self.error.clear();
@@ -306,13 +350,20 @@ impl State {
     }
     unsafe fn poll(&mut self) {
         self.last_poll = Instant::now();
+        if let Some(b) = &self.backend {
+            b.clear_notify_pending();
+        }
+        if let Some(s) = &self.smtc {
+            s.clear_notify_pending();
+        }
         let mut dirty = false;
         // Drain outside the receiver borrow, then create images on the UI thread.
         let events: Vec<_> = self
             .backend
             .as_ref()
-            .map(|b| b.events.try_iter().take(64).collect())
+            .map(|b| b.events.try_iter().take(256).collect())
             .unwrap_or_default();
+        let more_backend = events.len() == 256;
         for event in events {
             match event["type"].as_str().unwrap_or("") {
                 "state" => {
@@ -344,19 +395,23 @@ impl State {
                     }
                     if let Some(error) = event["error"].as_str() {
                         crate::logger::warn("music", format!("backend state error: {error}"));
-                        self.backend_live = false;
+                        if is_backend_disconnect_error(error) {
+                            self.backend_live = false;
+                            self.playback.available = false;
+                            self.playback.playing = false;
+                        }
                         self.error = error.into();
-                        self.playback.available = false;
-                        self.playback.playing = false;
                     }
                     dirty = true;
                 }
                 "error" => {
-                    self.backend_live = false;
                     let err = event["error"].as_str().unwrap_or("Playback error");
                     crate::logger::error("music", format!("backend error: {err}"));
+                    if is_backend_disconnect_error(err) {
+                        self.backend_live = false;
+                        self.playback.playing = false;
+                    }
                     self.error = err.into();
-                    self.playback.playing = false;
                     dirty = true;
                 }
                 "art" => {
@@ -366,7 +421,7 @@ impl State {
                             && file.ends_with(".img")
                             && file.as_bytes()[..64].iter().all(|c| c.is_ascii_hexdigit())
                         {
-                            if self.art_files.len() > 32 {
+                            if self.art_files.len() > 64 {
                                 self.art_files.retain(|url, _| {
                                     self.last_cover.as_ref() == Some(url)
                                         || self.playback.art.as_ref() == Some(url)
@@ -387,8 +442,12 @@ impl State {
         let smtc_updates: Vec<_> = self
             .smtc
             .as_ref()
-            .map(|s| s.updates.try_iter().take(16).collect())
+            .map(|s| s.updates.try_iter().take(64).collect())
             .unwrap_or_default();
+        let more_smtc = smtc_updates.len() == 64;
+        if (more_backend || more_smtc) && !self.hwnd.is_null() {
+            PostMessageW(self.hwnd, MUSIC_EVENT, 0, 0);
+        }
         let smtc_changed = !smtc_updates.is_empty();
         if let Some(latest) = smtc_updates.into_iter().last() {
             self.latest_smtc = Some(latest);
@@ -449,19 +508,31 @@ impl State {
                 .take(20)
                 .map(|t| t.thumb.clone()),
         );
+        let mut seen = std::collections::HashSet::new();
+        urls.retain(|u| !u.is_empty() && seen.insert(u.clone()));
         self.images.retain(|url, _| urls.contains(url));
+        let mut stale_urls = Vec::new();
         for url in urls {
             if self.images.contains_key(&url) {
                 continue;
             }
             if let Some(file) = self.art_files.get(&url) {
-                if let Some(image) =
-                    load_art(&self.root.join("config/native-music-player/art").join(file))
-                {
+                let path = self
+                    .root
+                    .join("config")
+                    .join("native-music-player")
+                    .join("art")
+                    .join(file);
+                if let Some(image) = load_art(&path) {
                     self.images.insert(url, image);
                     self.card_cache.clear();
+                } else {
+                    stale_urls.push(url);
                 }
             }
+        }
+        for url in stale_urls {
+            self.art_files.remove(&url);
         }
         if let Some(url) = self
             .playback
@@ -523,7 +594,12 @@ impl State {
                 && !move_backdrop_dirty
                 && !crate::glass::liquid_glass()
                 && self.background.is_some()
-                && self.frost.is_some();
+                && self.frost.is_some()
+                && crate::fusion::group_frosts(
+                    self.hwnd,
+                    (self.config.frost_strength * 2.55).round() as u8,
+                )
+                .is_none();
             if !self.moving && !reuse_frost {
                 self.card_cache.clear();
             }
@@ -561,7 +637,12 @@ impl State {
                 } else if let Some(frost) = &self.frost {
                     Canvas::new(bg.dc, self.dpi).image(frost, [0., 0., width, height]);
                 }
-                self.chrome(&mut bg, [width, height]);
+                let hwnd = self.hwnd;
+                let dpi_w = w as u32;
+                let dpi_h = h as u32;
+                bg.paint_frosted_chrome_for(hwnd, crate::glass::frosted_glass(), |chrome_dc| {
+                    self.chrome_into(chrome_dc, [dpi_w, dpi_h], [width, height]);
+                });
                 render::flush(bg.dc);
                 if !self.moving {
                     let bg_lum = crate::contrast::sample(
@@ -580,7 +661,6 @@ impl State {
                     );
                     self.light = crate::contrast::luminance(self.ink) < 0.5;
                 }
-                bg.bevel_for(self.hwnd);
                 bg.background_alpha(255);
                 self.background = Some(bg);
             }
@@ -761,6 +841,12 @@ impl Host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         state.borrow_mut().hwnd = hwnd;
+        if let Some(smtc) = &state.borrow().smtc {
+            smtc.set_notify(hwnd, MUSIC_EVENT);
+        }
+        if !smoke {
+            PostMessageW(hwnd, MUSIC_EVENT, 0, 0);
+        }
         state.borrow_mut().restore_art();
         eprintln!(
             "native-music-ready pid={} design={}",
@@ -842,6 +928,12 @@ impl Drop for Host {
             s.flush_settings();
             s.remember_view();
             s.settings.take();
+            if let Some(backend) = &s.backend {
+                backend.set_notify(null_mut(), 0);
+            }
+            if let Some(smtc) = &s.smtc {
+                smtc.set_notify(null_mut(), 0);
+            }
             s.backend.take();
             s.shadow.take();
             let hwnd = s.hwnd;
@@ -856,15 +948,58 @@ pub fn should_open(root: &Path) -> bool {
     Config::load(root).map(|c| c.open).unwrap_or(false)
 }
 
+fn normalize_track_text(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_backend_disconnect_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("disconnected")
+        || lower.contains("background player closed")
+        || lower.contains("sign-in browser closed")
+        || lower.contains("music widget closed")
+        || lower.contains("music adapter is closed")
+        || lower.contains("browser exited")
+}
+
 fn load_art(path: &Path) -> Option<Image> {
-    let mut reader = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?;
+    let reader = match image::ImageReader::open(path) {
+        Ok(r) => r,
+        Err(err) => {
+            crate::logger::warn(
+                "music",
+                format!("artwork file unavailable ({}): {err}", path.display()),
+            );
+            return None;
+        }
+    };
+    let mut reader = match reader.with_guessed_format() {
+        Ok(r) => r,
+        Err(err) => {
+            crate::logger::warn(
+                "music",
+                format!("artwork format probe failed ({}): {err}", path.display()),
+            );
+            return None;
+        }
+    };
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(32 * 1024 * 1024);
     reader.limits(limits);
-    let rgba = reader.decode().ok()?.thumbnail(400, 400).into_rgba8();
+    let decoded = match reader.decode() {
+        Ok(img) => img,
+        Err(err) => {
+            crate::logger::warn(
+                "music",
+                format!("artwork decode failed ({}): {err}", path.display()),
+            );
+            return None;
+        }
+    };
+    let rgba = decoded.thumbnail(400, 400).into_rgba8();
     let (w, h) = rgba.dimensions();
     let mut pixels = rgba.into_raw();
     for p in pixels.chunks_exact_mut(4) {
@@ -993,6 +1128,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         m if m == settings::NOTIFY => {
             s.settings_changed();
+            0
+        }
+        m if m == MUSIC_EVENT => {
+            s.poll();
+            s.sync_spin_timer();
             0
         }
         WM_TIMER => {
@@ -1129,9 +1269,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             s.pressed = None;
+            if s.moving || s.resizing {
+                let st = &mut *s;
+                crate::widget_interaction::exit_size_move(hwnd, &mut st.moving, &mut st.resizing);
+            }
             if msg == WM_CANCELMODE {
-                s.moving = false;
-                s.resizing = false;
+                ReleaseCapture();
             }
             InvalidateRect(hwnd, null(), 0);
             // DefWindowProc must see cancellation of its native move/size loop.
@@ -1274,6 +1417,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_NCDESTROY => {
+            if let Some(backend) = &s.backend {
+                backend.set_notify(null_mut(), 0);
+            }
+            if let Some(smtc) = &s.smtc {
+                smtc.set_notify(null_mut(), 0);
+            }
             crate::gpu::remove_surface(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             drop(s);
@@ -1554,7 +1703,7 @@ mod tests {
                     s.config.palette = palette.into();
                     s.config.tint = tint;
                     s.overlay = None;
-                    let mut actual = Buffer::plain(320, 240, 1.).unwrap();
+                    let actual = Buffer::plain(320, 240, 1.).unwrap();
                     let expected = Buffer::plain(320, 240, 1.).unwrap();
                     let rect = RECT {
                         left: 0,
@@ -1566,7 +1715,7 @@ mod tests {
                     FillRect(actual.dc, &rect, brush);
                     FillRect(expected.dc, &rect, brush);
                     DeleteObject(brush);
-                    s.chrome(&mut actual, [320., 240.]);
+                    s.chrome_into(actual.dc, [320, 240], [320., 240.]);
                     // Reference the Dock's coating sequence over identical backing.
                     // This guards the former duplicate reflection / 24-vs-.24 bug.
                     let color = s.surface_color();
@@ -2303,6 +2452,69 @@ mod tests {
             drop(host);
             crate::fusion::shutdown();
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn accept_smtc_preserves_queue_when_matching_active_track() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let root = test_root("smtc-preserve-queue");
+            let host = Host::create(
+                &root,
+                Rc::new(RefCell::new(Glass::new(13., 1.))),
+                true,
+                true,
+            )
+            .unwrap();
+            {
+                let mut s = host.state.borrow_mut();
+                let queue: Vec<model::Track> = (0..5)
+                    .map(|i| model::Track {
+                        video_id: format!("vid0000000{i}"),
+                        title: format!("Track {i}"),
+                        artist: "Artist".into(),
+                        thumb: format!("https://i.ytimg.com/vi/vid0000000{i}/0.jpg"),
+                        selected: i == 2,
+                    })
+                    .collect();
+                s.playback = Playback {
+                    video_id: "vid00000002".into(),
+                    title: "Track 2".into(),
+                    artist: "Artist".into(),
+                    available: true,
+                    playing: true,
+                    queue,
+                    ..Playback::default()
+                };
+
+                // Matching SMTC update (with whitespace/case variance) preserves the 5-card queue.
+                let matching_smtc = smtc::SmtcState {
+                    has_session: true,
+                    available: true,
+                    playing: true,
+                    title: "  track   2 ".into(),
+                    artist: "Artist".into(),
+                    ..smtc::SmtcState::default()
+                };
+                s.accept_smtc(&matching_smtc);
+                assert_eq!(s.playback.queue.len(), 5);
+                assert_eq!(s.playback.video_id, "vid00000002");
+
+                // Unrelated external track clears the YouTube Music queue.
+                let unrelated_smtc = smtc::SmtcState {
+                    has_session: true,
+                    available: true,
+                    playing: true,
+                    title: "Completely Different Song".into(),
+                    artist: "Other Artist".into(),
+                    ..smtc::SmtcState::default()
+                };
+                s.accept_smtc(&unrelated_smtc);
+                assert!(s.playback.queue.is_empty());
+            }
+            drop(host);
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 }

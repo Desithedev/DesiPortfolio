@@ -300,7 +300,8 @@ impl State {
     unsafe fn draw_header(&mut self, dc: HDC, w: f32) {
         use crate::settings_ui::{widget_header_hits, HeaderAction};
         if !self.playback.signed_in {
-            let r = [18., 14., 80., 40.];
+            let right = if w < 220. { 76. } else { 80. };
+            let r = [18., 14., right, 40.];
             let c = Canvas::new(dc, self.dpi);
             let color = if self.pressed == Some(Action::SignIn) {
                 0x0000cc

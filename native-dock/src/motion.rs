@@ -36,9 +36,79 @@ impl Drop for FrameClock {
     }
 }
 pub const VSYNC_FRAME: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 19;
+struct FramePacing {
+    period: std::time::Duration,
+    checked: Option<std::time::Instant>,
+    avoid_flush_until: Option<std::time::Instant>,
+    timer: windows_sys::Win32::Foundation::HANDLE,
+}
+impl FramePacing {
+    fn new() -> Self {
+        Self {
+            period: std::time::Duration::from_nanos(8_333_333),
+            checked: None,
+            avoid_flush_until: None,
+            timer: std::ptr::null_mut(),
+        }
+    }
+    fn budget(&self, low: bool) -> std::time::Duration {
+        if low { self.period.max(std::time::Duration::from_nanos(16_666_667)) } else { self.period }
+    }
+    fn can_flush(&self, cost_ms: f64, now: std::time::Instant, low: bool) -> bool {
+        cost_ms < (if low { 4.0 } else { 5.5 })
+            && self.avoid_flush_until.is_none_or(|until| now >= until)
+    }
+    fn record_flush(&mut self, elapsed: std::time::Duration, now: std::time::Instant, low: bool) -> bool {
+        if elapsed > self.budget(low).mul_f64(1.35) {
+            self.avoid_flush_until = Some(now + std::time::Duration::from_secs(1));
+            true
+        } else {
+            false
+        }
+    }
+    unsafe fn refresh(&mut self, now: std::time::Instant) {
+        if self.checked.is_some_and(|last| now.duration_since(last).as_secs_f32() < 2.) { return; }
+        self.checked = Some(now);
+        use windows_sys::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
+        let mut info: DWM_TIMING_INFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<DWM_TIMING_INFO>() as u32;
+        if DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut info) >= 0 {
+            let ratio = info.rateRefresh;
+            let hz = ratio.uiNumerator as f64 / (ratio.uiDenominator as f64).max(1.);
+            if (30.0..=500.0).contains(&hz) {
+                self.period = std::time::Duration::from_secs_f64(1. / hz);
+            }
+        }
+    }
+    unsafe fn wait_until(&mut self, started: std::time::Instant, low: bool) {
+        use windows_sys::Win32::System::Threading::*;
+        let remaining = self.budget(low).saturating_sub(started.elapsed());
+        if remaining < std::time::Duration::from_micros(100) { return; }
+        if self.timer.is_null() {
+            self.timer = CreateWaitableTimerExW(
+                std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
+            );
+        }
+        if !self.timer.is_null() {
+            let due = -((remaining.as_nanos() / 100).max(1).min(i64::MAX as u128) as i64);
+            if SetWaitableTimer(self.timer, &due, 0, None, std::ptr::null(), 0) != 0 {
+                WaitForSingleObject(self.timer, INFINITE);
+                return;
+            }
+        }
+        std::thread::sleep(remaining);
+    }
+}
+impl Drop for FramePacing {
+    fn drop(&mut self) {
+        if !self.timer.is_null() { unsafe { windows_sys::Win32::Foundation::CloseHandle(self.timer); } }
+    }
+}
 thread_local! {
     static PENDING_VSYNC: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
-    static LAST_DWM_FLUSH: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static PENDING_VSYNC_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static FRAME_PACING: std::cell::RefCell<FramePacing> = std::cell::RefCell::new(FramePacing::new());
 }
 pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
     let queued = PENDING_VSYNC.with(|q| {
@@ -52,17 +122,28 @@ pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
     if queued.is_empty() {
         return;
     }
-    let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-    let flush_limit = if low_power() { 4.0 } else { 6.8 };
-    if present_ms < flush_limit {
-        let recently_flushed = LAST_DWM_FLUSH.with(|cell| {
-            cell.get()
-                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(4))
+    let started = PENDING_VSYNC_START
+        .with(|c| c.take())
+        .unwrap_or(frame_started);
+    let present_ms = started.elapsed().as_secs_f64() * 1000.;
+    let low = low_power();
+    let can_flush = FRAME_PACING.with(|p| {
+        let mut p = p.borrow_mut();
+        p.refresh(std::time::Instant::now());
+        p.can_flush(present_ms, std::time::Instant::now(), low)
+    });
+    if can_flush {
+        let hr = windows_sys::Win32::Graphics::Dwm::DwmFlush();
+        FRAME_PACING.with(|p| {
+            let mut p = p.borrow_mut();
+            // A successful DwmFlush can still wait TWO refreshes for a layered
+            // window. Detect that measured miss instead of halving 120Hz scroll.
+            if hr < 0 || p.record_flush(started.elapsed(), std::time::Instant::now(), low) {
+                p.avoid_flush_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+            }
         });
-        if !recently_flushed {
-            let _ = windows_sys::Win32::Graphics::Dwm::DwmFlush();
-            LAST_DWM_FLUSH.with(|cell| cell.set(Some(std::time::Instant::now())));
-        }
+    } else {
+        FRAME_PACING.with(|p| p.borrow_mut().wait_until(started, low));
     }
     for (hwnd, message) in queued {
         windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -82,12 +163,10 @@ pub unsafe fn pace_vsync(
     if *frame_queued {
         return;
     }
-    let present_ms = frame_started.elapsed().as_secs_f64() * 1000.;
-    let budget_ms = if low_power() { 4.5 } else { 12. };
-    if present_ms >= budget_ms {
-        return;
-    }
     *frame_queued = true;
+    if PENDING_VSYNC_START.with(|c| c.get().is_none()) {
+        PENDING_VSYNC_START.with(|c| c.set(Some(frame_started)));
+    }
     PENDING_VSYNC.with(|q| {
         let mut q = q.borrow_mut();
         let entry = (hwnd as usize, message);
@@ -95,12 +174,16 @@ pub unsafe fn pace_vsync(
             q.push(entry);
         }
     });
-    let paint_pending = (windows_sys::Win32::UI::WindowsAndMessaging::GetQueueStatus(
-        windows_sys::Win32::UI::WindowsAndMessaging::QS_PAINT,
-    ) >> 16)
-        & windows_sys::Win32::UI::WindowsAndMessaging::QS_PAINT
-        != 0;
-    if !paint_pending {
+    // The host batches every widget's tick and paint before one shared wait.
+    // Waiting here normally makes independently animated HWNDs wait separate
+    // refreshes. Native move/menu loops do not run the host pump, so retain a
+    // local flush there to keep the other widgets alive during a modal loop.
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    let mut gui: GUITHREADINFO = std::mem::zeroed();
+    gui.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    if GetGUIThreadInfo(windows_sys::Win32::System::Threading::GetCurrentThreadId(), &mut gui) != 0
+        && gui.flags & (GUI_INMOVESIZE | GUI_INMENUMODE) != 0
+    {
         flush_pending_vsync(frame_started);
     }
 }
@@ -234,8 +317,14 @@ impl SmoothScroll {
         }
         let (position, velocity) = self.state(now);
         self.from = position;
-        if velocity.abs() < 1. {
-            self.velocity = (target - position) * 10.;
+        let delta = target - position;
+        if velocity.abs() < 80. || velocity * delta <= 0. {
+            self.velocity = (delta * 10.).clamp(-3600., 3600.)
+                + if velocity * delta > 0. {
+                    velocity * 0.5
+                } else {
+                    0.
+                };
             self.start = now - 8.;
         } else {
             self.velocity = velocity;
@@ -587,6 +676,22 @@ pub fn nearest_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pacing_bypasses_measured_double_refresh_waits_then_retries() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut pacing = FramePacing::new();
+        assert!(pacing.can_flush(5., now, false));
+        assert!(!pacing.can_flush(5.5, now, false));
+        assert!(!pacing.record_flush(Duration::from_micros(8333), now, false));
+        assert!(pacing.can_flush(5., now, false));
+        assert!(pacing.record_flush(Duration::from_micros(16667), now, false));
+        assert!(!pacing.can_flush(5., now + Duration::from_millis(999), false));
+        assert!(pacing.can_flush(5., now + Duration::from_secs(1), false));
+        assert!(!pacing.can_flush(4., now + Duration::from_secs(1), true));
+        assert_eq!(pacing.budget(true), Duration::from_nanos(16_666_667));
+        assert_eq!(pacing.budget(false).saturating_sub(Duration::from_millis(12)), Duration::ZERO);
+    }
     #[test]
     fn toolbar_uses_original_rotation_and_returns_to_rest() {
         let mut motion = Motion::default();

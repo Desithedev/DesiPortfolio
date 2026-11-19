@@ -1,8 +1,10 @@
-Lumen 0.1.6 refines Liquid Glass rendering, fused panes, low-power backdrop clarity, and shared search glass styling:
+Lumen 0.1.7 polishes Liquid Glass rendering, 120Hz responsiveness, and widget reliability across the native Rust desktop host:
 
-- **Curved Liquid Glass & Fused Panes**: Improved edge refraction and chromatic dispersion using crisp backdrop sampling across independent cards and fused widget L-junctions, eliminating double seams and sharp corner artifacts.
-- **Unified Search Glass & Divider Sync**: Both App Dock Search and Sticky Notes Search now share the un-boosted dominant wallpaper accent with Sticky Notes-style Liquid Glass rendered above the background at both `100%` and reduced opacity; the App Dock search `|` separator is synced with shortcut icon ink.
-- **Low Power Wallpaper Resolution**: Raised Low Power Mode wallpaper decoding cap to Full HD range (`1280px–1920px`) for sharper frosted glass on high-DPI displays.
+- **Liquid Glass & Fused-Pane Polish**: Softened Liquid Glass edge refraction and chromatic dispersion without rim stretching, added seamless fused-pane chrome/frost blending, Direct2D text/run layout acceleration, and refined DirectComposition/GPU compositor lifecycle handling.
+- **120Hz Scroll, Animation & Timer Responsiveness**: Improved 120Hz frame pacing across widgets and pumped low-priority `WM_TIMER` messages during high-frequency animation frames so background polling never stalls.
+- **Sticky Notes Unified Rich Text**: Matched non-editing Sticky Notes card typography pixel-for-pixel with the RichEdit editor via Direct2D/RichEdit rasterization.
+- **YouTube Music Live Sync & Coverflow Cache**: Added native Chrome/Edge CDP pipe sync, instant push notifications on track/playback updates, Video-mode support, SMTC fallback improvements, and an expanded Coverflow artwork cache (`40` covers).
+- **Control Center, Clock & App Dock**: Added fast Control Center device snapshots without blocking on DDC/CI I2C queries, asynchronous wakeups, and UI/layout refinements.
 
 Optional Python entry points remain available:
 
@@ -14,7 +16,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.6-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.7-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

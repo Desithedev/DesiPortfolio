@@ -7,7 +7,11 @@ use std::{
     mem::zeroed,
     path::{Path, PathBuf},
     ptr::{null_mut, NonNull},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -44,6 +48,9 @@ pub enum SmtcCommand {
 pub struct SmtcClient {
     tx: Sender<SmtcCommand>,
     pub updates: Receiver<SmtcState>,
+    notify_hwnd: Arc<AtomicIsize>,
+    notify_msg: Arc<AtomicU32>,
+    notify_pending: Arc<AtomicBool>,
 }
 
 impl SmtcClient {
@@ -51,13 +58,34 @@ impl SmtcClient {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (upd_tx, upd_rx) = mpsc::channel();
         let art_dir = root.join("config/native-music-player/art");
+        let notify_hwnd = Arc::new(AtomicIsize::new(0));
+        let notify_msg = Arc::new(AtomicU32::new(0));
+        let notify_pending = Arc::new(AtomicBool::new(false));
+        let w_hwnd = Arc::clone(&notify_hwnd);
+        let w_msg = Arc::clone(&notify_msg);
+        let w_pending = Arc::clone(&notify_pending);
         let _ = thread::Builder::new()
             .name("lumen-smtc".into())
-            .spawn(move || worker_loop(art_dir, cmd_rx, upd_tx));
+            .spawn(move || worker_loop(art_dir, cmd_rx, upd_tx, w_hwnd, w_msg, w_pending));
         Self {
             tx: cmd_tx,
             updates: upd_rx,
+            notify_hwnd,
+            notify_msg,
+            notify_pending,
         }
+    }
+
+    pub fn set_notify(&self, hwnd: windows_sys::Win32::Foundation::HWND, msg: u32) {
+        self.notify_hwnd.store(hwnd as isize, Ordering::Release);
+        self.notify_msg.store(msg, Ordering::Release);
+        if hwnd.is_null() || msg == 0 {
+            self.notify_pending.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn clear_notify_pending(&self) {
+        self.notify_pending.store(false, Ordering::Release);
     }
 
     pub fn send(&self, cmd: SmtcCommand) {
@@ -547,7 +575,33 @@ unsafe fn run_command(session: &ComPtr, cmd: &SmtcCommand, timeline_start: i64) 
     }
 }
 
-fn worker_loop(art_dir: PathBuf, cmd_rx: Receiver<SmtcCommand>, upd_tx: Sender<SmtcState>) {
+fn post_notify(hwnd: &AtomicIsize, msg: &AtomicU32, pending: &AtomicBool) {
+    if !pending.swap(true, Ordering::AcqRel) {
+        let h = hwnd.load(Ordering::Acquire);
+        let m = msg.load(Ordering::Acquire);
+        if h != 0 && m != 0 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    h as windows_sys::Win32::Foundation::HWND,
+                    m,
+                    0,
+                    0,
+                );
+            }
+        } else {
+            pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+fn worker_loop(
+    art_dir: PathBuf,
+    cmd_rx: Receiver<SmtcCommand>,
+    upd_tx: Sender<SmtcState>,
+    notify_hwnd: Arc<AtomicIsize>,
+    notify_msg: Arc<AtomicU32>,
+    notify_pending: Arc<AtomicBool>,
+) {
     unsafe {
         let ro_ok = RoInitialize(1) >= 0; // RO_INIT_MULTITHREADED
         let manager = get_session_manager();
@@ -583,6 +637,7 @@ fn worker_loop(art_dir: PathBuf, cmd_rx: Receiver<SmtcCommand>, upd_tx: Sender<S
                         if upd_tx.send(state).is_err() {
                             break 'outer;
                         }
+                        post_notify(&notify_hwnd, &notify_msg, &notify_pending);
                     }
                 } else if last_had_session || ran_cmd {
                     last_had_session = false;
@@ -591,6 +646,7 @@ fn worker_loop(art_dir: PathBuf, cmd_rx: Receiver<SmtcCommand>, upd_tx: Sender<S
                     if upd_tx.send(SmtcState::default()).is_err() {
                         break 'outer;
                     }
+                    post_notify(&notify_hwnd, &notify_msg, &notify_pending);
                 }
             }
 

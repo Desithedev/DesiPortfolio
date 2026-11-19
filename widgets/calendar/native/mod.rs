@@ -726,30 +726,37 @@ impl State {
             } else {
                 1.
             };
-            if let Some(material) = material {
-                self.artwork
-                    .draw(frame.dc, self.dpi, pane, 0., material, blend);
-            }
-            let c = Canvas::new(frame.dc, self.dpi);
-            if !crate::surface::managed(&self.config.palette)
-                && (theme == "lumen" && material.is_none()
-                    || self.config.palette != "wallpaper-auto")
-            {
-                c.round(pane, 0., accent, (blend * 255.).round() as u8, false, false);
-            }
-            crate::surface::paint(&c, pane, &self.config.palette, blend);
-            self.paint_agenda_sidebar(frame.dc, w, h);
-            c.coating(chrome, chrome_r);
-            c.draw_pane_overlay(
-                [r.right as u32, r.bottom as u32],
-                self.dpi,
-                self.config.tint / 100.,
-                light,
-                [0., 0., w, h],
-            );
-            c.widget_corner_reflection_for(self.hwnd, chrome, chrome_r, light);
-            drop(c);
-            frame.bevel_for(self.hwnd);
+            let hwnd = self.hwnd;
+            let is_lumen = theme == "lumen";
+            frame.paint_frosted_chrome_for(hwnd, frosted, |chrome_dc| {
+                if let Some(material) = material {
+                    self.artwork
+                        .draw(chrome_dc, self.dpi, pane, 0., material, blend);
+                }
+                {
+                    let c = Canvas::new(chrome_dc, self.dpi);
+                    if !crate::surface::managed(&self.config.palette)
+                        && (is_lumen && material.is_none()
+                            || self.config.palette != "wallpaper-auto")
+                    {
+                        c.round(pane, 0., accent, (blend * 255.).round() as u8, false, false);
+                    }
+                    crate::surface::paint(&c, pane, &self.config.palette, blend);
+                }
+                self.paint_agenda_sidebar(chrome_dc, w, h);
+                {
+                    let c = Canvas::new(chrome_dc, self.dpi);
+                    c.coating(chrome, chrome_r);
+                    c.draw_pane_overlay(
+                        [r.right as u32, r.bottom as u32],
+                        self.dpi,
+                        self.config.tint / 100.,
+                        light,
+                        [0., 0., w, h],
+                    );
+                    c.widget_corner_reflection_for(hwnd, chrome, chrome_r, light);
+                }
+            });
             self.ink = Some(
                 crate::contrast::inks(
                     crate::contrast::sample(frame.dc, self.dpi, [20., 48., w - 20., h - 20.]),
@@ -1066,6 +1073,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 s.bounds();
             }
             s.pressed = None;
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }

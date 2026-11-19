@@ -32,18 +32,21 @@ struct Member {
     visible: bool,
     moving: bool,
     opacity: u8,
+    frost: u8,
     snap_drag: Option<(RECT, POINT)>,
 }
 struct Bridge {
     hwnd: HWND,
     panes: Vec<Pane>,
     opacities: Vec<f32>,
+    frosts: Vec<f32>,
     wallpaper: u64,
     material: u64,
     uploads: u64,
 }
 impl Drop for Bridge {
     fn drop(&mut self) {
+        crate::gpu::remove_surface(self.hwnd);
         unsafe {
             if IsWindow(self.hwnd) != 0 {
                 DestroyWindow(self.hwnd);
@@ -67,6 +70,11 @@ struct Manager {
 thread_local! {
     static MANAGER: RefCell<Option<Manager>> = const { RefCell::new(None) };
     static PENDING_MOVE: std::cell::Cell<Option<(usize, RECT)>> = const { std::cell::Cell::new(None) };
+    static IN_WM_MOVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn in_wm_moving() -> bool {
+    IN_WM_MOVING.with(|f| f.get())
 }
 
 pub unsafe fn window_rect(hwnd: HWND) -> RECT {
@@ -169,7 +177,22 @@ pub unsafe fn move_captured_widget(hwnd: HWND, mut r: RECT) {
             }
         }
     });
-    commit_atomic_move(hwnd, r);
+    if crate::gpu::is_gpu_window(hwnd) {
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            r.left,
+            r.top,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        if crate::glass::move_paint_due(hwnd) {
+            InvalidateRect(hwnd, null(), 0);
+        }
+    } else {
+        commit_atomic_move(hwnd, r);
+    }
 }
 
 pub unsafe fn init(glass: Rc<RefCell<Glass>>) {
@@ -291,6 +314,7 @@ unsafe fn read_member(hwnd: HWND, radius: f32) -> Member {
         visible: IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0,
         moving: false,
         opacity: 255,
+        frost: 255,
         snap_drag: None,
     }
 }
@@ -316,6 +340,48 @@ impl Manager {
             x,
             y,
         )
+    }
+    fn affine_at(&self, panes: &[Pane], x: f32, y: f32) -> Option<(f32, [f32; 3])> {
+        material::blend_affine(
+            panes.iter().filter_map(|p| {
+                Some((
+                    p,
+                    self.members.get(&p.id)?.window,
+                    self.materials.get(&p.id)?,
+                ))
+            }),
+            x,
+            y,
+        )
+    }
+    fn delta_at(&self, panes: &[Pane], x: f32, y: f32) -> Option<[f32; 3]> {
+        self.affine_at(panes, x, y).map(|(_, b)| b)
+    }
+    fn overlay_at(&self, panes: &[Pane], x: f32, y: f32) -> Option<[f32; 4]> {
+        material::blend_overlay(
+            panes.iter().filter_map(|p| {
+                Some((
+                    p,
+                    self.members.get(&p.id)?.window,
+                    self.materials.get(&p.id)?,
+                ))
+            }),
+            x,
+            y,
+        )
+    }
+    fn frost_at(&self, panes: &[Pane], x: f32, y: f32) -> f32 {
+        material::blend_scalar(
+            panes.iter().map(|p| {
+                (
+                    p,
+                    self.members.get(&p.id).map_or(255, |m| m.frost) as f32 / 255.0,
+                )
+            }),
+            x,
+            y,
+        )
+        .unwrap_or(1.0)
     }
     unsafe fn changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
@@ -359,6 +425,7 @@ impl Manager {
             let mut new = read_member(hwnd, radius.unwrap_or(old.pane.radius / old.pane.dpi));
             new.moving = old.moving;
             new.opacity = old.opacity;
+            new.frost = old.frost;
             let changed = old.pane != new.pane || old.visible != new.visible;
             self.members.insert(id, new);
             if changed && !old.moving {
@@ -401,6 +468,7 @@ pub fn revision(hwnd: HWND) -> u64 {
             p.radius.to_bits().hash(&mut h);
             p.dpi.to_bits().hash(&mut h);
             p.topmost.hash(&mut h);
+            s.members.get(&p.id).map_or(255u8, |m| m.frost).hash(&mut h);
         }
         h.finish()
     })
@@ -423,8 +491,133 @@ pub fn pane_radius(hwnd: HWND) -> Option<f32> {
     })
 }
 
+pub fn frosted_wallpaper_active() -> bool {
+    if !crate::glass::frosted_glass() {
+        return false;
+    }
+    MANAGER.with(|m| {
+        m.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref()?.glass.try_borrow().ok().map(|g| g.available()))
+            .unwrap_or(false)
+    })
+}
+
+/// Publish raw chrome or wallpaper-subtracted chrome delta for frosted widgets.
+pub unsafe fn publish_chrome_for(
+    hwnd: HWND,
+    width: usize,
+    height: usize,
+    source_bgra: &[u8],
+) {
+    if width == 0 || height == 0 || source_bgra.len() < width * height * 4 {
+        return;
+    }
+    let info = MANAGER.with(|m| {
+        let Ok(guard) = m.try_borrow() else {
+            return None;
+        };
+        let s = guard.as_ref()?;
+        let member = s.members.get(&(hwnd as usize))?;
+        let panes = s.group(hwnd as usize);
+        Some((s.glass.clone(), member.pane.dpi, member.window, panes))
+    });
+    let Some((glass, dpi, win_rect, fused_panes)) = info else {
+        return;
+    };
+    let (tw, th) = (width.min(64), height.min(64));
+    let material = if frosted_wallpaper_active() {
+        let win = window_rect(hwnd);
+        let rim_mask = if crate::glass::liquid_glass() {
+            let mut mask = vec![false; width * height];
+            if let Some(ref panes) = fused_panes {
+                let rim_band = 2.0 * dpi.max(1.0);
+                geometry::with_outline(panes, |outline| {
+                    for y in 0..height {
+                        let gy = win_rect[1] as f32 + y as f32 + 0.5;
+                        for x in 0..width {
+                            let gx = win_rect[0] as f32 + x as f32 + 0.5;
+                            if outline.distance([gx, gy]) > -rim_band {
+                                mask[y * width + x] = true;
+                            }
+                        }
+                    }
+                });
+            } else {
+                let rim_band = 4.0 * dpi.max(1.0);
+                for y in 0..height {
+                    let dy = y.min(height - 1 - y) as f32;
+                    for x in 0..width {
+                        let dx = x.min(width - 1 - x) as f32;
+                        if dx.min(dy) < rim_band {
+                            mask[y * width + x] = true;
+                        }
+                    }
+                }
+            }
+            Some(mask)
+        } else {
+            None
+        };
+        glass
+            .try_borrow()
+            .ok()
+            .and_then(|g| g.sample_blurred_tile(hwnd, win, tw, th))
+            .map(|tile| {
+                material::Material::from_bgra_delta(
+                    width,
+                    height,
+                    source_bgra,
+                    &tile,
+                    tw,
+                    th,
+                    rim_mask.as_deref(),
+                )
+            })
+            .unwrap_or_else(|| material::Material::from_bgra(width, height, source_bgra))
+    } else {
+        material::Material::from_bgra(width, height, source_bgra)
+    };
+    store_material(hwnd, material, true);
+}
+
+unsafe fn store_material(hwnd: HWND, material: material::Material, only_if_grouped: bool) {
+    MANAGER.with(|manager| {
+        let Ok(mut manager) = manager.try_borrow_mut() else {
+            return;
+        };
+        let Some(s) = manager.as_mut() else { return };
+        if !s.members.contains_key(&(hwnd as usize)) {
+            return;
+        }
+        if s.materials.get(&(hwnd as usize)) == Some(&material) {
+            return;
+        }
+        s.materials.insert(hwnd as usize, material);
+        if !only_if_grouped || s.group(hwnd as usize).is_some() {
+            s.changed();
+        }
+    });
+}
+
+/// Publish premultiplied chrome-only overlay (without wallpaper) for fused widgets.
+pub unsafe fn publish_overlay_for(
+    hwnd: HWND,
+    width: usize,
+    height: usize,
+    overlay_bgra: &[u8],
+    inset_px: usize,
+) {
+    if width == 0 || height == 0 || overlay_bgra.len() < width * height * 4 {
+        return;
+    }
+    let material = material::Material::from_overlay_bgra(width, height, overlay_bgra, inset_px);
+    store_material(hwnd, material, true);
+}
+
 /// Publish only raw chrome, before shared blending, bevel, alpha and content.
 /// Equality suppresses repaint feedback and keeps storage below12 KiB/member.
+#[allow(dead_code)]
 pub unsafe fn publish_material(hwnd: HWND, material: material::Material) {
     MANAGER.with(|manager| {
         let Ok(mut manager) = manager.try_borrow_mut() else {
@@ -478,6 +671,28 @@ pub fn group_opacities(hwnd: HWND, own_alpha: u8) -> Option<(Vec<Pane>, Vec<u8>)
         }
     })
 }
+pub fn group_frosts(hwnd: HWND, own_frost: u8) -> Option<(Vec<Pane>, Vec<u8>)> {
+    MANAGER.with(|m| {
+        let s = m.try_borrow().ok()?;
+        let s = s.as_ref()?;
+        let panes = s.group(hwnd as usize)?;
+        let frosts: Vec<u8> = panes
+            .iter()
+            .map(|p| {
+                if p.id == hwnd as usize {
+                    own_frost
+                } else {
+                    s.members.get(&p.id).map_or(255, |m| m.frost)
+                }
+            })
+            .collect();
+        if frosts.iter().all(|&f| f == own_frost) {
+            None
+        } else {
+            Some((panes, frosts))
+        }
+    })
+}
 pub fn fused(hwnd: HWND) -> bool {
     group(hwnd).is_some()
 }
@@ -489,22 +704,26 @@ pub fn is_surface(hwnd: HWND) -> bool {
         })
     })
 }
-unsafe fn restack(hwnd: HWND, panes: &[Pane], rect: Option<[i32; 4]>) {
+unsafe fn restack(hwnd: HWND, panes: &[Pane], rect: Option<[i32; 4]>, show: bool) {
     crate::desktop_layer::register(
         hwnd,
         panes
             .iter()
             .any(|pane| crate::desktop_layer::contains(pane.id as HWND)),
     );
-    let mut above = GetTopWindow(null_mut());
+    let mut lowest = null_mut();
+    let mut cur = GetTopWindow(null_mut());
     for _ in 0..4096 {
-        if above.is_null() || panes.iter().any(|p| p.id == above as usize) {
+        if cur.is_null() {
             break;
         }
-        above = GetWindow(above, GW_HWNDNEXT);
+        if panes.iter().any(|p| p.id == cur as usize) {
+            lowest = cur;
+        }
+        cur = GetWindow(cur, GW_HWNDNEXT);
     }
-    if above.is_null() {
-        above = panes[0].id as HWND;
+    if lowest.is_null() {
+        lowest = panes.last().map_or(null_mut(), |p| p.id as HWND);
     }
     let topmost = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST as isize != 0;
     if topmost != panes[0].topmost {
@@ -523,18 +742,19 @@ unsafe fn restack(hwnd: HWND, panes: &[Pane], rect: Option<[i32; 4]>) {
         );
     }
     let [x, y, w, h] = rect.unwrap_or([0, 0, 0, 0]);
-    // The unowned decorative surface stays below the highest cluster member,
-    // including its desktop band. Never float a junction over other apps or
-    // over General Settings just because it was repainted last.
+    // The unowned decorative surface stays below the lowest cluster member,
+    // including its desktop band. Never float a junction over widgets, other apps,
+    // or General Settings just because it was repainted or shown last.
     SetWindowPos(
         hwnd,
-        above,
+        lowest,
         x,
         y,
         w,
         h,
         SWP_NOACTIVATE
             | SWP_NOOWNERZORDER
+            | if show { SWP_SHOWWINDOW } else { 0 }
             | if rect.is_none() {
                 SWP_NOMOVE | SWP_NOSIZE
             } else {
@@ -549,6 +769,22 @@ pub fn opacity(hwnd: HWND, value: u8) {
                 if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
                     if p.opacity != value {
                         p.opacity = value;
+                        unsafe {
+                            s.changed();
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+pub fn frost_strength(hwnd: HWND, value: u8) {
+    MANAGER.with(|m| {
+        if let Ok(mut x) = m.try_borrow_mut() {
+            if let Some(s) = x.as_mut() {
+                if let Some(p) = s.members.get_mut(&(hwnd as usize)) {
+                    if p.frost != value {
+                        p.frost = value;
                         unsafe {
                             s.changed();
                         }
@@ -639,6 +875,9 @@ pub unsafe fn shared_material(
         {
             return None;
         }
+        let has_opaque = panes
+            .iter()
+            .any(|p| s.materials.get(&p.id).is_some_and(|m| m.is_opaque()));
         let r = window_rect(hwnd);
         // Global pixel grid: adjacent widgets interpolate identical samples at
         // their seam. Only this small field evaluates distance/exponential;
@@ -649,22 +888,201 @@ pub unsafe fn shared_material(
         let gw = ((r.left + width - l + step - 1) / step + 1) as usize;
         let gh = ((r.top + height - t + step - 1) / step + 1) as usize;
         let mut bgr = Vec::with_capacity(gw * gh);
+        if has_opaque {
+            for y in 0..gh {
+                for x in 0..gw {
+                    let color = s.material_at(
+                        &panes,
+                        (l + x as i32 * step) as f32 + 8.,
+                        (t + y as i32 * step) as f32 + 8.,
+                    )?;
+                    bgr.push(color);
+                }
+            }
+            Some(material::Field {
+                window: [l, t, l + gw as i32 * step, t + gh as i32 * step],
+                width: gw,
+                height: gh,
+                is_delta: false,
+                bgr,
+            })
+        } else {
+            let own_mat = s.materials.get(&(hwnd as usize))?;
+            let own_win = s
+                .members
+                .get(&(hwnd as usize))
+                .map_or([r.left, r.top, r.right, r.bottom], |m| m.window);
+            let own_gain = if own_mat.is_delta {
+                own_mat.gain()
+            } else {
+                1.0
+            };
+            let field_rect = RECT {
+                left: l,
+                top: t,
+                right: l + gw as i32 * step,
+                bottom: t + gh as i32 * step,
+            };
+            let wall_tile = s
+                .glass
+                .try_borrow()
+                .ok()
+                .and_then(|g| g.sample_blurred_tile(hwnd, field_rect, gw, gh));
+            for y in 0..gh {
+                for x in 0..gw {
+                    let gx = (l + x as i32 * step) as f32 + 8.;
+                    let gy = (t + y as i32 * step) as f32 + 8.;
+                    let (blended_gain, blended_bias) = s.affine_at(&panes, gx, gy)?;
+                    let ob = own_mat.sample_delta(own_win, gx, gy);
+                    let wb = wall_tile
+                        .as_ref()
+                        .and_then(|t| t.get(y * gw + x).copied())
+                        .unwrap_or([128, 128, 128]);
+                    bgr.push(std::array::from_fn(|c| {
+                        (blended_gain - own_gain) * wb[c] as f32 + (blended_bias[c] - ob[c])
+                    }));
+                }
+            }
+            Some(material::Field {
+                window: [l, t, l + gw as i32 * step, t + gh as i32 * step],
+                width: gw,
+                height: gh,
+                is_delta: true,
+                bgr,
+            })
+        }
+    })
+}
+
+pub unsafe fn shared_overlay(
+    hwnd: HWND,
+    width: i32,
+    height: i32,
+) -> Option<material::OverlayField> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    MANAGER.with(|m| {
+        let s = m.try_borrow().ok()?;
+        let s = s.as_ref()?;
+        let panes = s.group(hwnd as usize)?;
+        if panes
+            .iter()
+            .filter(|p| s.materials.contains_key(&p.id))
+            .count()
+            < 2
+        {
+            return None;
+        }
+        if !panes
+            .iter()
+            .any(|p| s.materials.get(&p.id).is_some_and(|m| m.is_overlay))
+        {
+            return None;
+        }
+        let r = window_rect(hwnd);
+        let step = 16;
+        let l = r.left.div_euclid(step) * step - step;
+        let t = r.top.div_euclid(step) * step - step;
+        let gw = ((r.left + width - l + step - 1) / step + 1) as usize;
+        let gh = ((r.top + height - t + step - 1) / step + 1) as usize;
+        let mut bgra = Vec::with_capacity(gw * gh);
         for y in 0..gh {
             for x in 0..gw {
-                let color = s.material_at(
+                let color = s.overlay_at(
                     &panes,
                     (l + x as i32 * step) as f32 + 8.,
                     (t + y as i32 * step) as f32 + 8.,
                 )?;
-                bgr.push(color);
+                bgra.push(color);
             }
         }
-        Some(material::Field {
+        Some(material::OverlayField {
             window: [l, t, l + gw as i32 * step, t + gh as i32 * step],
             width: gw,
             height: gh,
-            bgr,
+            bgra,
         })
+    })
+}
+
+pub struct FrostBlend {
+    origin: [f32; 2],
+    own: f32,
+    field: material::FrostField,
+    seams: Vec<crate::compositor::Seam>,
+    bounds: [i32; 4],
+}
+impl FrostBlend {
+    pub fn sample_local(&self, x: i32, y: i32) -> f32 {
+        if x < self.bounds[0]
+            || x >= self.bounds[2]
+            || y < self.bounds[1]
+            || y >= self.bounds[3]
+        {
+            return self.own;
+        }
+        let gx = self.origin[0] + x as f32 + 0.5;
+        let gy = self.origin[1] + y as f32 + 0.5;
+        let w = crate::compositor::seam_weight(&self.seams, x, y, gx, gy);
+        if w <= 0.0 {
+            self.own
+        } else {
+            (self.own * (1.0 - w) + self.field.sample(gx, gy) * w).clamp(0.0, 1.0)
+        }
+    }
+}
+
+pub unsafe fn shared_frost(
+    hwnd: HWND,
+    width: i32,
+    height: i32,
+    own_frost: u8,
+) -> Option<FrostBlend> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let (panes, frosts) = group_frosts(hwnd, own_frost)?;
+    let own = panes.iter().find(|p| p.id == hwnd as usize)?;
+    let r = window_rect(hwnd);
+    let seams = crate::compositor::collect_seams(&panes, own, r, width, height);
+    if seams.is_empty() {
+        return None;
+    }
+    let bounds = crate::compositor::seams_bounds(&seams);
+    let step = 16;
+    let l = r.left.div_euclid(step) * step - step;
+    let t = r.top.div_euclid(step) * step - step;
+    let gw = ((r.left + width - l + step - 1) / step + 1) as usize;
+    let gh = ((r.top + height - t + step - 1) / step + 1) as usize;
+    let mut values = Vec::with_capacity(gw * gh);
+    for y in 0..gh {
+        let gy = (t + y as i32 * step) as f32 + 8.;
+        for x in 0..gw {
+            let gx = (l + x as i32 * step) as f32 + 8.;
+            let v = material::blend_scalar(
+                panes
+                    .iter()
+                    .zip(&frosts)
+                    .map(|(p, &f)| (p, f as f32 / 255.0)),
+                gx,
+                gy,
+            )
+            .unwrap_or(1.0);
+            values.push(v);
+        }
+    }
+    Some(FrostBlend {
+        origin: [r.left as f32, r.top as f32],
+        own: own_frost as f32 / 255.0,
+        field: material::FrostField {
+            window: [l, t, l + gw as i32 * step, t + gh as i32 * step],
+            width: gw,
+            height: gh,
+            values,
+        },
+        seams,
+        bounds,
     })
 }
 
@@ -816,7 +1234,18 @@ unsafe extern "system" fn widget_proc(
                 }
             });
             let target = *r;
-            commit_atomic_move(hwnd, target);
+            if crate::gpu::is_gpu_window(hwnd) {
+                if crate::glass::move_paint_due(hwnd) {
+                    IN_WM_MOVING.with(|f| f.set(true));
+                    PENDING_MOVE.with(|p| p.set(Some((hwnd as usize, target))));
+                    InvalidateRect(hwnd, null(), 0);
+                    UpdateWindow(hwnd);
+                    PENDING_MOVE.with(|p| p.set(None));
+                    IN_WM_MOVING.with(|f| f.set(false));
+                }
+            } else {
+                commit_atomic_move(hwnd, target);
+            }
         }
         WM_EXITSIZEMOVE | WM_CAPTURECHANGED | WM_CANCELMODE => {
             MANAGER.with(|m| {
@@ -900,6 +1329,10 @@ pub(crate) unsafe fn refresh() {
             .iter()
             .map(|p| s.members.get(&p.id).map_or(255, |m| m.opacity) as f32 / 255.)
             .collect();
+        let frosts: Vec<f32> = ps
+            .iter()
+            .map(|p| s.members.get(&p.id).map_or(255, |m| m.frost) as f32 / 255.)
+            .collect();
         let wallpaper = s.glass.borrow().revision();
         let material = s.material_key(&ps);
         let old = previous
@@ -909,11 +1342,12 @@ pub(crate) unsafe fn refresh() {
         if old.as_ref().is_some_and(|b| {
             b.panes == ps
                 && b.opacities == opacities
+                && b.frosts == frosts
                 && b.wallpaper == wallpaper
                 && b.material == material
         }) {
             let bridge = old.unwrap();
-            restack(bridge.hwnd, &ps, None);
+            restack(bridge.hwnd, &ps, None, false);
             s.bridges.push(bridge);
             continue;
         }
@@ -931,7 +1365,11 @@ pub(crate) unsafe fn refresh() {
         }
         let hwnd = old.as_ref().map(|b| b.hwnd).unwrap_or_else(|| {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                crate::gpu::window_ex_style()
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOOLWINDOW,
                 wide("LumenNativeFusionSurface").as_ptr(),
                 null(),
                 WS_POPUP | WS_DISABLED,
@@ -952,15 +1390,174 @@ pub(crate) unsafe fn refresh() {
             hwnd,
             panes: Vec::new(),
             opacities: Vec::new(),
+            frosts: Vec::new(),
             wallpaper: 0,
             material: 0,
             uploads: 0,
         });
+        let has_opaque_material = ps
+            .iter()
+            .any(|p| s.materials.get(&p.id).is_some_and(|m| m.is_opaque()));
+        let has_overlay_material = ps
+            .iter()
+            .any(|p| s.materials.get(&p.id).is_some_and(|m| m.is_overlay));
+        let windows: Vec<[i32; 4]> = ps
+            .iter()
+            .map(|p| s.members.get(&p.id).map_or([0; 4], |m| m.window))
+            .collect();
+        if !cfg!(test) && crate::gpu::is_gpu_window(hwnd) && !has_opaque_material && ps.len() <= 16
+        {
+            let packed = geometry::with_outline(&ps, |outline| {
+                outline.pack_gpu_segments([l as f32, t as f32])
+            });
+            if let Some((
+                fuse_lines,
+                fuse_line_count,
+                fuse_corner_c,
+                fuse_corner_uv,
+                fuse_corner_count,
+            )) = packed
+            {
+                let ref_hwnd = ps[0].id as HWND;
+                let (desk, accent, has_wallpaper) = {
+                    let glass = s.glass.borrow();
+                    let area = glass.monitor_origin_size(ref_hwnd);
+                    let synced = if crate::gpu::wallpaper_revision_synced(wallpaper, area) {
+                        true
+                    } else if let Some((pair_area, blurred, sharp)) =
+                        glass.gpu_wallpaper_pair_for(ref_hwnd)
+                    {
+                        crate::gpu::sync_wallpaper_pair(
+                            wallpaper,
+                            pair_area,
+                            &blurred,
+                            sharp.as_deref(),
+                        )
+                    } else {
+                        false
+                    };
+                    (area, glass.wallpaper_accent(), synced)
+                };
+                let mut constants = crate::gpu::FusionBridgeConstants {
+                    bridge_rect: [l as f32, t as f32, w as f32, h as f32],
+                    desktop_rect: [
+                        desk[0] as f32,
+                        desk[1] as f32,
+                        desk[2] as f32,
+                        desk[3] as f32,
+                    ],
+                    params: [
+                        dpi,
+                        pad as f32,
+                        if crate::glass::liquid_glass() { 1.0 } else { 0.0 },
+                        0.0,
+                    ],
+                    accent_flags: [
+                        (accent & 0xff) as f32 / 255.0,
+                        ((accent >> 8) & 0xff) as f32 / 255.0,
+                        ((accent >> 16) & 0xff) as f32 / 255.0,
+                        if has_wallpaper { 1.0 } else { 0.0 },
+                    ],
+                    counts: [
+                        ps.len() as u32,
+                        windows.len() as u32,
+                        fuse_line_count,
+                        fuse_corner_count,
+                    ],
+                    fuse_lines,
+                    fuse_corner_c,
+                    fuse_corner_uv,
+                    ..Default::default()
+                };
+                for (i, (p, &op)) in ps.iter().zip(&opacities).enumerate() {
+                    constants.pane_rects[i] = [
+                        p.rect[0] - l as f32,
+                        p.rect[1] - t as f32,
+                        p.rect[2] - l as f32,
+                        p.rect[3] - t as f32,
+                    ];
+                    constants.pane_meta[i] = [p.radius, op, p.dpi, (1.0 - frosts[i]).clamp(0.0, 1.0)];
+                    if let Some(mat) = s.materials.get(&p.id).filter(|m| m.is_delta) {
+                        let d = mat.avg_rgb_delta();
+                        constants.pane_delta[i] = [d[0], d[1], d[2], 1.0];
+                    }
+                }
+                for (i, mw) in windows.iter().enumerate() {
+                    constants.member_windows[i] = [
+                        (mw[0] - l) as f32,
+                        (mw[1] - t) as f32,
+                        (mw[2] - l) as f32,
+                        (mw[3] - t) as f32,
+                    ];
+                }
+                let has_any_material = ps.iter().any(|p| s.materials.contains_key(&p.id));
+                let field_data = if has_any_material {
+                    let step = 8i32;
+                    let fw = ((w + step - 1) / step + 1).max(2) as usize;
+                    let fh = ((h + step - 1) / step + 1).max(2) as usize;
+                    let mut field_rgba = vec![0u8; fw * fh * 4];
+                    for fy in 0..fh {
+                        let gy = (t + fy as i32 * step) as f32;
+                        for fx in 0..fw {
+                            let gx = (l + fx as i32 * step) as f32;
+                            let idx = (fy * fw + fx) * 4;
+                            if has_overlay_material {
+                                let o = s.overlay_at(&ps, gx, gy).unwrap_or([0.0; 4]);
+                                field_rgba[idx] = o[2].round().clamp(0.0, 255.0) as u8;
+                                field_rgba[idx + 1] = o[1].round().clamp(0.0, 255.0) as u8;
+                                field_rgba[idx + 2] = o[0].round().clamp(0.0, 255.0) as u8;
+                                field_rgba[idx + 3] =
+                                    (255.0 - o[3]).round().clamp(0.0, 255.0) as u8;
+                            } else {
+                                let (gain, bias_bgr) =
+                                    s.affine_at(&ps, gx, gy).unwrap_or((1.0, [0.0; 3]));
+                                field_rgba[idx] = (((bias_bgr[2] / 255.0) * 0.5 + 0.5)
+                                    .clamp(0.0, 1.0)
+                                    * 255.0)
+                                    .round() as u8;
+                                field_rgba[idx + 1] = (((bias_bgr[1] / 255.0) * 0.5 + 0.5)
+                                    .clamp(0.0, 1.0)
+                                    * 255.0)
+                                    .round() as u8;
+                                field_rgba[idx + 2] = (((bias_bgr[0] / 255.0) * 0.5 + 0.5)
+                                    .clamp(0.0, 1.0)
+                                    * 255.0)
+                                    .round() as u8;
+                                field_rgba[idx + 3] = (gain.clamp(0.0, 1.0) * 255.0).round() as u8;
+                            }
+                        }
+                    }
+                    constants.field_uv = [
+                        fw as f32,
+                        fh as f32,
+                        step as f32,
+                        if has_overlay_material { 2.0 } else { 1.0 },
+                    ];
+                    Some((fw as u32, fh as u32, field_rgba))
+                } else {
+                    None
+                };
+                let field_ref = field_data
+                    .as_ref()
+                    .map(|(fw, fh, data)| (*fw, *fh, data.as_slice()));
+                restack(hwnd, &ps, Some([l, t, w, h]), false);
+                if crate::gpu::present_fusion_bridge_with_field(hwnd, &constants, field_ref) {
+                    bridge.uploads += 1;
+                    restack(hwnd, &ps, None, true);
+                    bridge.panes = ps;
+                    bridge.opacities = opacities;
+                    bridge.frosts = frosts;
+                    bridge.wallpaper = wallpaper;
+                    bridge.material = material;
+                    s.bridges.push(bridge);
+                    continue;
+                }
+            }
+        }
         let Some(mut buffer) = Buffer::plain(w, h, dpi) else {
             continue;
         };
-        let has_material = ps.iter().any(|p| s.materials.contains_key(&p.id));
-        if !has_material {
+        if !has_opaque_material {
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -979,12 +1576,14 @@ pub(crate) unsafe fn refresh() {
             };
             FillRect(buffer.dc, &rr, brush);
             DeleteObject(brush);
-            s.glass.borrow().draw(buffer.dc, hwnd, w, h);
+            if frosts.iter().all(|&f| (f - 1.0).abs() < 1e-4) {
+                s.glass.borrow().draw(buffer.dc, hwnd, w, h);
+            } else {
+                s.glass.borrow().draw_with_frost(buffer.dc, hwnd, w, h, |x, y| {
+                    s.frost_at(&ps, (l + x) as f32 + 0.5, (t + y) as f32 + 0.5)
+                });
+            }
         }
-        let windows: Vec<[i32; 4]> = ps
-            .iter()
-            .map(|p| s.members.get(&p.id).map_or([0; 4], |m| m.window))
-            .collect();
         let uniform_opacity = opacities
             .first()
             .copied()
@@ -994,6 +1593,7 @@ pub(crate) unsafe fn refresh() {
         let liquid = crate::glass::liquid_glass();
         let spec_w = crate::compositor::liquid_spec_width(dpi, w as f32, h as f32);
         let bridge_rim = (40.0 * dpi).clamp(12.0, (w.min(h) as f32) * 0.44);
+        let underlap = 3.0 * dpi;
         let mut rim_samples: Vec<(i32, i32, f32, f32, f32, f32, f32, f32)> = Vec::new();
         geometry::with_outline(&ps, |outline| {
             let r_max = pad_f + 6. * dpi;
@@ -1007,11 +1607,13 @@ pub(crate) unsafe fn refresh() {
                         .iter()
                         .map(|c| [c.min[0] - r_max, c.max[0] + r_max]),
                 )
-                .chain(
-                    windows
-                        .iter()
-                        .flat_map(|w| [[w[0] as f32 - 2., w[0] as f32 + 2.], [w[2] as f32 - 2., w[2] as f32 + 2.]]),
-                )
+                .chain(windows.iter().flat_map(|w| {
+                    let u = underlap + 2.0;
+                    [
+                        [w[0] as f32 - 2., w[0] as f32 + u],
+                        [w[2] as f32 - u, w[2] as f32 + 2.],
+                    ]
+                }))
                 .collect();
             x_zones.sort_unstable_by(|a, b| a[0].total_cmp(&b[0]));
             let mut merged_zones: Vec<[f32; 2]> = Vec::with_capacity(x_zones.len());
@@ -1048,7 +1650,7 @@ pub(crate) unsafe fn refresh() {
                         };
                         if gx >= span_l && gx < span_r {
                             let end_x = ((span_r - 0.5).floor() as i32 - l + 1).clamp(x + 1, w);
-                            if !has_material {
+                            if !has_opaque_material {
                                 pixels[row + (x as usize * 4)..row + (end_x as usize * 4)].fill(0);
                             }
                             x = end_x;
@@ -1074,7 +1676,7 @@ pub(crate) unsafe fn refresh() {
                     };
                     let i = row + (x * 4) as usize;
                     if geometry::covered_core(&ps, gx, gy) {
-                        if !has_material {
+                        if !has_opaque_material {
                             pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
                         }
                         x = span_end_x;
@@ -1082,7 +1684,7 @@ pub(crate) unsafe fn refresh() {
                     }
                     let d = outline.distance([gx, gy]);
                     if d >= pad_f {
-                        if !has_material {
+                        if !has_opaque_material {
                             pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
                         }
                         x = span_end_x;
@@ -1091,18 +1693,18 @@ pub(crate) unsafe fn refresh() {
                     let in_window = windows
                         .iter()
                         .any(|w| lx >= w[0] && lx < w[2] && ly >= w[1] && ly < w[3]);
-                    if in_window && d < -0.625 {
-                        if !has_material {
-                            pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
-                        }
-                        x = span_end_x;
-                        continue;
-                    }
+                    let in_deep_window = in_window
+                        && windows.iter().any(|w| {
+                            gx >= w[0] as f32 + underlap
+                                && gx < w[2] as f32 - underlap
+                                && gy >= w[1] as f32 + underlap
+                                && gy < w[3] as f32 - underlap
+                        });
                     let coverage = outline.coverage_with_distance(gx, gy, d);
-                    // The shadow must also occupy transparent rounded corners INSIDE
-                    // member HWND bounds; a rectangular hole cuts it into hard squares.
-                    if in_window && coverage > 0. {
-                        if !has_material {
+                    // Keep a 3dp opaque member underlap band gated strictly on d < -1.0
+                    // so the outer rounded AA border never double-blends while inner joins never leak.
+                    if (in_window && d >= -1.0 && coverage > 0.) || (in_deep_window && d < -1.0) {
+                        if !has_opaque_material {
                             pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
                         }
                         x = span_end_x;
@@ -1144,12 +1746,37 @@ pub(crate) unsafe fn refresh() {
                         } else {
                             0.
                         };
-                        let material = s.material_at(&ps, gx, gy);
+                        let material = if has_opaque_material {
+                            s.material_at(&ps, gx, gy)
+                        } else {
+                            None
+                        };
+                        let affine = if !has_opaque_material && !has_overlay_material {
+                            s.affine_at(&ps, gx, gy)
+                        } else {
+                            None
+                        };
                         if material.is_none() && has_n {
                             rim_samples.push((x, y, d, nx, ny, a, edge, spec));
+                        } else if has_overlay_material && !has_opaque_material {
+                            let ov = s.overlay_at(&ps, gx, gy).unwrap_or([0.0; 4]);
+                            let oa = (ov[3] / 255.0).clamp(0.0, 1.0);
+                            for c in 0..3 {
+                                let blended = (pixels[i + c] as f32 * (1.0 - oa) + ov[c])
+                                    .clamp(0.0, 255.0);
+                                let lit = (blended + (255.0 - blended) * edge + spec).min(255.0);
+                                pixels[i + c] = (lit * a) as u8;
+                            }
                         } else {
                             for c in 0..3 {
-                                let value = material.map_or(pixels[i + c] as f32, |m| m[c]);
+                                let value = material.map_or_else(
+                                    || {
+                                        let base = pixels[i + c] as f32;
+                                        let (gain, bias) = affine.unwrap_or((1.0, [0.0; 3]));
+                                        (base * gain + bias[c]).clamp(0., 255.)
+                                    },
+                                    |m| m[c],
+                                );
                                 let lit = (value + (255. - value) * edge + spec).min(255.);
                                 pixels[i + c] = (lit * a) as u8;
                             }
@@ -1169,7 +1796,7 @@ pub(crate) unsafe fn refresh() {
                             .clamp(0., 255.) as u8;
                         for sx in x..span_end_x {
                             let si = row + (sx * 4) as usize;
-                            if !has_material {
+                            if !has_opaque_material {
                                 pixels[si..si + 3].fill(0);
                             }
                             pixels[si + 3] = a;
@@ -1180,7 +1807,7 @@ pub(crate) unsafe fn refresh() {
             }
         });
         if !rim_samples.is_empty() {
-            s.glass.borrow().apply_bridge_refraction(
+            s.glass.borrow().apply_bridge_refraction_with_frost(
                 hwnd,
                 RECT {
                     left: l,
@@ -1193,14 +1820,50 @@ pub(crate) unsafe fn refresh() {
                 dpi,
                 pixels,
                 &rim_samples,
+                |x, y| s.frost_at(&ps, (l + x) as f32 + 0.5, (t + y) as f32 + 0.5),
             );
+            if !has_opaque_material {
+                for &(x, y, _d, _nx, _ny, a, edge, spec) in &rim_samples {
+                    if a <= 1e-4 {
+                        continue;
+                    }
+                    let gx = (l + x) as f32 + 0.5;
+                    let gy = (t + y) as f32 + 0.5;
+                    let i = ((y * w + x) * 4) as usize;
+                    if has_overlay_material {
+                        if let Some(ov) = s.overlay_at(&ps, gx, gy) {
+                            let oa = (ov[3] / 255.0).clamp(0.0, 1.0);
+                            for c in 0..3 {
+                                let lit = pixels[i + c] as f32 / a;
+                                let lit_new = ((lit - 255.0 * edge - spec) * (1.0 - oa)
+                                    + ov[c] * (1.0 - edge)
+                                    + 255.0 * edge
+                                    + spec)
+                                    .clamp(0.0, 255.0);
+                                pixels[i + c] = (lit_new * a).round().clamp(0.0, 255.0) as u8;
+                            }
+                        }
+                    } else if let Some((gain, bias)) = s.affine_at(&ps, gx, gy) {
+                        for c in 0..3 {
+                            let lit = pixels[i + c] as f32 / a;
+                            let lit_new = ((lit - 255.0 * edge - spec) * gain
+                                + bias[c] * (1.0 - edge)
+                                + 255.0 * edge
+                                + spec)
+                                .clamp(0.0, 255.0);
+                            pixels[i + c] = (lit_new * a).round().clamp(0.0, 255.0) as u8;
+                        }
+                    }
+                }
+            }
         }
-        restack(hwnd, &ps, Some([l, t, w, h]));
+        restack(hwnd, &ps, Some([l, t, w, h]), false);
         if buffer.upload(hwnd) {
             bridge.uploads += 1;
-            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            restack(hwnd, &ps, None, true);
             bridge.panes = ps;
             bridge.opacities = opacities;
+            bridge.frosts = frosts;
             bridge.wallpaper = wallpaper;
             bridge.material = material;
             s.bridges.push(bridge);
@@ -1411,7 +2074,7 @@ mod tests {
                     topmost: true,
                 },
             ];
-            restack(bridge, &panes, None);
+            restack(bridge, &panes, None, false);
             let mut w = GetTopWindow(null_mut());
             let mut ranks = HashMap::new();
             for rank in 0..4096 {
@@ -1425,7 +2088,10 @@ mod tests {
                 ranks[&(controls as usize)] < ranks[&(bridge as usize)],
                 "bridge must not cover General Settings"
             );
-            assert!(ranks[&(a as usize)].min(ranks[&(b as usize)]) < ranks[&(bridge as usize)]);
+            assert!(
+                ranks[&(a as usize)].max(ranks[&(b as usize)]) < ranks[&(bridge as usize)],
+                "bridge must sit strictly below every member pane"
+            );
             assert!(GetWindow(bridge, GW_OWNER).is_null());
             for h in [bridge, controls, b, a] {
                 DestroyWindow(h);
@@ -1715,7 +2381,7 @@ mod tests {
             let widget_glass = Glass::fixture_tiled_file(&wave_path, 14.0, 1.0);
             init(Rc::new(RefCell::new(Glass::fixture_tiled_file(&wave_path, 14.0, 1.0))));
             let instance = GetModuleHandleW(null());
-            let (ox, oy) = (-(cw as i32) * 32, -(ch as i32) * 48);
+            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
 
             // L-junction cluster with deliberate 2px edge step between Clock (x=40) and Notes (x=42):
             // Clock [40..300, 40..230] (pane [44..296, 44..226]) — warm sunset orange chrome
@@ -1914,6 +2580,1343 @@ mod tests {
             }
             shutdown();
             MANAGER.with(|m| assert!(m.borrow().is_none()));
+        }
+    }
+
+    #[test]
+    fn gpu_bridge_is_click_through_and_below_all_members() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            init(Rc::new(RefCell::new(Glass::new(0., 1.))));
+            let instance = GetModuleHandleW(null());
+            let make_widget = |x: i32, y: i32| {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                    wide("STATIC").as_ptr(),
+                    wide("Lumen click-through test widget").as_ptr(),
+                    WS_POPUP | WS_VISIBLE,
+                    x,
+                    y,
+                    60,
+                    60,
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+                hwnd
+            };
+            let w1 = make_widget(8, 8);
+            let w2 = make_widget(68, 8);
+            let bridge = CreateWindowExW(
+                WS_EX_NOREDIRECTIONBITMAP
+                    | WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_NOACTIVATE
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_TOPMOST,
+                wide("LumenNativeFusionSurface").as_ptr(),
+                null(),
+                WS_POPUP | WS_DISABLED,
+                0,
+                0,
+                140,
+                80,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!bridge.is_null());
+            let mut constants = crate::gpu::FusionBridgeConstants {
+                bridge_rect: [0., 0., 140., 80.],
+                desktop_rect: [0., 0., 1920., 1080.],
+                params: [1., 8., 0., 0.],
+                accent_flags: [0.2, 0.3, 0.4, 0.],
+                counts: [2, 2, 0, 0],
+                ..Default::default()
+            };
+            constants.pane_rects[0] = [8., 8., 68., 68.];
+            constants.pane_rects[1] = [68., 8., 128., 68.];
+            constants.pane_meta[0] = [16., 1., 1., 0.];
+            constants.pane_meta[1] = [16., 1., 1., 0.];
+            constants.member_windows[0] = [8., 8., 68., 68.];
+            constants.member_windows[1] = [68., 8., 128., 68.];
+            if crate::gpu::available() {
+                assert!(
+                    crate::gpu::present_fusion_bridge(bridge, &constants),
+                    "DirectComposition bridge must accept WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT"
+                );
+            }
+            let panes = [
+                Pane {
+                    id: w1 as usize,
+                    rect: [8., 8., 68., 68.],
+                    radius: 16.,
+                    dpi: 1.,
+                    topmost: true,
+                },
+                Pane {
+                    id: w2 as usize,
+                    rect: [68., 8., 128., 68.],
+                    radius: 16.,
+                    dpi: 1.,
+                    topmost: true,
+                },
+            ];
+            // Even if placed above both widgets, the bridge must remain click-through.
+            SetWindowPos(
+                bridge,
+                HWND_TOP,
+                0,
+                0,
+                140,
+                80,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            assert_ne!(
+                WindowFromPoint(POINT { x: 38, y: 38 }),
+                bridge,
+                "bridge HWND must be click-through"
+            );
+            // Showing via restack must place bridge visible and strictly below every member.
+            ShowWindow(bridge, SW_HIDE);
+            restack(bridge, &panes, Some([0, 0, 140, 80]), true);
+            assert_ne!(IsWindowVisible(bridge), 0);
+            let mut w = GetTopWindow(null_mut());
+            let mut ranks = HashMap::new();
+            for rank in 0..4096 {
+                if w.is_null() {
+                    break;
+                }
+                ranks.insert(w as usize, rank);
+                w = GetWindow(w, GW_HWNDNEXT);
+            }
+            assert!(
+                ranks[&(w1 as usize)].max(ranks[&(w2 as usize)]) < ranks[&(bridge as usize)],
+                "restack(..., show=true) must keep bridge below all member widgets"
+            );
+            assert_ne!(WindowFromPoint(POINT { x: 38, y: 38 }), bridge);
+            crate::gpu::remove_surface(bridge);
+            DestroyWindow(bridge);
+            DestroyWindow(w2);
+            DestroyWindow(w1);
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn frosted_l_junction_over_diagonal_wallpaper_preserves_diagonal_variation() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_frosted_glass(self.0);
+                crate::glass::set_liquid_glass(self.1);
+            }
+        }
+        let _reset = Reset(
+            crate::glass::frosted_glass(),
+            crate::glass::liquid_glass(),
+        );
+        crate::glass::set_frosted_glass(true);
+        crate::glass::set_liquid_glass(true);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-diag-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (620usize, 420usize);
+        let diag_path = temp_dir.join("diag-stripe.png");
+        let mut diag_img = image::RgbaImage::new(cw as u32, ch as u32);
+        for y in 0..ch {
+            for x in 0..cw {
+                let phase = (x as f32 + y as f32) * std::f32::consts::TAU / 120.0;
+                let s = phase.sin() * 0.5 + 0.5;
+                let r = (35.0 + 195.0 * s).round().clamp(0.0, 255.0) as u8;
+                let g = (65.0 + 135.0 * (1.0 - s)).round().clamp(0.0, 255.0) as u8;
+                let b = (215.0 - 155.0 * s).round().clamp(0.0, 255.0) as u8;
+                diag_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        diag_img.save(&diag_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&diag_path, 14.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(
+                &diag_path, 14.0, 1.0,
+            ))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            let specs = [
+                ([ox + 40, oy + 40, 260, 190], [230.0f32, 160.0, 120.0]),
+                ([ox + 42, oy + 222, 180, 160], [110.0f32, 150.0, 210.0]),
+                ([ox + 292, oy + 40, 288, 342], [45.0f32, 100.0, 210.0]),
+            ];
+            let mut windows = Vec::new();
+            for (rect, _) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Frosted diagonal verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, tint)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    let brush = CreateSolidBrush(0x281e18);
+                    FillRect(
+                        frame.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: w,
+                            bottom: h,
+                        },
+                        brush,
+                    );
+                    DeleteObject(brush);
+                    widget_glass.draw_blended(frame.dc, hwnd, w, h, 215);
+                    {
+                        let px = frame.pixels_mut();
+                        let mix = 0.25f32;
+                        for p in px.chunks_exact_mut(4) {
+                            p[0] = (p[0] as f32 * (1.0 - mix) + tint[2] * mix).round() as u8;
+                            p[1] = (p[1] as f32 * (1.0 - mix) + tint[1] * mix).round() as u8;
+                            p[2] = (p[2] as f32 * (1.0 - mix) + tint[0] * mix).round() as u8;
+                        }
+                    }
+                    frame.background_alpha_for(hwnd, 255);
+                    frame.bevel_for(hwnd);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let member_caps: Vec<_> = windows
+                .iter()
+                .map(|&h| crate::compositor::test_capture::get(h).expect("member upload"))
+                .collect();
+
+            // Sample directly inside both opaque concave bridge fillets at y = 231
+            // (outside member windows: left fillet x=223..=229, right fillet x=285..=291)
+            // and along the left concave bridge vertical edge (x=223, y=231..=237).
+            let sample_bridge = |gx: i32, gy: i32| -> [u8; 4] {
+                let bx = gx - (bridge_cap.rect[0] - ox);
+                let by = gy - (bridge_cap.rect[1] - oy);
+                let bi = ((by * bridge_cap.w + bx) * 4) as usize;
+                [
+                    bridge_cap.bgra[bi],
+                    bridge_cap.bgra[bi + 1],
+                    bridge_cap.bgra[bi + 2],
+                    bridge_cap.bgra[bi + 3],
+                ]
+            };
+
+            let mut min_r_bridge = 255u8;
+            let mut max_r_bridge = 0u8;
+            let mut min_b_bridge = 255u8;
+            let mut max_b_bridge = 0u8;
+            for x in (223..=229).chain(285..=291) {
+                let p = sample_bridge(x, 231);
+                assert!(
+                    p[3] > 200,
+                    "concave bridge pixel ({x}, 231) must be opaque (alpha={})",
+                    p[3]
+                );
+                min_r_bridge = min_r_bridge.min(p[2]);
+                max_r_bridge = max_r_bridge.max(p[2]);
+                min_b_bridge = min_b_bridge.min(p[0]);
+                max_b_bridge = max_b_bridge.max(p[0]);
+            }
+            assert!(
+                (max_r_bridge - min_r_bridge) >= 30 && (max_b_bridge - min_b_bridge) >= 30,
+                "concave bridge fillets at y=231 must preserve diagonal stripe variation (R={min_r_bridge}..{max_r_bridge}, B={min_b_bridge}..{max_b_bridge})"
+            );
+            for y in 231..=237 {
+                let p = sample_bridge(223, y);
+                assert!(
+                    p[3] > 200,
+                    "concave bridge pixel (223, {y}) must be opaque (alpha={})",
+                    p[3]
+                );
+            }
+
+            // Composite bridge + member uploads to verify that fused seam blending
+            // never smears column 0 horizontally across neighbor panels or concave joins.
+            let mut canvas = diag_img.clone();
+            let blend_cap =
+                |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                    let lx0 = cap.rect[0] - ox;
+                    let ly0 = cap.rect[1] - oy;
+                    for y in 0..cap.h {
+                        let cy = ly0 + y;
+                        if cy < 0 || cy >= ch as i32 {
+                            continue;
+                        }
+                        for x in 0..cap.w {
+                            let cx = lx0 + x;
+                            if cx < 0 || cx >= cw as i32 {
+                                continue;
+                            }
+                            let si = ((y * cap.w + x) * 4) as usize;
+                            let a = cap.bgra[si + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let inv = 255 - a;
+                            let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                            p.0[0] = (cap.bgra[si + 2] as u32
+                                + (p.0[0] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[1] = (cap.bgra[si + 1] as u32
+                                + (p.0[1] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[3] = 255;
+                        }
+                    }
+                };
+            blend_cap(&mut canvas, &bridge_cap);
+            for mc in &member_caps {
+                blend_cap(&mut canvas, mc);
+            }
+
+            let mut min_r_h = 255u8;
+            let mut max_r_h = 0u8;
+            let mut min_b_h = 255u8;
+            let mut max_b_h = 0u8;
+            for x in 240u32..=360 {
+                let p = canvas.get_pixel(x, 140).0;
+                min_r_h = min_r_h.min(p[0]);
+                max_r_h = max_r_h.max(p[0]);
+                min_b_h = min_b_h.min(p[2]);
+                max_b_h = max_b_h.max(p[2]);
+            }
+            assert!(
+                (max_r_h - min_r_h) >= 40 && (max_b_h - min_b_h) >= 40,
+                "horizontal slice across fused seam band must preserve diagonal stripe variation (R={min_r_h}..{max_r_h}, B={min_b_h}..{max_b_h})"
+            );
+
+            let mut min_r_v = 255u8;
+            let mut max_r_v = 0u8;
+            for y in 160u32..=235 {
+                let p = canvas.get_pixel(224, y).0;
+                min_r_v = min_r_v.min(p[0]);
+                max_r_v = max_r_v.max(p[0]);
+            }
+            assert!(
+                (max_r_v - min_r_v) >= 25,
+                "vertical slice from member into concave bridge must preserve diagonal stripe variation (R={min_r_v}..{max_r_v})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn controls_zero_tint_fused_with_clock_tinted_gradient_has_smooth_seam_and_concave_corner() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_frosted_glass(self.0);
+                crate::glass::set_liquid_glass(self.1);
+            }
+        }
+        let _reset = Reset(
+            crate::glass::frosted_glass(),
+            crate::glass::liquid_glass(),
+        );
+        crate::glass::set_frosted_glass(true);
+        crate::glass::set_liquid_glass(true);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-affine-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (520usize, 360usize);
+        let wall_path = temp_dir.join("cool-gradient.png");
+        let mut wall_img = image::RgbaImage::new(cw as u32, ch as u32);
+        for y in 0..ch {
+            for x in 0..cw {
+                let t = (x as f32 / cw as f32 * 0.6 + y as f32 / ch as f32 * 0.4).clamp(0.0, 1.0);
+                let r = (32.0 + 28.0 * t).round() as u8;
+                let g = (74.0 + 36.0 * t).round() as u8;
+                let b = (182.0 + 40.0 * t).round() as u8;
+                wall_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        wall_img.save(&wall_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&wall_path, 14.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(
+                &wall_path, 14.0, 1.0,
+            ))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            // Left: 0% tint (Control Center style); Right: 26% warm tint (Clock style),
+            // shorter vertically to form a concave L-junction corner at (236, 196).
+            let specs = [
+                ([ox + 40, oy + 40, 200, 260], 0.0f32),
+                ([ox + 232, oy + 40, 200, 160], 0.26f32),
+            ];
+            let warm_tint = [245.0f32, 165.0, 75.0];
+            let mut windows = Vec::new();
+            for (rect, _) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Affine seam verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, mix)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    let brush = CreateSolidBrush(0x281e18);
+                    FillRect(
+                        frame.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: w,
+                            bottom: h,
+                        },
+                        brush,
+                    );
+                    DeleteObject(brush);
+                    widget_glass.draw_blended(frame.dc, hwnd, w, h, 255);
+                    if *mix > 0.0 {
+                        let px = frame.pixels_mut();
+                        for p in px.chunks_exact_mut(4) {
+                            p[0] = (p[0] as f32 * (1.0 - mix) + warm_tint[2] * mix).round() as u8;
+                            p[1] = (p[1] as f32 * (1.0 - mix) + warm_tint[1] * mix).round() as u8;
+                            p[2] = (p[2] as f32 * (1.0 - mix) + warm_tint[0] * mix).round() as u8;
+                        }
+                    }
+                    frame.background_alpha_for(hwnd, 255);
+                    frame.bevel_for(hwnd);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let member_caps: Vec<_> = windows
+                .iter()
+                .map(|&h| crate::compositor::test_capture::get(h).expect("member upload"))
+                .collect();
+
+            let mut canvas = wall_img.clone();
+            let blend_cap =
+                |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                    let lx0 = cap.rect[0] - ox;
+                    let ly0 = cap.rect[1] - oy;
+                    for y in 0..cap.h {
+                        let cy = ly0 + y;
+                        if cy < 0 || cy >= ch as i32 {
+                            continue;
+                        }
+                        for x in 0..cap.w {
+                            let cx = lx0 + x;
+                            if cx < 0 || cx >= cw as i32 {
+                                continue;
+                            }
+                            let si = ((y * cap.w + x) * 4) as usize;
+                            let a = cap.bgra[si + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let inv = 255 - a;
+                            let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                            p.0[0] = (cap.bgra[si + 2] as u32
+                                + (p.0[0] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[1] = (cap.bgra[si + 1] as u32
+                                + (p.0[1] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[3] = 255;
+                        }
+                    }
+                };
+            blend_cap(&mut canvas, &bridge_cap);
+            for mc in &member_caps {
+                blend_cap(&mut canvas, mc);
+            }
+
+            // Left interior (0% tint) vs right interior (26% warm tint) must remain distinct.
+            let left_core = canvas.get_pixel(120, 110).0;
+            let right_core = canvas.get_pixel(350, 110).0;
+            assert!(
+                right_core[0] > left_core[0] + 25 && left_core[2] > right_core[2] + 15,
+                "expected 0% left ({left_core:?}) vs 26% warm right ({right_core:?})"
+            );
+
+            // Across the seam (x = 216..=256 at y = 110), adjacent pixel steps must stay smooth.
+            let mut max_step = 0i32;
+            for x in 216u32..256 {
+                let p0 = canvas.get_pixel(x, 110).0;
+                let p1 = canvas.get_pixel(x + 1, 110).0;
+                for c in 0..3 {
+                    max_step = max_step.max((p1[c] as i32 - p0[c] as i32).abs());
+                }
+            }
+            assert!(
+                max_step <= 10,
+                "seam transition between 0% and 26% tint panes must be smooth (max_step={max_step})"
+            );
+
+            // Concave L-junction fillet (outside both member windows at x=242, y=202) must be
+            // opaque (no corner notch) and hand over smoothly from the left member across x=234..242.
+            let bx = 242 - (bridge_cap.rect[0] - ox);
+            let by = 202 - (bridge_cap.rect[1] - oy);
+            let bi = ((by * bridge_cap.w + bx) * 4) as usize;
+            assert!(
+                bridge_cap.bgra[bi + 3] > 200,
+                "concave L-junction corner must be opaque without notch (alpha={})",
+                bridge_cap.bgra[bi + 3]
+            );
+            let mut corner_step = 0i32;
+            for x in 234u32..242 {
+                let p0 = canvas.get_pixel(x, 202).0;
+                let p1 = canvas.get_pixel(x + 1, 202).0;
+                for c in 0..3 {
+                    corner_step = corner_step.max((p1[c] as i32 - p0[c] as i32).abs());
+                }
+            }
+            assert!(
+                corner_step <= 12,
+                "concave L-junction member-to-bridge handover must stay smooth (corner_step={corner_step})"
+            );
+            let fillet_px = canvas.get_pixel(242, 202).0;
+            let neighbor_px = canvas.get_pixel(236, 202).0;
+            let corner_diff = (0..3)
+                .map(|c| (fillet_px[c] as i32 - neighbor_px[c] as i32).abs())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                corner_diff <= 24,
+                "concave corner ({fillet_px:?}) must transition smoothly from neighbor ({neighbor_px:?})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn high_tint_afterglow_controls_fused_with_wide_zero_tint_dock_has_no_seam_step() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_frosted_glass(self.0);
+                crate::glass::set_liquid_glass(self.1);
+            }
+        }
+        let _reset = Reset(
+            crate::glass::frosted_glass(),
+            crate::glass::liquid_glass(),
+        );
+        crate::glass::set_frosted_glass(true);
+        crate::glass::set_liquid_glass(true);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-afterglow-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (1500usize, 420usize);
+        let wall_path = temp_dir.join("wave-wallpaper.png");
+        let mut wall_img = image::RgbaImage::new(cw as u32, ch as u32);
+        for y in 0..ch {
+            for x in 0..cw {
+                let wx = (x as f32 * 0.032).sin() * 0.5 + 0.5;
+                let wy = (y as f32 * 0.028).cos() * 0.5 + 0.5;
+                let w = 0.65 * wx + 0.35 * wy;
+                let r = (30.0 + 200.0 * w).round() as u8;
+                let g = (40.0 + 185.0 * (1.0 - w * 0.7)).round() as u8;
+                let b = (225.0 - 190.0 * w).round() as u8;
+                wall_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        wall_img.save(&wall_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&wall_path, 14.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(
+                &wall_path, 14.0, 1.0,
+            ))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-(cw as i32) * 10, -(ch as i32) * 20);
+            // Left: 65% 2D gradient orange/lavender tint (Controls style);
+            // Right: wide (1120px, so gw > 64) 0% tint pane (Dock style).
+            let specs = [
+                ([ox + 40, oy + 40, 260, 320], 0.65f32),
+                ([ox + 292, oy + 40, 1120, 240], 0.0f32),
+            ];
+            let mut windows = Vec::new();
+            for (rect, _) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Afterglow wide dock verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, mix)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    let brush = CreateSolidBrush(0x281e18);
+                    FillRect(
+                        frame.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: w,
+                            bottom: h,
+                        },
+                        brush,
+                    );
+                    DeleteObject(brush);
+                    widget_glass.draw_blended(frame.dc, hwnd, w, h, 255);
+                    if *mix > 0.0 {
+                        let px = frame.pixels_mut();
+                        for y in 0..h {
+                            let ty = y as f32 / h as f32;
+                            for x in 0..w {
+                                let tx = x as f32 / w as f32;
+                                let tr = 245.0 * (1.0 - ty) + 185.0 * ty;
+                                let tg = 140.0 * (1.0 - tx) + 130.0 * tx;
+                                let tb = 60.0 * (1.0 - ty) + 235.0 * ty;
+                                let i = ((y * w + x) * 4) as usize;
+                                px[i] = (px[i] as f32 * (1.0 - mix) + tb * mix).round() as u8;
+                                px[i + 1] =
+                                    (px[i + 1] as f32 * (1.0 - mix) + tg * mix).round() as u8;
+                                px[i + 2] =
+                                    (px[i + 2] as f32 * (1.0 - mix) + tr * mix).round() as u8;
+                            }
+                        }
+                    }
+                    frame.background_alpha_for(hwnd, 255);
+                    frame.bevel_for(hwnd);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let dock_field =
+                shared_material(windows[1], specs[1].0[2], specs[1].0[3], 1.0).expect("wide field");
+            assert!(
+                dock_field.width > 64,
+                "wide dock field must exceed 64 grid cells (width={})",
+                dock_field.width
+            );
+            let mut min_b = f32::MAX;
+            let mut max_b = f32::MIN;
+            for y in 0..dock_field.height {
+                let v = dock_field.bgr[y * dock_field.width][0];
+                min_b = min_b.min(v);
+                max_b = max_b.max(v);
+            }
+            assert!(
+                max_b - min_b > 12.0,
+                "wide shared_material must sample real wave wallpaper instead of flat 128 fallback (delta range={min_b:.2}..{max_b:.2})"
+            );
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let member_caps: Vec<_> = windows
+                .iter()
+                .map(|&h| crate::compositor::test_capture::get(h).expect("member upload"))
+                .collect();
+
+            let mut canvas = wall_img.clone();
+            let blend_cap =
+                |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                    let lx0 = cap.rect[0] - ox;
+                    let ly0 = cap.rect[1] - oy;
+                    for y in 0..cap.h {
+                        let cy = ly0 + y;
+                        if cy < 0 || cy >= ch as i32 {
+                            continue;
+                        }
+                        for x in 0..cap.w {
+                            let cx = lx0 + x;
+                            if cx < 0 || cx >= cw as i32 {
+                                continue;
+                            }
+                            let si = ((y * cap.w + x) * 4) as usize;
+                            let a = cap.bgra[si + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let inv = 255 - a;
+                            let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                            p.0[0] = (cap.bgra[si + 2] as u32
+                                + (p.0[0] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[1] = (cap.bgra[si + 1] as u32
+                                + (p.0[1] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[3] = 255;
+                        }
+                    }
+                };
+            blend_cap(&mut canvas, &bridge_cap);
+            for mc in &member_caps {
+                blend_cap(&mut canvas, mc);
+            }
+
+            // Left interior (65% tint) stays strongly shifted from underlying wave wallpaper,
+            // while far-right interior (0% tint) stays close to the wallpaper.
+            let left_diff = (0..3)
+                .map(|c| {
+                    (canvas.get_pixel(110, 140).0[c] as i32 - wall_img.get_pixel(110, 140).0[c] as i32)
+                        .abs()
+                })
+                .max()
+                .unwrap_or(0);
+            let right_diff = (0..3)
+                .map(|c| {
+                    (canvas.get_pixel(900, 140).0[c] as i32 - wall_img.get_pixel(900, 140).0[c] as i32)
+                        .abs()
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                left_diff > 70 && right_diff < 45 && left_diff > right_diff + 40,
+                "expected distinct 65% left tint (diff={left_diff}) vs 0% right dock (diff={right_diff})"
+            );
+
+            // Vertical seam row at y=140 crossing x=276..316 must have no hard step.
+            let mut max_step = 0i32;
+            for x in 276u32..316 {
+                let p0 = canvas.get_pixel(x, 140).0;
+                let p1 = canvas.get_pixel(x + 1, 140).0;
+                for c in 0..3 {
+                    max_step = max_step.max((p1[c] as i32 - p0[c] as i32).abs());
+                }
+            }
+            assert!(
+                max_step <= 8,
+                "high-tint 65% Controls to 0% wide Dock seam must have no step (max_step={max_step})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn pure_overlay_high_tint_controls_and_zero_tint_dock_have_zero_seam_and_zero_stretch() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_frosted_glass(self.0);
+                crate::glass::set_liquid_glass(self.1);
+            }
+        }
+        let _reset = Reset(
+            crate::glass::frosted_glass(),
+            crate::glass::liquid_glass(),
+        );
+        crate::glass::set_frosted_glass(true);
+        crate::glass::set_liquid_glass(true);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-pure-overlay-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (800usize, 400usize);
+        let wall_path = temp_dir.join("diag-wave-wallpaper.png");
+        let mut wall_img = image::RgbaImage::new(cw as u32, ch as u32);
+        for y in 0..ch {
+            for x in 0..cw {
+                let phase = (x as f32 * 0.09 + y as f32 * 0.07).sin();
+                let ridge = (phase * 0.5 + 0.5).powf(2.0);
+                let r = (25.0 + 210.0 * ridge).round() as u8;
+                let g = (45.0 + 185.0 * (1.0 - ridge * 0.65)).round() as u8;
+                let b = (225.0 - 180.0 * ridge).round() as u8;
+                wall_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        wall_img.save(&wall_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&wall_path, 4.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(
+                &wall_path, 4.0, 1.0,
+            ))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-15000, -8400);
+            let specs = [
+                ([ox, oy, 269, 300], true),
+                ([ox + 261, oy, 413, 300], false),
+            ];
+            let mut windows = Vec::new();
+            for (rect, _) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Pure overlay fusion verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, is_controls)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    widget_glass.draw_blended(frame.dc, hwnd, w, h, 255);
+                    let is_fused = fused(hwnd);
+                    let pane = if is_fused {
+                        [0.0, 0.0, w as f32, h as f32]
+                    } else {
+                        [4.0, 4.0, w as f32 - 4.0, h as f32 - 4.0]
+                    };
+                    let r_rad = if is_fused { 0.0 } else { 30.0 };
+                    frame.paint_frosted_chrome_for(hwnd, true, |dc| {
+                        let c = crate::render::Canvas::new(dc, 1.0);
+                        if *is_controls {
+                            crate::surface::paint(&c, pane, "gradient:afterglow", 1.0);
+                            c.coating(pane, r_rad);
+                            c.draw_pane_overlay([w as u32, h as u32], 1.0, 1.0, false, pane);
+                        } else {
+                            c.draw_pane_overlay([w as u32, h as u32], 1.0, 0.0, false, pane);
+                        }
+                    });
+                    frame.background_alpha_for(hwnd, 255);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let left_cap =
+                crate::compositor::test_capture::get(windows[0]).expect("left upload");
+            let right_cap =
+                crate::compositor::test_capture::get(windows[1]).expect("right upload");
+
+            let mut canvas = wall_img.clone();
+            let blend_cap =
+                |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                    let lx0 = cap.rect[0] - ox;
+                    let ly0 = cap.rect[1] - oy;
+                    for y in 0..cap.h {
+                        let cy = ly0 + y;
+                        if cy < 0 || cy >= ch as i32 {
+                            continue;
+                        }
+                        for x in 0..cap.w {
+                            let cx = lx0 + x;
+                            if cx < 0 || cx >= cw as i32 {
+                                continue;
+                            }
+                            let si = ((y * cap.w + x) * 4) as usize;
+                            let a = cap.bgra[si + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let inv = 255 - a;
+                            let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                            p.0[0] = (cap.bgra[si + 2] as u32
+                                + (p.0[0] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[1] = (cap.bgra[si + 1] as u32
+                                + (p.0[1] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[3] = 255;
+                        }
+                    }
+                };
+            blend_cap(&mut canvas, &bridge_cap);
+            blend_cap(&mut canvas, &left_cap);
+            blend_cap(&mut canvas, &right_cap);
+
+            // 1. Across the vertical seam: discrete 2nd-difference kink across interior rows <= 8
+            // (isolates any seam step/discontinuity without conflating smooth diagonal wallpaper slope).
+            let mut max_seam_kink = 0i32;
+            for y in 40..260 {
+                let p263 = canvas.get_pixel(263, y as u32).0;
+                let p264 = canvas.get_pixel(264, y as u32).0;
+                let p265 = canvas.get_pixel(265, y as u32).0;
+                let p266 = canvas.get_pixel(266, y as u32).0;
+                for c in 0..3 {
+                    let d_left = p264[c] as i32 - p263[c] as i32;
+                    let d_seam = p265[c] as i32 - p264[c] as i32;
+                    let d_right = p266[c] as i32 - p265[c] as i32;
+                    let kink = (d_seam - d_left).abs().max((d_seam - d_right).abs());
+                    max_seam_kink = max_seam_kink.max(kink);
+                }
+                let li = ((y * left_cap.w + (left_cap.w - 5)) * 4) as usize;
+                let ri = ((y * right_cap.w + 4) * 4) as usize;
+                let ri_next = ((y * right_cap.w + 5) * 4) as usize;
+                for c in 0..3 {
+                    let d_seam = right_cap.bgra[ri + c] as i32 - left_cap.bgra[li + c] as i32;
+                    let d_right = right_cap.bgra[ri_next + c] as i32 - right_cap.bgra[ri + c] as i32;
+                    max_seam_kink = max_seam_kink.max((d_seam - d_right).abs());
+                }
+            }
+            assert!(
+                max_seam_kink <= 8,
+                "pure overlay seam kink must be <= 8 across interior rows (max_seam_kink={max_seam_kink})"
+            );
+
+            // 2. Inside the blend zone on left widget (x in (w - 110)..(w - 15)):
+            // emerging diagonal ridges must have genuine diagonal variation rather than a flat stretch bar.
+            let lw = left_cap.w;
+            let mut step_sum = 0.0f32;
+            let mut step_count = 0usize;
+            let mut row_phase_diff = 0.0f32;
+            let mut row_phase_count = 0usize;
+            for y in 80..220 {
+                for x in (lw - 110)..(lw - 15) {
+                    let i0 = ((y * lw + x) * 4) as usize;
+                    let i1 = ((y * lw + x + 1) * 4) as usize;
+                    let diff = (0..3)
+                        .map(|c| (left_cap.bgra[i1 + c] as f32 - left_cap.bgra[i0 + c] as f32).abs())
+                        .fold(0.0f32, f32::max);
+                    step_sum += diff;
+                    step_count += 1;
+                    if y + 32 < 220 {
+                        let i2 = (((y + 32) * lw + x) * 4) as usize;
+                        let vdiff = (0..3)
+                            .map(|c| {
+                                (left_cap.bgra[i2 + c] as f32 - left_cap.bgra[i0 + c] as f32).abs()
+                            })
+                            .fold(0.0f32, f32::max);
+                        row_phase_diff += vdiff;
+                        row_phase_count += 1;
+                    }
+                }
+            }
+            let mut interior_dx_sum = 0.0f32;
+            let mut interior_dx_count = 0usize;
+            for y in 80..220 {
+                for x in 12..52 {
+                    let i0 = ((y * lw + x) * 4) as usize;
+                    let i1 = ((y * lw + x + 1) * 4) as usize;
+                    let diff = (0..3)
+                        .map(|c| (left_cap.bgra[i1 + c] as f32 - left_cap.bgra[i0 + c] as f32).abs())
+                        .fold(0.0f32, f32::max);
+                    interior_dx_sum += diff;
+                    interior_dx_count += 1;
+                }
+            }
+            let mean_dx = step_sum / step_count.max(1) as f32;
+            let mean_dy = row_phase_diff / row_phase_count.max(1) as f32;
+            let interior_dx = interior_dx_sum / interior_dx_count.max(1) as f32;
+            // Compare retained texture contrast, not a required contrast boost.
+            // Bounded rim magnification now preserves more texture in the
+            // reference strip too; that must not count as a stretched bridge.
+            assert!(
+                mean_dx > 0.6 && mean_dy > 4.0 && mean_dx >= interior_dx * 0.90,
+                "blend zone must reveal genuine diagonal wallpaper ridges (mean_dx={mean_dx:.3}, mean_dy={mean_dy:.3}, interior_dx={interior_dx:.3})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn fused_frost_strength_blends_smoothly_across_seam_from_zero_to_full() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_frosted_glass(self.0);
+                crate::glass::set_liquid_glass(self.1);
+            }
+        }
+        let _reset = Reset(
+            crate::glass::frosted_glass(),
+            crate::glass::liquid_glass(),
+        );
+        crate::glass::set_frosted_glass(true);
+        crate::glass::set_liquid_glass(true);
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lumen-fusion-frost-blend-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        struct CleanupDir(std::path::PathBuf);
+        impl Drop for CleanupDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = CleanupDir(temp_dir.clone());
+
+        let (cw, ch) = (800usize, 400usize);
+        let wall_path = temp_dir.join("frost-stripe-wallpaper.png");
+        let mut wall_img = image::RgbaImage::new(cw as u32, ch as u32);
+        for y in 0..ch {
+            for x in 0..cw {
+                let v = (x as f32 * 0.22 + y as f32 * 0.12).sin() * 0.5 + 0.5;
+                let r = (20.0 + 220.0 * v).round() as u8;
+                let g = (40.0 + 190.0 * (1.0 - v)).round() as u8;
+                let b = (220.0 - 160.0 * v).round() as u8;
+                wall_img.put_pixel(x as u32, y as u32, image::Rgba([r, g, b, 255]));
+            }
+        }
+        wall_img.save(&wall_path).unwrap();
+
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            let widget_glass = Glass::fixture_tiled_file(&wall_path, 18.0, 1.0);
+            init(Rc::new(RefCell::new(Glass::fixture_tiled_file(
+                &wall_path, 18.0, 1.0,
+            ))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-15000, -8400);
+            let specs = [
+                ([ox, oy, 269, 300], 0u8),
+                ([ox + 261, oy, 413, 300], 255u8),
+            ];
+            let mut windows = Vec::new();
+            for (rect, frost) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Frost blend verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 30.0);
+                frost_strength(hwnd, *frost);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, frost)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 30.0).unwrap();
+                    if let Some(blend) = shared_frost(hwnd, w, h, *frost) {
+                        widget_glass.draw_with_frost(frame.dc, hwnd, w, h, |x, y| {
+                            blend.sample_local(x, y)
+                        });
+                    } else {
+                        widget_glass.draw_blended(frame.dc, hwnd, w, h, *frost);
+                    }
+                    let is_fused = fused(hwnd);
+                    let pane = if is_fused {
+                        [0.0, 0.0, w as f32, h as f32]
+                    } else {
+                        [4.0, 4.0, w as f32 - 4.0, h as f32 - 4.0]
+                    };
+                    frame.paint_frosted_chrome_for(hwnd, true, |dc| {
+                        let c = crate::render::Canvas::new(dc, 1.0);
+                        c.draw_pane_overlay([w as u32, h as u32], 1.0, 0.0, false, pane);
+                    });
+                    frame.background_alpha_for(hwnd, 255);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let left_cap =
+                crate::compositor::test_capture::get(windows[0]).expect("left upload");
+            let right_cap =
+                crate::compositor::test_capture::get(windows[1]).expect("right upload");
+
+            let mut canvas = wall_img.clone();
+            let blend_cap =
+                |canvas: &mut image::RgbaImage, cap: &crate::compositor::test_capture::CapturedUpload| {
+                    let lx0 = cap.rect[0] - ox;
+                    let ly0 = cap.rect[1] - oy;
+                    for y in 0..cap.h {
+                        let cy = ly0 + y;
+                        if cy < 0 || cy >= ch as i32 {
+                            continue;
+                        }
+                        for x in 0..cap.w {
+                            let cx = lx0 + x;
+                            if cx < 0 || cx >= cw as i32 {
+                                continue;
+                            }
+                            let si = ((y * cap.w + x) * 4) as usize;
+                            let a = cap.bgra[si + 3] as u32;
+                            if a == 0 {
+                                continue;
+                            }
+                            let inv = 255 - a;
+                            let p = canvas.get_pixel_mut(cx as u32, cy as u32);
+                            p.0[0] = (cap.bgra[si + 2] as u32
+                                + (p.0[0] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[1] = (cap.bgra[si + 1] as u32
+                                + (p.0[1] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[2] = (cap.bgra[si] as u32 + (p.0[2] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                            p.0[3] = 255;
+                        }
+                    }
+                };
+            blend_cap(&mut canvas, &bridge_cap);
+            blend_cap(&mut canvas, &left_cap);
+            blend_cap(&mut canvas, &right_cap);
+
+            let red_contrast = |cap: &crate::compositor::test_capture::CapturedUpload,
+                                x0: i32,
+                                x1: i32,
+                                y: i32| {
+                let mut mn = 255i32;
+                let mut mx = 0i32;
+                for x in x0..x1 {
+                    let r = cap.bgra[((y * cap.w + x) * 4 + 2) as usize] as i32;
+                    mn = mn.min(r);
+                    mx = mx.max(r);
+                }
+                mx - mn
+            };
+            let left_interior = red_contrast(&left_cap, 30, 90, 150);
+            let right_interior = red_contrast(&right_cap, 150, 250, 150);
+            assert!(
+                left_interior > 120,
+                "0% frost left interior must keep sharp stripe contrast (contrast={left_interior})"
+            );
+            assert!(
+                right_interior < 35,
+                "100% frost right interior must be strongly blurred (contrast={right_interior})"
+            );
+
+            let left_seam = red_contrast(&left_cap, left_cap.w - 35, left_cap.w - 4, 150);
+            let right_seam = red_contrast(&right_cap, 4, 35, 150);
+            assert!(
+                left_seam > right_interior + 25 && left_seam < left_interior - 25,
+                "left seam zone must have intermediate (~50%) contrast (left_seam={left_seam}, left_interior={left_interior}, right_interior={right_interior})"
+            );
+            assert!(
+                right_seam > right_interior + 25 && right_seam < left_interior - 25,
+                "right seam zone must have intermediate (~50%) contrast (right_seam={right_seam}, left_interior={left_interior}, right_interior={right_interior})"
+            );
+
+            let mut max_seam_kink = 0i32;
+            for y in 60..240 {
+                let p263 = canvas.get_pixel(263, y as u32).0;
+                let p264 = canvas.get_pixel(264, y as u32).0;
+                let p265 = canvas.get_pixel(265, y as u32).0;
+                let p266 = canvas.get_pixel(266, y as u32).0;
+                for c in 0..3 {
+                    let d_left = p264[c] as i32 - p263[c] as i32;
+                    let d_seam = p265[c] as i32 - p264[c] as i32;
+                    let d_right = p266[c] as i32 - p265[c] as i32;
+                    max_seam_kink = max_seam_kink
+                        .max((d_seam - d_left).abs())
+                        .max((d_seam - d_right).abs());
+                }
+                let li = ((y * left_cap.w + (left_cap.w - 5)) * 4) as usize;
+                let ri = ((y * right_cap.w + 4) * 4) as usize;
+                let ri_next = ((y * right_cap.w + 5) * 4) as usize;
+                for c in 0..3 {
+                    let d_seam = right_cap.bgra[ri + c] as i32 - left_cap.bgra[li + c] as i32;
+                    let d_right = right_cap.bgra[ri_next + c] as i32 - right_cap.bgra[ri + c] as i32;
+                    max_seam_kink = max_seam_kink.max((d_seam - d_right).abs());
+                }
+            }
+            assert!(
+                max_seam_kink <= 8,
+                "frost seam transition must have no abrupt discontinuity (max_seam_kink={max_seam_kink})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
         }
     }
 }

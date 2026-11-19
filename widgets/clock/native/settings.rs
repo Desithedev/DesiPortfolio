@@ -197,7 +197,6 @@ impl State {
             (THEME, Value::Choice(v)) if THEMES.iter().any(|t| t.0 == v) => self.config.theme = v,
             (ZONE, Value::Choice(v)) => match zone(&v) {
                 Ok(z) => {
-                    self.location_label = model::location_label(&v);
                     self.config.time_zone = v;
                     self.zone = z
                 }

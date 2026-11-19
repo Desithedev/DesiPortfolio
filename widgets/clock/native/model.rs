@@ -254,37 +254,6 @@ pub fn zone(id: &str) -> Result<Option<DYNAMIC_TIME_ZONE_INFORMATION>, String> {
         "Windows time zone {key} is unavailable. Config left untouched."
     ))
 }
-/// Display the selected clock-zone city, never a device geolocation lookup.
-pub fn location_label(id: &str) -> String {
-    let selected = if id == "local" {
-        unsafe {
-            let mut info: DYNAMIC_TIME_ZONE_INFORMATION = zeroed();
-            let status = GetDynamicTimeZoneInformation(&mut info);
-            let len = info
-                .TimeZoneKeyName
-                .iter()
-                .position(|v| *v == 0)
-                .unwrap_or(128);
-            let key = String::from_utf16_lossy(&info.TimeZoneKeyName[..len]);
-            if status != u32::MAX {
-                ZONES
-                    .iter()
-                    .find(|(_, win)| *win == key)
-                    .map(|(zone, _)| (*zone).to_owned())
-                    .unwrap_or_else(|| "Local time".into())
-            } else {
-                "Local time".into()
-            }
-        }
-    } else {
-        id.to_owned()
-    };
-    selected
-        .split('/')
-        .next_back()
-        .unwrap_or("Local time")
-        .replace('_', " ")
-}
 pub fn now(zone: &Option<DYNAMIC_TIME_ZONE_INFORMATION>) -> SYSTEMTIME {
     unsafe {
         let mut t = zeroed();
@@ -342,12 +311,6 @@ pub fn progress(t: &SYSTEMTIME) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn named_clock_zones_display_city_without_underscores() {
-        assert_eq!(location_label("Asia/Ho_Chi_Minh"), "Ho Chi Minh");
-        assert_eq!(location_label("America/New_York"), "New York");
-        assert_eq!(location_label("UTC"), "UTC");
-    }
     #[test]
     fn midnight_noon_and_day_progress() {
         let mut t: SYSTEMTIME = unsafe { zeroed() };

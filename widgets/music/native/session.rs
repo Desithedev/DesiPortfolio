@@ -11,7 +11,7 @@ pub(super) struct Snapshot {
     pub art_files: BTreeMap<String, String>,
     pub last_cover: Option<String>,
 }
-pub(super) const MAX_ART_FILES: usize = 10;
+pub(super) const MAX_ART_FILES: usize = 40;
 
 pub(super) fn valid_file(file: &str) -> bool {
     file.len() == 68
@@ -345,5 +345,10 @@ mod tests {
         );
         assert!(!valid_file("../../outside.img"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn max_art_files_accommodates_coverflow_cache() {
+        assert!(MAX_ART_FILES >= 40);
     }
 }

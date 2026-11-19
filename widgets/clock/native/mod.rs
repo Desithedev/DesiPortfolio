@@ -61,7 +61,6 @@ struct State {
     error: String,
     settings: Option<crate::settings_ui::Host>,
     theme_texture: Option<(String, render::Image)>,
-    location_label: String,
     afterglow_content: Option<(String, render::Image)>,
     anim_clock: Option<crate::motion::FrameClock>,
     frame_queued: bool,
@@ -80,7 +79,6 @@ impl Host {
         let mut config = Config::load(root)?;
         config.time_zone = "local".into();
         let zone = zone(&config.time_zone)?;
-        let location_label = model::location_label(&config.time_zone);
         let class = wide("LumenNativeClockWindow");
         let instance = GetModuleHandleW(null());
         let wc = WNDCLASSW {
@@ -138,7 +136,6 @@ impl Host {
             error: String::new(),
             settings: None,
             theme_texture: None,
-            location_label,
             afterglow_content: None,
             anim_clock: None,
             frame_queued: false,
@@ -495,58 +492,64 @@ impl State {
             if frosted && wallpaper_available {
                 self.draw_frost(frame.dc, r.right, r.bottom);
             }
-            let light = crate::accent::light(self.surface_color());
+            let surface_color = self.surface_color();
+            let light = crate::accent::light(surface_color);
             let tint = if frosted {
                 self.config.tint
             } else {
                 100.
             };
-            {
-                let c = Canvas::new(frame.dc, self.dpi);
-                if self.config.palette == "theme" {
-                    let key = format!("{}:{}:{}", self.config.theme, r.right, r.bottom);
-                    if self.theme_texture.as_ref().is_none_or(|(k, _)| *k != key) {
-                        self.theme_texture = render::Image::from_rgba(
-                            256,
-                            256,
-                            visuals::pixels(&self.config, 256, 256, w / h),
-                        )
-                        .map(|i| (key, i));
-                    }
-                    if let Some((_, image)) = &self.theme_texture {
-                        // Legacy artwork remains recognizable even when frost is on.
-                        c.image_alpha(
-                            image,
-                            [0., 0., w, h],
-                            if frosted {
-                                0.86 + 0.14 * tint / 100.
-                            } else {
-                                1.
-                            },
+            if self.config.palette == "theme" {
+                let key = format!("{}:{}:{}", self.config.theme, r.right, r.bottom);
+                if self.theme_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+                    self.theme_texture = render::Image::from_rgba(
+                        256,
+                        256,
+                        visuals::pixels(&self.config, 256, 256, w / h),
+                    )
+                    .map(|i| (key, i));
+                }
+            }
+            frame.paint_frosted_chrome_for(
+                self.hwnd,
+                frosted && wallpaper_available,
+                |chrome_dc| {
+                    let c = Canvas::new(chrome_dc, self.dpi);
+                    if self.config.palette == "theme" {
+                        if let Some((_, image)) = &self.theme_texture {
+                            // Legacy artwork remains recognizable even when frost is on.
+                            c.image_alpha(
+                                image,
+                                [0., 0., w, h],
+                                if frosted {
+                                    0.86 + 0.14 * tint / 100.
+                                } else {
+                                    1.
+                                },
+                            );
+                        }
+                    } else if !crate::surface::managed(&self.config.palette) {
+                        c.round(
+                            pane,
+                            radius,
+                            surface_color,
+                            (tint * 2.55).round() as u8,
+                            false,
+                            false,
                         );
                     }
-                } else if !crate::surface::managed(&self.config.palette) {
-                    c.round(
-                        pane,
-                        radius,
-                        self.surface_color(),
-                        (tint * 2.55).round() as u8,
-                        false,
-                        false,
+                    crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
+                    c.coating(pane, radius);
+                    c.draw_pane_overlay(
+                        [r.right as u32, r.bottom as u32],
+                        self.dpi,
+                        tint / 100.,
+                        light,
+                        [0., 0., w, h],
                     );
-                }
-                crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
-                c.coating(pane, radius);
-                c.draw_pane_overlay(
-                    [r.right as u32, r.bottom as u32],
-                    self.dpi,
-                    tint / 100.,
-                    light,
-                    [0., 0., w, h],
-                );
-                c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
-            }
-            frame.bevel_for(self.hwnd);
+                    c.widget_corner_reflection_for(self.hwnd, pane, radius, light);
+                },
+            );
             let l = crate::contrast::sample(frame.dc, self.dpi, [20., 20., w - 20., h - 20.]);
             (self.ink, self.muted) = crate::contrast::inks(l, None);
             let Some(bg) = self
@@ -589,9 +592,6 @@ impl State {
                 self.hover.map(header_action),
                 self.pressed.map(header_action),
             );
-            if self.config.theme == "sunset" {
-                face::draw_location(&c, w, h, &self.location_label, self.ink);
-            }
             if !self.error.is_empty() {
                 c.round(
                     [12., h - 43., w - 12., h - 10.],
@@ -748,7 +748,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_TIMECHANGE => {
-            s.location_label = model::location_label(&s.config.time_zone);
             s.arm();
             InvalidateRect(hwnd, null(), 0);
             0
@@ -910,14 +909,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             s.pressed = None;
             if s.moving || s.resizing {
-                s.moving = false;
-                s.resizing = false;
-                s.key.clear();
-            }
-            if msg == WM_CANCELMODE {
-                ReleaseCapture();
+                let st = &mut *s;
+                crate::widget_interaction::exit_size_move(hwnd, &mut st.moving, &mut st.resizing);
+                st.key.clear();
             }
             InvalidateRect(hwnd, null(), 0);
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+                drop(s);
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
             0
         }
         WM_CONTEXTMENU => {

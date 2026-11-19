@@ -121,14 +121,25 @@ pub(super) fn neighbor_index(selected: Option<usize>, len: usize, slot: i32) -> 
     (index >= 0 && index < len as i64).then_some(index as usize)
 }
 pub(super) fn selected_index(playback: &Playback) -> Option<usize> {
-    if !playback.video_id.is_empty() {
-        playback
-            .queue
-            .iter()
-            .position(|t| t.video_id == playback.video_id)
-    } else {
-        playback.queue.iter().position(|t| t.selected)
-    }
+    (!playback.video_id.is_empty())
+        .then(|| {
+            playback
+                .queue
+                .iter()
+                .position(|t| t.video_id == playback.video_id)
+        })
+        .flatten()
+        .or_else(|| playback.queue.iter().position(|t| t.selected))
+        .or_else(|| {
+            (!playback.title.is_empty()).then(|| {
+                playback
+                    .queue
+                    .iter()
+                    .position(|t| t.title.eq_ignore_ascii_case(&playback.title))
+            })
+            .flatten()
+        })
+        .or_else(|| (!playback.queue.is_empty()).then_some(0))
 }
 impl State {
     pub(super) unsafe fn coverflow_content(&mut self, c: &Canvas, dc: HDC, w: f32, h: f32) {
@@ -386,7 +397,7 @@ impl State {
             );
         }
         render::flush(buffer.dc);
-        if crate::glass::liquid_glass() && !live_nested {
+        if crate::glass::liquid_glass() && (!live_nested || !crate::motion::low_power()) {
             crate::glass::apply_liquid_glass_premul_bgra(
                 buffer.pixels_mut(),
                 pw as usize,
@@ -716,5 +727,64 @@ mod tests {
             assert!(squeeze > 0.7 && squeeze <= 1.0);
             prev_cx = cx;
         }
+    }
+    #[test]
+    fn selected_index_uses_fallback_chain() {
+        let make_track = |id: &str, title: &str, selected: bool| model::Track {
+            video_id: id.into(),
+            title: title.into(),
+            artist: "Artist".into(),
+            thumb: String::new(),
+            selected,
+        };
+        let queue = vec![
+            make_track("vid00000001", "First Song", false),
+            make_track("vid00000002", "Second Song", true),
+            make_track("vid00000003", "Third Song", false),
+        ];
+
+        // 1. Direct video_id match wins over selected flag.
+        let p_id = Playback {
+            video_id: "vid00000003".into(),
+            title: "First Song".into(),
+            queue: queue.clone(),
+            ..Playback::default()
+        };
+        assert_eq!(selected_index(&p_id), Some(2));
+
+        // 2. Falls back to `selected` flag when video_id is missing/unmatched (e.g. SMTC id).
+        let p_selected = Playback {
+            video_id: "smtc:First Song\0Artist".into(),
+            title: "First Song".into(),
+            queue: queue.clone(),
+            ..Playback::default()
+        };
+        assert_eq!(selected_index(&p_selected), Some(1));
+
+        // 3. Falls back to case-insensitive title match when neither video_id nor selected matches.
+        let unselected_queue = vec![
+            make_track("vid00000001", "First Song", false),
+            make_track("vid00000002", "Second Song", false),
+            make_track("vid00000003", "Third Song", false),
+        ];
+        let p_title = Playback {
+            video_id: "smtc:second song\0Artist".into(),
+            title: "second song".into(),
+            queue: unselected_queue.clone(),
+            ..Playback::default()
+        };
+        assert_eq!(selected_index(&p_title), Some(1));
+
+        // 4. Falls back to index 0 when queue is non-empty and nothing matches.
+        let p_first = Playback {
+            video_id: "unknown".into(),
+            title: "Unlisted Song".into(),
+            queue: unselected_queue,
+            ..Playback::default()
+        };
+        assert_eq!(selected_index(&p_first), Some(0));
+
+        // 5. Empty queue returns None.
+        assert_eq!(selected_index(&Playback::default()), None);
     }
 }

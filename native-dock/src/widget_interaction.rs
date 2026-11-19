@@ -317,4 +317,34 @@ mod tests {
         crate::motion::set_low_power(prev_low);
         crate::glass::set_frosted_glass(prev_frosted);
     }
+
+    #[test]
+    fn start_resize_followed_by_exit_size_move_clears_resizing_and_restores_shadow() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let owner = test_owner_window(120, 140, 200, 160);
+            assert!(!owner.is_null());
+            ShowWindow(owner, SW_SHOWNOACTIVATE);
+
+            let mut shadow = WindowShadow::new(owner);
+            assert!(shadow.is_some());
+            let mut resizing = false;
+            let mut moving = false;
+
+            start_resize(owner, &mut resizing, shadow.as_ref());
+            assert!(resizing);
+            assert!(crate::glass::is_resizing(owner));
+
+            exit_size_move(owner, &mut moving, &mut resizing);
+            assert!(!resizing);
+            assert!(!moving);
+            assert!(!crate::glass::is_resizing(owner));
+
+            sync_shadow(owner, moving, resizing, &mut shadow, 1., 255);
+            assert_ne!(IsWindowVisible(shadow.as_ref().unwrap().hwnd), 0);
+
+            shadow.take();
+            DestroyWindow(owner);
+        }
+    }
 }

@@ -162,7 +162,7 @@ impl Typography {
             DEFAULT_CHARSET as u32,
             0,
             0,
-            CLEARTYPE_QUALITY as u32,
+            ANTIALIASED_QUALITY as u32,
             0,
             wide("Segoe UI Variable Text").as_ptr(),
         );
@@ -209,7 +209,7 @@ impl Typography {
         }
         let face_name = family
             .map(str::trim)
-            .filter(|f| !f.is_empty())
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("Segoe UI"))
             .unwrap_or("Segoe UI Variable Text");
         let style_bits = u8::from(bold) | (u8::from(italic) << 1);
         let px_h = (size * dpi).round().max(1.) as i32;
@@ -237,7 +237,7 @@ impl Typography {
                 DEFAULT_CHARSET as u32,
                 0,
                 0,
-                CLEARTYPE_QUALITY as u32,
+                ANTIALIASED_QUALITY as u32,
                 0,
                 wide(face_name).as_ptr(),
             );

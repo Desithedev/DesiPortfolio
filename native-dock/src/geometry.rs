@@ -98,7 +98,7 @@ pub fn edge(x: i32, y: i32, w: i32, h: i32, inset: i32, grip: i32) -> u32 {
         HTTOPRIGHT
     } else if w - x + h - y < grip {
         HTBOTTOMRIGHT
-    } else if x < grip && y >= h - grip {
+    } else if x + h - y < grip {
         HTBOTTOMLEFT
     } else if top && left {
         HTTOPLEFT
@@ -106,6 +106,8 @@ pub fn edge(x: i32, y: i32, w: i32, h: i32, inset: i32, grip: i32) -> u32 {
         HTTOPRIGHT
     } else if bottom && right {
         HTBOTTOMRIGHT
+    } else if bottom && left {
+        HTBOTTOMLEFT
     } else if left {
         HTLEFT
     } else if right {
@@ -289,8 +291,17 @@ mod tests {
         assert_eq!(edge(728, 12, 746, 370, 6, 36), HTTOPRIGHT);
         assert_eq!(edge(728, 358, 746, 370, 6, 36), HTBOTTOMRIGHT);
         assert_eq!(edge(32, 30, 746, 370, 6, 36), HTCLIENT);
-        assert_eq!(edge(20, 350, 746, 370, 6, 36), HTBOTTOMLEFT);
+        assert_eq!(edge(18, 358, 746, 370, 6, 36), HTBOTTOMLEFT);
         assert_eq!(edge(744, 200, 746, 370, 6, 36), HTRIGHT);
         assert_eq!(edge(200, 100, 746, 370, 6, 36), HTCLIENT);
+    }
+    #[test]
+    fn geometry_bottom_left_symmetry_unit_test() {
+        let h = 200;
+        let w = 200;
+        let inset = 10;
+        let grip = 40;
+        assert_eq!(edge(38, h - 38, w, h, inset, grip), HTCLIENT);
+        assert_eq!(edge(14, h - 14, w, h, inset, grip), HTBOTTOMLEFT);
     }
 }

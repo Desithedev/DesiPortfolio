@@ -69,7 +69,7 @@ mod tests {
         for dpi in [1., 1.5] {
             for [w, h] in [[240, 240], [420, 650], [880, 540]] {
                 let size = [(w as f32 * dpi) as i32, (h as f32 * dpi) as i32];
-                let top = if w >= 420 { 96. } else { 66. };
+                let top = 66.;
                 for design in ["notebook", "index", "honey"] {
                     let rgba = pixels(size, dpi, design, top);
                     assert_eq!(rgba.len(), size[0] as usize * size[1] as usize * 4);

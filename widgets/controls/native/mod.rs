@@ -37,6 +37,7 @@ const MANAGER_TOGGLE: u32 = WM_APP + 176;
 const MANAGER_SYNC: u32 = WM_APP + 177;
 const MANAGER_SETTINGS: u32 = WM_APP + 178;
 const WALLPAPER_READY: u32 = WM_APP + 179;
+const SNAPSHOT_READY: u32 = WM_APP + 180;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Action {
     Control(usize),
@@ -258,6 +259,9 @@ impl Host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         state.borrow_mut().hwnd = hwnd;
+        if let Some(worker) = &state.borrow().worker {
+            worker.set_notify(hwnd, SNAPSHOT_READY);
+        }
         state.borrow_mut().dpi = GetDpiForWindow(hwnd) as f32 / 96.;
         if !smoke {
             state.borrow().glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
@@ -334,6 +338,9 @@ impl Drop for Host {
     fn drop(&mut self) {
         unsafe {
             let mut s = self.state.borrow_mut();
+            if let Some(worker) = &s.worker {
+                worker.set_notify(null_mut(), 0);
+            }
             s.settings.take();
             s.editor.take();
             s.chooser.take();
@@ -393,12 +400,62 @@ impl State {
     fn read(&mut self) {
         if !self.pending {
             if let Some(worker) = &self.worker {
-                worker.read();
+                worker.read_with_sources(self.config.controls.iter().any(|c| c.kind == Kind::Source));
                 self.pending = true;
                 self.last_poll = Instant::now();
                 unsafe {
                     SetTimer(self.hwnd, 1, 100, None);
                 }
+            }
+        }
+    }
+    unsafe fn drain_worker_snapshots(&mut self, visible: bool) {
+        let mut result = None;
+        if let Some(worker) = &self.worker {
+            worker.clear_notify_pending();
+            for value in worker.rx.try_iter() {
+                result = Some(value);
+            }
+        }
+        if let Some(mut result) = result {
+            let was_empty =
+                self.snapshot.outputs.is_empty() && self.snapshot.displays.is_empty();
+            self.pending = false;
+            self.error = result.errors.first().cloned().unwrap_or_default();
+            if let Some(next) = self.queued.take() {
+                if next.control.kind.is_input() {
+                    result.mic_volume = Some(next.value);
+                } else {
+                    result.volume = Some(next.value);
+                }
+                self.command(next.control, next.value);
+            }
+            if self.snapshot != result {
+                self.snapshot = result;
+                self.sync_display_order();
+                self.candidates = self.catalog();
+                if let Some(ui) = &self.manager_window {
+                    PostMessageW(ui.hwnd(), MANAGER_SYNC, 0, 0);
+                }
+                if visible {
+                    InvalidateRect(self.hwnd, null(), 0);
+                }
+            }
+            if was_empty
+                && (!self.snapshot.outputs.is_empty() || !self.snapshot.displays.is_empty())
+            {
+                crate::logger::info(
+                    "controls",
+                    format!(
+                        "snapshot ready: outputs={} inputs={} displays={}",
+                        self.snapshot.outputs.len(),
+                        self.snapshot.inputs.len(),
+                        self.snapshot.displays.len()
+                    ),
+                );
+            }
+            if !self.pending {
+                SetTimer(self.hwnd, 1, 2500, None);
             }
         }
     }
@@ -1334,7 +1391,6 @@ impl State {
                     (self.config.frost_strength * 2.55).round() as u8,
                 );
             }
-            let c = Canvas::new(frame.dc, self.dpi);
             let fused = crate::fusion::fused(self.hwnd);
             let pane = [0., 0., w, h];
             let paint_r = if fused { 0. } else { 30. };
@@ -1343,35 +1399,38 @@ impl State {
             } else {
                 1.
             };
-            if crate::surface::managed(&self.config.palette) {
-                crate::surface::paint(&c, pane, &self.config.palette, tint);
-            } else {
-                c.round(
-                    pane,
-                    paint_r,
-                    crate::surface::color(
-                        &self.config.palette,
-                        self.glass.borrow().wallpaper_accent(),
-                    ),
-                    (tint * if light { 64. } else { 255. }) as u8,
-                    false,
-                    false,
-                );
-            }
-            if design == "soft-violet" {
-                c.round(pane, paint_r, rgb(229, 233, 232), 205, false, false);
-            }
-            c.coating(pane, paint_r);
-            c.draw_pane_overlay(
-                [r.right as u32, r.bottom as u32],
-                self.dpi,
-                tint,
-                light,
-                pane,
+            let palette_fallback = crate::surface::color(
+                &self.config.palette,
+                self.glass.borrow().wallpaper_accent(),
             );
-            c.widget_corner_reflection_for(self.hwnd, pane, paint_r, light);
-            drop(c);
-            frame.bevel_for(self.hwnd);
+            let hwnd = self.hwnd;
+            frame.paint_frosted_chrome_for(hwnd, frosted, |chrome_dc| {
+                let c = Canvas::new(chrome_dc, self.dpi);
+                if crate::surface::managed(&self.config.palette) {
+                    crate::surface::paint(&c, pane, &self.config.palette, tint);
+                } else {
+                    c.round(
+                        pane,
+                        paint_r,
+                        palette_fallback,
+                        (tint * if light { 64. } else { 255. }) as u8,
+                        false,
+                        false,
+                    );
+                }
+                if design == "soft-violet" {
+                    c.round(pane, paint_r, rgb(229, 233, 232), 205, false, false);
+                }
+                c.coating(pane, paint_r);
+                c.draw_pane_overlay(
+                    [r.right as u32, r.bottom as u32],
+                    self.dpi,
+                    tint,
+                    light,
+                    pane,
+                );
+                c.widget_corner_reflection_for(hwnd, pane, paint_r, light);
+            });
             self.ink = Some(
                 crate::contrast::inks(
                     crate::contrast::sample(frame.dc, self.dpi, [18., 54., w - 18., h - 18.]),
@@ -1441,7 +1500,20 @@ impl State {
             ((w - 14.) * self.dpi) as i32,
             ((h - if self.manager { 60. } else { 12. }) * self.dpi) as i32,
         );
-        let batch = render::AlphaBatch::new(frame.dc, self.dpi);
+        let own_alpha = (self.config.opacity * 2.55).round() as u8;
+        let needs_alpha = own_alpha < 255
+            || crate::fusion::group_opacities(self.hwnd, own_alpha)
+                .is_some_and(|(_, ops)| ops.iter().any(|&o| o < 255));
+        let alpha_batch = if needs_alpha {
+            render::AlphaBatch::new(frame.dc, self.dpi)
+        } else {
+            None
+        };
+        let batch = if alpha_batch.is_none() {
+            Some(render::Batch::new(frame.dc, self.dpi))
+        } else {
+            None
+        };
         let mut compact_groups: Vec<([f32; 4], f32)> = vec![];
         if compact_expanded {
             let (compact_items, _, _) = self.compact_tiles(w, h, self.scroll);
@@ -1461,11 +1533,12 @@ impl State {
                         box_r[2] = box_r[2].max(item.rect[2]);
                         box_r[3] = box_r[3].max(item.rect[3]);
                     }
+                    let pad_y = if minimized { 3. } else { 4. };
                     let gr = [
-                        (box_r[0] - 4.).max(14.),
-                        (box_r[1] - if minimized { 3. } else { 4. }).max(54.),
-                        (box_r[2] + 4.).min(w - 14.),
-                        box_r[3] + if minimized { 3. } else { 4. },
+                        box_r[0] - 4.,
+                        box_r[1] - pad_y,
+                        box_r[2] + 4.,
+                        box_r[3] + pad_y,
                     ];
                     let gr_rad = if minimized {
                         ((gr[3] - gr[1]) / 2.).min(20.)
@@ -1473,19 +1546,23 @@ impl State {
                         20.
                     };
                     if gr[3] >= 54. && gr[1] <= h - 12. && gr[2] >= 14. && gr[0] <= w - 14. {
-                        let cv = Canvas::new(frame.dc, self.dpi);
-                        cv.group_surface_live(gr, gr_rad, self.drag.is_some());
+                        if let Some(ref b) = batch {
+                            b.group_surface(gr, gr_rad, self.scroll_clock.is_none());
+                        } else {
+                            let cv = Canvas::new(frame.dc, self.dpi);
+                            cv.group_surface_live(gr, gr_rad, self.drag.is_some());
+                        }
                         compact_groups.push((gr, gr_rad));
                     }
                 }
                 i = j;
             }
+            let cv = Canvas::new(frame.dc, self.dpi);
             for item in compact_items {
                 let r = item.rect;
                 if r[3] < 54. || r[1] > h - 12. || r[2] < 14. || r[0] > w - 14. {
                     continue;
                 }
-                let cv = Canvas::new(frame.dc, self.dpi);
                 let action = if item.kind.is_volume() {
                     Action::Slider(item.control_index)
                 } else if let Some(di) = item.device_index {
@@ -2226,7 +2303,8 @@ impl State {
                         ]
                     };
                     let row_now = self.hover_epoch.elapsed().as_secs_f64() * 1000.;
-                    let row_hover = self.hover == Some(Action::Device(tile.index, j))
+                    let row_hover = self.scroll_clock.is_none()
+                        && self.hover == Some(Action::Device(tile.index, j))
                         && *enabled
                         && !self.editing;
                     let motion = self
@@ -2661,7 +2739,7 @@ impl State {
                 if let Some(c) = self.config.controls.get(picker_idx) {
                     let cv = Canvas::new(frame.dc, self.dpi);
                     let back = [18., 58., 44., 84.];
-                    let back_hover = self.hover == Some(Action::Back);
+                    let back_hover = self.scroll_clock.is_none() && self.hover == Some(Action::Back);
                     let back_pressed = self.pressed == Some(Action::Back);
                     cv.soft_shadow(back, 13., if back_hover { 18. } else { 12. }, 4., 2.);
                     self.button_lenses.draw(
@@ -2720,7 +2798,9 @@ impl State {
                                 continue;
                             }
                             let row_action = Action::Device(picker_idx, j);
-                            let row_hover = self.hover == Some(row_action) && *enabled;
+                            let row_hover = self.scroll_clock.is_none()
+                                && self.hover == Some(row_action)
+                                && *enabled;
                             let row_pressed = self.pressed == Some(row_action) && *enabled;
                             cv.soft_shadow(rr, 17., if row_hover { 18. } else { 12. }, 4., 2.);
                             if *on {
@@ -2973,7 +3053,13 @@ impl State {
                 }
             }
         }
+        drop(batch);
         RestoreDC(frame.dc, saved);
+        let header_batch = if alpha_batch.is_none() {
+            Some(render::Batch::new(frame.dc, self.dpi))
+        } else {
+            None
+        };
         let c = Canvas::new(frame.dc, self.dpi);
         if self.manager {
             c.text(
@@ -3143,55 +3229,62 @@ impl State {
             );
         }
         drop(c);
-        drop(batch);
+        drop(header_batch);
+        drop(alpha_batch);
         let clip_top = if self.manager { 142. } else { 54. };
         let clip_bottom = h - if self.manager { 60. } else { 12. };
-        if let Some(bg) = &self.backdrop {
-            let clip = SaveDC(frame.dc);
-            IntersectClipRect(
-                frame.dc,
-                (14. * self.dpi) as i32,
-                (clip_top * self.dpi) as i32,
-                ((w - 14.) * self.dpi) as i32,
-                (clip_bottom * self.dpi) as i32,
-            );
-            for (gr, gr_rad) in &compact_groups {
-                frame.retain_control_backing(bg, *gr, *gr_rad, 1.);
-            }
-            for (action, r) in &self.hits {
-                if matches!(action, Action::Settings | Action::Hide | Action::Scroll(_))
-                    || (self.config.design == "compact" && matches!(action, Action::Move(_)))
-                    || r[3] < clip_top
-                    || r[1] > clip_bottom
-                    || r[2] < 14.
-                    || r[0] > w - 14.
-                {
-                    continue;
+        if needs_alpha {
+            if let Some(bg) = &self.backdrop {
+                let clip = SaveDC(frame.dc);
+                IntersectClipRect(
+                    frame.dc,
+                    (14. * self.dpi) as i32,
+                    (clip_top * self.dpi) as i32,
+                    ((w - 14.) * self.dpi) as i32,
+                    (clip_bottom * self.dpi) as i32,
+                );
+                for (gr, gr_rad) in &compact_groups {
+                    frame.retain_control_backing(bg, *gr, *gr_rad, 1.);
                 }
-                let radius = if r[1] < 54. {
-                    15.
-                } else if self.config.design == "compact" && !self.manager {
-                    (r[3] - r[1]) / 2.
-                } else {
-                    lenses::radius(lenses::material(&self.config.design), r[3] - r[1])
-                };
-                frame.retain_control_backing(bg, *r, radius, 1.);
+                for (action, r) in &self.hits {
+                    if matches!(action, Action::Settings | Action::Hide | Action::Scroll(_))
+                        || (self.config.design == "compact" && matches!(action, Action::Move(_)))
+                        || r[3] < clip_top
+                        || r[1] > clip_bottom
+                        || r[2] < 14.
+                        || r[0] > w - 14.
+                    {
+                        continue;
+                    }
+                    let radius = if r[1] < 54. {
+                        15.
+                    } else if self.config.design == "compact" && !self.manager {
+                        (r[3] - r[1]) / 2.
+                    } else {
+                        lenses::radius(lenses::material(&self.config.design), r[3] - r[1])
+                    };
+                    frame.retain_control_backing(bg, *r, radius, 1.);
+                }
+                RestoreDC(frame.dc, clip);
+                frame.retain_control_backing(bg, [18., 12., 68., 42.], 15., 1.);
+                if self.editing && !self.manager && w >= 220. {
+                    frame.retain_control_backing(bg, [76., 12., 130., 42.], 15., 1.);
+                }
+                settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, w);
             }
-            RestoreDC(frame.dc, clip);
-            frame.retain_control_backing(bg, [18., 12., 68., 42.], 15., 1.);
-            if self.editing && !self.manager && w >= 220. {
-                frame.retain_control_backing(bg, [76., 12., 130., 42.], 15., 1.);
-            }
-            settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, w);
         }
         if let Some(bg) = &self.fade_base {
-            let max = self.scrollbar().map_or(0., |(_, _, max, _)| max);
+            let list_max = if self.manager {
+                self.scrollbar().map_or(0., |(_, _, max, _)| max)
+            } else {
+                max
+            };
             if !self.manager && h <= 240. {
                 frame.fade_horizontal_edges(
                     bg,
                     [14., 54., w - 14., h - 12.],
                     self.scroll > 0.5,
-                    self.scroll < max - 0.5,
+                    self.scroll < list_max - 0.5,
                 );
             } else {
                 frame.fade_list_edges(
@@ -3199,7 +3292,7 @@ impl State {
                     clip_top,
                     clip_bottom,
                     self.scroll > 0.5,
-                    self.scroll < max - 0.5,
+                    self.scroll < list_max - 0.5,
                 );
             }
             if !self.editing && !self.manager {
@@ -3207,7 +3300,7 @@ impl State {
                 frame.fade_control_region(bg, [10., 5., 75., 51.], reveal);
             }
         }
-        frame.present_with_alpha(self.hwnd, true);
+        frame.present_with_alpha(self.hwnd, needs_alpha);
         self.frame = Some(frame);
         if let Some(shadow) = &mut self.shadow {
             if self.drag.as_ref().is_some_and(|d| d.edge != HTCAPTION) {
@@ -3418,6 +3511,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 s.key.clear();
                 InvalidateRect(hwnd, null(), 0);
             }
+            0
+        }
+        m if m == SNAPSHOT_READY => {
+            let visible = IsWindowVisible(hwnd) != 0;
+            s.drain_worker_snapshots(visible);
             0
         }
         m if m == WM_APP + 174 => {
@@ -3665,13 +3763,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 InvalidateRect(hwnd, null(), 0);
             } else {
-                let hover = s.hit(p).map(|a| match a {
-                    Action::Mute(i) => Action::Slider(i),
-                    _ => a,
-                });
-                if hover != s.hover {
-                    s.hover = hover;
-                    InvalidateRect(hwnd, null(), 0);
+                if s.scroll_clock.is_none() {
+                    let hover = s.hit(p).map(|a| match a {
+                        Action::Mute(i) => Action::Slider(i),
+                        _ => a,
+                    });
+                    if hover != s.hover {
+                        s.hover = hover;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
                 }
                 let mut t = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -3723,21 +3823,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 crate::glass::set_resizing(hwnd, false);
                 s.key.clear();
                 s.bounds();
-                InvalidateRect(hwnd, null(), 0);
             }
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+            }
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSEWHEEL => {
+            s.hover = None;
             let max = s.scrollbar().map_or(0., |(_, _, max, _)| max).max(0.);
             s.scroll_target = (s.scroll_target - ((wp >> 16) as i16 as f32 / 120.) * 60.).clamp(0., max);
             if (s.scroll_target - s.scroll).abs() >= 0.2 {
                 if s.scroll_clock.is_none() {
                     s.scroll_clock = Some(crate::motion::FrameClock::start());
+                    s.scroll += (s.scroll_target - s.scroll) * (1. - (-0.00833_f32 / 0.065).exp());
+                    s.scroll_tick = Instant::now();
                 }
-                s.scroll += (s.scroll_target - s.scroll) * (1. - (-0.00833_f32 / 0.065).exp());
-                s.scroll_tick = Instant::now();
                 SetTimer(hwnd, 2, crate::motion::frame_interval_ms(), None);
-                InvalidateRect(hwnd, null(), 0);
+                if !s.frame_queued {
+                    InvalidateRect(hwnd, null(), 0);
+                }
             } else {
                 s.scroll = s.scroll_target;
                 KillTimer(hwnd, 2);
@@ -3793,6 +3899,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_TIMER if wp == 3 => {
+            if s.frame_queued {
+                return 0;
+            }
             let now = s.hover_epoch.elapsed().as_secs_f64() * 1000.;
             if !s.hover_motion.values().any(|v| v.moving(now)) {
                 KillTimer(hwnd, 3);
@@ -3804,6 +3913,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_TIMER if wp == 2 => {
+            if s.frame_queued {
+                return 0;
+            }
             let max = s.scrollbar().map_or(0., |(_, _, max, _)| max).max(0.);
             s.scroll_target = s.scroll_target.clamp(0., max);
             let elapsed = s.scroll_tick.elapsed().as_secs_f32().min(0.1);
@@ -3850,37 +3962,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_TIMER if wp == 1 => {
             let visible = IsWindowVisible(hwnd) != 0;
-            let mut result = None;
-            if let Some(worker) = &s.worker {
-                while let Ok(value) = worker.rx.try_recv() {
-                    result = Some(value);
-                }
-            }
-            if let Some(result) = result {
-                s.pending = false;
-                s.error = result.errors.first().cloned().unwrap_or_default();
-                let mut result = result;
-                if let Some(next) = s.queued.take() {
-                    if next.control.kind.is_input() {
-                        result.mic_volume = Some(next.value);
-                    } else {
-                        result.volume = Some(next.value);
-                    }
-                    s.command(next.control, next.value);
-                }
-                if s.snapshot != result {
-                    s.snapshot = result;
-                    s.sync_display_order();
-                    s.candidates = s.catalog();
-                    if let Some(ui) = &s.manager_window {
-                        PostMessageW(ui.hwnd(), MANAGER_SYNC, 0, 0);
-                    }
-                    if visible {
-                        InvalidateRect(hwnd, null(), 0);
-                    }
-                }
-            }
-            let poll_due = s.last_poll.elapsed() > Duration::from_secs(5);
+            s.drain_worker_snapshots(visible);
+            let poll_due = s.last_poll.elapsed() >= Duration::from_millis(2400);
             if visible && poll_due {
                 if s.glass.borrow_mut().refresh() {
                     s.key.clear();
@@ -3891,7 +3974,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
             }
             if !s.pending {
-                SetTimer(hwnd, 1, 5000, None);
+                SetTimer(hwnd, 1, 2500, None);
             }
             if visible && poll_due && !s.inspect && !s.config.floating {
                 drop(s);
@@ -3957,6 +4040,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             0
         }
         WM_NCDESTROY => {
+            if let Some(worker) = &s.worker {
+                worker.set_notify(null_mut(), 0);
+            }
             KillTimer(hwnd, 3);
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 2);
@@ -4575,6 +4661,154 @@ mod tests {
                     .map(|(id, _, _, _)| id)
                     .collect();
                 assert_eq!(ordered, vec!["d1", "d2", "d3"]);
+            }
+            drop(host);
+            crate::fusion::shutdown();
+        }
+    }
+    #[test]
+    fn header_buttons_render_ink_after_scroll_clip_and_restore() {
+        let _lock = crate::native_ui_test_lock();
+        let _runtime = render::Runtime::start().unwrap();
+        let root = std::env::temp_dir()
+            .join(format!("lumen-controls-header-clip-{}", std::process::id()));
+        unsafe {
+            let shared = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            crate::fusion::init(shared.clone());
+            let host = Host::create(&root, shared, true, true).unwrap();
+            let has_ink_in_rect = |pixels: &[u8], width: usize, r: [f32; 4]| -> bool {
+                let x0 = r[0] as usize;
+                let y0 = r[1] as usize;
+                let x1 = r[2] as usize;
+                let y1 = r[3] as usize;
+                (y0..y1).any(|y| {
+                    (x0..x1).any(|x| {
+                        let i = (y * width + x) * 4;
+                        pixels[i] > 16 || pixels[i + 1] > 16 || pixels[i + 2] > 16
+                    })
+                })
+            };
+            let w = 420;
+            let h = 220;
+            let edit_rect = [18., 12., 68., 42.];
+            let add_rect = [76., 12., 130., 42.];
+            {
+                let s = host.state.borrow();
+
+                // Normal mode: "Edit" + pencil icon at [18., 12., 68., 42.]
+                let edit_buf = Buffer::plain(w, h, 1.).unwrap();
+                PatBlt(edit_buf.dc, 0, 0, w, h, BLACKNESS);
+                let saved = SaveDC(edit_buf.dc);
+                IntersectClipRect(edit_buf.dc, 14, 54, w - 14, h - 12);
+                let batch = Some(render::Batch::new(edit_buf.dc, 1.));
+                {
+                    let body = Canvas::new(edit_buf.dc, 1.);
+                    body.round([20., 64., 140., 120.], 12., 0x334455, 255, false, false);
+                }
+                drop(batch);
+                RestoreDC(edit_buf.dc, saved);
+                let header_batch = render::Batch::new(edit_buf.dc, 1.);
+                {
+                    let c = Canvas::new(edit_buf.dc, 1.);
+                    s.icons.pencil(
+                        &c,
+                        1.,
+                        [
+                            edit_rect[0] + 6.,
+                            edit_rect[1] + 8.,
+                            edit_rect[0] + 20.,
+                            edit_rect[1] + 22.,
+                        ],
+                        0xffffff,
+                    );
+                    c.text(
+                        "Edit",
+                        [
+                            edit_rect[0] + 22.,
+                            edit_rect[1],
+                            edit_rect[2] - 3.,
+                            edit_rect[3],
+                        ],
+                        10.,
+                        true,
+                        0xffffff,
+                        1,
+                    );
+                }
+                drop(header_batch);
+                let edit_pixels = edit_buf.snapshot();
+                assert!(
+                    has_ink_in_rect(&edit_pixels, w as usize, edit_rect),
+                    "expected visible Edit + pencil ink in header rect"
+                );
+
+                // Editing mode: "Done" at [18., 12., 68., 42.] and "+ Add" at [76., 12., 130., 42.]
+                let done_buf = Buffer::plain(w, h, 1.).unwrap();
+                PatBlt(done_buf.dc, 0, 0, w, h, BLACKNESS);
+                let saved = SaveDC(done_buf.dc);
+                IntersectClipRect(done_buf.dc, 14, 54, w - 14, h - 12);
+                let batch = Some(render::Batch::new(done_buf.dc, 1.));
+                {
+                    let body = Canvas::new(done_buf.dc, 1.);
+                    body.round([20., 64., 140., 120.], 12., 0x334455, 255, false, false);
+                }
+                drop(batch);
+                RestoreDC(done_buf.dc, saved);
+                let header_batch = render::Batch::new(done_buf.dc, 1.);
+                {
+                    let c = Canvas::new(done_buf.dc, 1.);
+                    c.text("Done", edit_rect, 10., true, 0xffffff, 1);
+                    c.text("+ Add", add_rect, 10., true, 0xffffff, 1);
+                }
+                drop(header_batch);
+                let done_pixels = done_buf.snapshot();
+                assert!(
+                    has_ink_in_rect(&done_pixels, w as usize, edit_rect),
+                    "expected visible Done ink in header rect"
+                );
+                assert!(
+                    has_ink_in_rect(&done_pixels, w as usize, add_rect),
+                    "expected visible + Add ink in header rect"
+                );
+            }
+            // Full State::paint() at 100% opacity (needs_alpha == false) with controls present
+            let hwnd = host.hwnd();
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                -3000,
+                -3000,
+                w,
+                320,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            {
+                let mut s = host.state.borrow_mut();
+                s.dpi = 1.;
+                s.config.opacity = 100.;
+                s.config.controls = vec![Control {
+                    id: "vol".into(),
+                    kind: Kind::Volume,
+                    target: String::new(),
+                    label: "Volume".into(),
+                }];
+                s.editing = true;
+                s.key.clear();
+                s.frame = None;
+                s.backdrop = None;
+                s.paint();
+                let frame_px = s.frame.as_ref().unwrap().snapshot();
+                let base_px = s.fade_base.as_ref().unwrap().snapshot();
+                let rect_changed = |r: [f32; 4]| -> bool {
+                    ((r[1] as usize)..(r[3] as usize)).any(|y| {
+                        ((r[0] as usize)..(r[2] as usize)).any(|x| {
+                            let i = (y * w as usize + x) * 4;
+                            frame_px[i..i + 3] != base_px[i..i + 3]
+                        })
+                    })
+                };
+                assert!(rect_changed(edit_rect), "full paint should draw Done button in header");
+                assert!(rect_changed(add_rect), "full paint should draw + Add button in header");
             }
             drop(host);
             crate::fusion::shutdown();

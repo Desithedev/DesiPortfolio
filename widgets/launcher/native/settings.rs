@@ -1055,9 +1055,17 @@ unsafe extern "system" fn settings_proc(
             }
             0
         }
-        WM_CAPTURECHANGED => {
-            app.resize_drag = None;
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
+            if app.resize_drag.take().is_some() {
+                app.pending_resize = None;
+                crate::glass::set_resizing(hwnd, false);
+            }
             app.settings.scrollbar_drag = None;
+            app.settings.dragging = None;
+            if message == WM_CANCELMODE {
+                ReleaseCapture();
+            }
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_MOUSEWHEEL => {
@@ -1075,7 +1083,9 @@ unsafe extern "system" fn settings_proc(
             app.settings.smooth_scroll.by(-delta * 72., now);
             app.settings.scroll = app.settings.smooth_scroll.value(now).round() as i32;
             SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
-            InvalidateRect(hwnd, null(), 0);
+            if !app.settings.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER if wparam == 1 => {

@@ -30,7 +30,7 @@ pub fn material_weight(normal: f32, tangent: f32, dpi: f32) -> f32 {
         let t = (1. - distance / (extent * dpi)).clamp(0., 1.);
         t * t * t * (t * (t * 6. - 15.) + 10.)
     };
-    fade(normal, 140.) * fade(tangent, 80.)
+    fade(normal, 140.) * fade(tangent, 140.)
 }
 pub use contour::with_outline;
 /// Integrate edge coverage in physical pixels, shared by the member and bridge
@@ -74,8 +74,20 @@ pub fn touching_edges(end: f32, start: f32, scale: f32) -> bool {
     let overlap = end - start;
     overlap >= -1.5 * scale && overlap <= 8. * scale
 }
+pub fn deep_overlap(a: &Pane, b: &Pane) -> bool {
+    if a.id == b.id || a.topmost != b.topmost {
+        return false;
+    }
+    let ox = overlap(a.rect[0], a.rect[2], b.rect[0], b.rect[2]);
+    let oy = overlap(a.rect[1], a.rect[3], b.rect[1], b.rect[3]);
+    let scale = a.dpi.max(b.dpi).max(1.0);
+    ox > 8.0 * scale && oy > 8.0 * scale
+}
 pub fn adjacent(a: &Pane, b: &Pane) -> bool {
     if a.id == b.id || a.topmost != b.topmost {
+        return false;
+    }
+    if deep_overlap(a, b) {
         return false;
     }
     let scale = a.dpi.max(b.dpi);
@@ -112,14 +124,23 @@ pub fn components(panes: &[Pane]) -> Vec<Vec<Pane>> {
         if seen[start] {
             continue;
         }
+        let deeply_overlaps_any = panes.iter().any(|other| deep_overlap(&panes[start], other));
+        if deeply_overlaps_any {
+            seen[start] = true;
+            out.push(vec![panes[start]]);
+            continue;
+        }
         seen[start] = true;
         let mut indexes = vec![start];
         let mut at = 0;
         while at < indexes.len() {
             for i in 0..panes.len() {
-                if !seen[i] && adjacent(&panes[indexes[at]], &panes[i]) {
-                    seen[i] = true;
-                    indexes.push(i);
+                if !seen[i] {
+                    let deeply_overlaps_other = panes.iter().any(|other| deep_overlap(&panes[i], other));
+                    if !deeply_overlaps_other && adjacent(&panes[indexes[at]], &panes[i]) {
+                        seen[i] = true;
+                        indexes.push(i);
+                    }
                 }
             }
             at += 1;
@@ -182,6 +203,9 @@ pub fn snap_resize(pane: &Pane, others: &[Pane], edges: [bool; 4], min: [f32; 2]
 }
 /// Move just the dragged pane. Never moves another member of a fused component.
 pub fn snap_move(moving: &Pane, others: &[Pane]) -> [f32; 2] {
+    if others.iter().any(|o| deep_overlap(moving, o)) {
+        return [0., 0.];
+    }
     let threshold = 12. * moving.dpi;
     let [l, t, r, b] = moving.rect;
     let mut best: Option<(f32, [f32; 2])> = None;
@@ -196,6 +220,9 @@ pub fn snap_move(moving: &Pane, others: &[Pane]) -> [f32; 2] {
                 rect: [l + delta[0], t + delta[1], r + delta[0], b + delta[1]],
                 ..*moving
             };
+            if others.iter().any(|o| deep_overlap(&candidate, o)) {
+                return;
+            }
             if !adjacent(&candidate, p) {
                 return;
             }
@@ -559,5 +586,19 @@ mod tests {
         let mut b = pane(2, [-584., -300., -134., 150.]);
         b.dpi = 1.5;
         assert_eq!(snap_move(&b, &[a]), [-16., 0.]);
+    }
+    #[test]
+    fn deep_interior_overlap_prevents_fusion_even_when_snapped_to_third_widget() {
+        let a = pane(1, [0., 0., 400., 300.]);
+        // B is dragged deep inside A (> 8*scale overlap on both axes) while touching C (at x=400)
+        let b = pane(2, [100., 50., 400., 200.]);
+        let c = pane(3, [400., 0., 700., 300.]);
+        let cs = components(&[a, b, c]);
+        // B must be in its own singleton component [b], not fused with a or c
+        assert!(cs.iter().any(|comp| comp.len() == 1 && comp[0].id == 2));
+        // snap_move should not snap B to C while B deeply overlaps A
+        let b_deep = pane(2, [100., 50., 395., 200.]);
+        let delta = snap_move(&b_deep, &[a, c]);
+        assert_eq!(delta, [0., 0.]);
     }
 }

@@ -125,6 +125,7 @@ impl WallpaperSource {
 
 type SourceKey = (PathBuf, Option<SystemTime>);
 type BlurKey = (PathBuf, Option<SystemTime>, i32, i32);
+type NativeLayerKey = (PathBuf, u64, usize, [i32; 4], u32, bool, u32, (i32, i32), [u32; 2]);
 
 struct PendingWallpaper {
     path: PathBuf,
@@ -148,13 +149,16 @@ thread_local! {
     static WALLPAPER_SOURCES: RefCell<HashMap<SourceKey, Rc<WallpaperSource>>> = RefCell::new(HashMap::new());
     static BLURRED_CACHE: RefCell<HashMap<BlurKey, (Rc<OwnedBitmap>, i32, i32)>> = RefCell::new(HashMap::new());
     static PATH_BUF: RefCell<Vec<u16>> = RefCell::new(vec![0u16; 32768]);
+    static NATIVE_LAYERS: RefCell<Vec<(NativeLayerKey, crate::compositor::Buffer)>> = const { RefCell::new(Vec::new()) };
 }
 pub fn clear_cache() {
+    NATIVE_LAYERS.with(|cache| cache.borrow_mut().clear());
     WALLPAPER_SOURCES.with(|cache| cache.borrow_mut().clear());
     BLURRED_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 pub(crate) fn trim_working_set() {
+    NATIVE_LAYERS.with(|cache| cache.borrow_mut().clear());
     unsafe {
         windows_sys::Win32::System::Memory::SetProcessWorkingSetSizeEx(
             windows_sys::Win32::System::Threading::GetCurrentProcess(),
@@ -308,6 +312,148 @@ impl Glass {
     pub fn revision(&self) -> u64 {
         self.generation
             .wrapping_add(LIQUID_GLASS_REVISION.load(Ordering::Relaxed))
+    }
+    pub fn desktop_origin_size(&self) -> [i32; 4] {
+        unsafe {
+            let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if vw > 0 && vh > 0 {
+                [vx, vy, vw, vh]
+            } else {
+                [
+                    0,
+                    0,
+                    GetSystemMetrics(SM_CXSCREEN).max(1),
+                    GetSystemMetrics(SM_CYSCREEN).max(1),
+                ]
+            }
+        }
+    }
+    pub fn monitor_origin_size(&self, hwnd: HWND) -> [i32; 4] {
+        unsafe {
+            if self.style == 22 {
+                return self.desktop_origin_size();
+            }
+            let mut monitor: MONITORINFO = zeroed();
+            monitor.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            ) != 0
+            {
+                let r = monitor.rcMonitor;
+                [r.left, r.top, (r.right - r.left).max(1), (r.bottom - r.top).max(1)]
+            } else {
+                self.desktop_origin_size()
+            }
+        }
+    }
+    pub fn gpu_wallpaper_pair_for(
+        &self,
+        hwnd: HWND,
+    ) -> Option<([i32; 4], Vec<u8>, Option<Vec<u8>>)> {
+        unsafe {
+            let area = self.monitor_origin_size(hwnd);
+            let [vx, vy, vw, vh] = area;
+            if vw <= 0 || vh <= 0 || (vw as i64) * (vh as i64) > 32_000_000 {
+                return None;
+            }
+            let blurred_bmp = self.bitmap.as_ref()?.0;
+            let mut buffer = crate::compositor::Buffer::plain(vw, vh, 1.0)?;
+            let render_bmp =
+                |buffer: &mut crate::compositor::Buffer, bmp: HBITMAP, src_size: (i32, i32)| {
+                    let rr = RECT {
+                        left: 0,
+                        top: 0,
+                        right: vw,
+                        bottom: vh,
+                    };
+                    if self.style == 0 || self.style == 6 {
+                        PatBlt(buffer.dc, 0, 0, vw, vh, BLACKNESS);
+                    } else {
+                        let brush = CreateSolidBrush(self.wallpaper_accent());
+                        FillRect(buffer.dc, &rr, brush);
+                        DeleteObject(brush);
+                    }
+                    let monitor_rect = RECT {
+                        left: vx,
+                        top: vy,
+                        right: vx + vw,
+                        bottom: vy + vh,
+                    };
+                    self.draw_layer(buffer.dc, hwnd, vw, vh, bmp, src_size, monitor_rect, false);
+                    let pixels = buffer.pixels_mut();
+                    for p in pixels.chunks_exact_mut(4) {
+                        p[3] = 255;
+                    }
+                    pixels.to_vec()
+                };
+            let blurred = render_bmp(&mut buffer, blurred_bmp, self.blur_size());
+            let sharp = self
+                .source
+                .as_ref()
+                .map(|s| s.sharp_bitmap())
+                .filter(|b| !b.is_null())
+                .map(|bmp| render_bmp(&mut buffer, bmp, (self.width, self.height)));
+            Some((area, blurred, sharp))
+        }
+    }
+    pub fn gpu_wallpaper_bgra(&self) -> Option<(i32, i32, Vec<u8>)> {
+        unsafe {
+            let [vx, vy, vw, vh] = self.desktop_origin_size();
+            if vw <= 0 || vh <= 0 || (vw as i64) * (vh as i64) > 32_000_000 {
+                return None;
+            }
+            let sharp = self
+                .source
+                .as_ref()
+                .map(|s| s.sharp_bitmap())
+                .filter(|b| !b.is_null());
+            let (bmp, src_size) = if let Some(sharp) = sharp {
+                (sharp, (self.width, self.height))
+            } else if let Some(blurred) = self.bitmap.as_ref() {
+                (blurred.0, self.blur_size())
+            } else {
+                return None;
+            };
+            let mut buffer = crate::compositor::Buffer::plain(vw, vh, 1.0)?;
+            let rr = RECT {
+                left: 0,
+                top: 0,
+                right: vw,
+                bottom: vh,
+            };
+            if self.style == 0 || self.style == 6 {
+                PatBlt(buffer.dc, 0, 0, vw, vh, BLACKNESS);
+            } else {
+                let brush = CreateSolidBrush(self.wallpaper_accent());
+                FillRect(buffer.dc, &rr, brush);
+                DeleteObject(brush);
+            }
+            let desktop_rect = RECT {
+                left: vx,
+                top: vy,
+                right: vx + vw,
+                bottom: vy + vh,
+            };
+            self.draw_layer(
+                buffer.dc,
+                GetDesktopWindow(),
+                vw,
+                vh,
+                bmp,
+                src_size,
+                desktop_rect,
+                false,
+            );
+            let pixels = buffer.pixels_mut();
+            for p in pixels.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+            Some((vw, vh, pixels.to_vec()))
+        }
     }
     /// Test-only file source. Does not read or change the user's desktop setup.
     #[cfg(test)]
@@ -740,6 +886,168 @@ impl Glass {
             (self.width, self.height)
         }
     }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_sharp_blur_field(
+        &self,
+        dc: HDC,
+        hwnd: HWND,
+        width: i32,
+        height: i32,
+        window: RECT,
+        moving: bool,
+        low_moving: bool,
+        fallback_amount: u8,
+        frost_at: impl Fn(i32, i32) -> f32,
+    ) -> bool {
+        let Some(bitmap) = self.bitmap.as_ref().map(|b| b.0) else {
+            return false;
+        };
+        if let Some(sharp) = self
+            .source
+            .as_ref()
+            .map(|s| s.sharp_bitmap())
+            .filter(|b| !b.is_null())
+        {
+            self.draw_layer(
+                dc,
+                hwnd,
+                width,
+                height,
+                sharp,
+                (self.width, self.height),
+                window,
+                low_moving,
+            );
+            let mut scratch = self.blend_buffer.borrow_mut();
+            if scratch
+                .as_ref()
+                .is_none_or(|(owner, b)| *owner != hwnd || b.width != width || b.height != height)
+            {
+                *scratch = crate::compositor::Buffer::plain(width, height, 1.).map(|b| (hwnd, b));
+            }
+            if let Some((_, buffer)) = scratch.as_mut() {
+                if self.style == 0 || self.style == 6 {
+                    PatBlt(buffer.dc, 0, 0, width, height, BLACKNESS);
+                }
+                self.draw_layer(
+                    buffer.dc,
+                    hwnd,
+                    width,
+                    height,
+                    bitmap,
+                    self.blur_size(),
+                    window,
+                    moving,
+                );
+                let hbmp = GetCurrentObject(dc, OBJ_BITMAP as u32);
+                let mut ds: DIBSECTION = zeroed();
+                let is_dib = !hbmp.is_null()
+                    && GetObjectW(hbmp, size_of::<DIBSECTION>() as i32, &mut ds as *mut _ as _)
+                        >= size_of::<BITMAP>() as i32
+                    && !ds.dsBm.bmBits.is_null()
+                    && ds.dsBm.bmBitsPixel == 32
+                    && ds.dsBm.bmWidth >= width
+                    && ds.dsBm.bmHeight.abs() >= height;
+                if is_dib {
+                    GdiFlush();
+                    let dst_stride = ds.dsBm.bmWidthBytes.max(width * 4) as usize;
+                    let dst_px = std::slice::from_raw_parts_mut(
+                        ds.dsBm.bmBits as *mut u8,
+                        height as usize * dst_stride,
+                    );
+                    let blur_px = &buffer.pixels_mut()[..(width as usize * height as usize * 4)];
+                    for y in 0..height as usize {
+                        for x in 0..width as usize {
+                            let a = (frost_at(x as i32, y as i32) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u32;
+                            let di = y * dst_stride + x * 4;
+                            let bi = (y * width as usize + x) * 4;
+                            if a == 255 {
+                                dst_px[di..di + 3].copy_from_slice(&blur_px[bi..bi + 3]);
+                            } else if a > 0 {
+                                let inv = 255 - a;
+                                for c in 0..3 {
+                                    dst_px[di + c] = ((dst_px[di + c] as u32 * inv
+                                        + blur_px[bi + c] as u32 * a
+                                        + 127)
+                                        / 255) as u8;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    AlphaBlend(
+                        dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        buffer.dc,
+                        0,
+                        0,
+                        width,
+                        height,
+                        BLENDFUNCTION {
+                            BlendOp: AC_SRC_OVER as u8,
+                            BlendFlags: 0,
+                            SourceConstantAlpha: fallback_amount,
+                            AlphaFormat: 0,
+                        },
+                    );
+                }
+            }
+            if crate::motion::low_power() && !moving {
+                scratch.take();
+            }
+            true
+        } else {
+            self.draw_layer(
+                dc,
+                hwnd,
+                width,
+                height,
+                bitmap,
+                self.blur_size(),
+                window,
+                moving,
+            );
+            true
+        }
+    }
+    pub unsafe fn draw_with_frost(
+        &self,
+        dc: HDC,
+        hwnd: HWND,
+        width: i32,
+        height: i32,
+        frost_at: impl Fn(i32, i32) -> f32,
+    ) {
+        if self.bitmap.is_none()
+            || width <= 0
+            || height <= 0
+            || width as i64 * height as i64 > 32_000_000
+        {
+            return;
+        }
+        let window = crate::fusion::window_rect(hwnd);
+        let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
+        let low_moving = moving && crate::motion::low_power();
+        if self.style == 0 || self.style == 6 {
+            PatBlt(dc, 0, 0, width, height, BLACKNESS);
+        }
+        self.draw_sharp_blur_field(
+            dc,
+            hwnd,
+            width,
+            height,
+            window,
+            moving,
+            low_moving,
+            255,
+            frost_at,
+        );
+    }
     pub unsafe fn draw_blended(&self, dc: HDC, hwnd: HWND, width: i32, height: i32, amount: u8) {
         let Some(bitmap) = self.bitmap.as_ref().map(|b| b.0) else {
             return;
@@ -747,13 +1055,44 @@ impl Glass {
         if width <= 0 || height <= 0 || width as i64 * height as i64 > 32_000_000 {
             return;
         }
+        if !crate::fusion::is_surface(hwnd) {
+            crate::fusion::frost_strength(hwnd, amount);
+        }
+        let frost_blend = if !crate::fusion::is_surface(hwnd) {
+            crate::fusion::shared_frost(hwnd, width, height, amount)
+        } else {
+            None
+        };
         let window = crate::fusion::window_rect(hwnd);
         let moving = crate::fusion::is_moving(hwnd) || is_resizing(hwnd);
-        let apply_liquid = liquid_glass()
-            && !(moving && crate::motion::low_power())
-            && !crate::fusion::is_surface(hwnd);
+        let low_moving = moving && crate::motion::low_power();
+        let apply_liquid = liquid_glass() && !low_moving && !crate::fusion::is_surface(hwnd);
         if self.style == 0 || self.style == 6 {
             PatBlt(dc, 0, 0, width, height, BLACKNESS);
+        }
+        if let Some(ref fb) = frost_blend {
+            self.draw_sharp_blur_field(
+                dc,
+                hwnd,
+                width,
+                height,
+                window,
+                moving,
+                low_moving,
+                amount,
+                |x, y| fb.sample_local(x, y),
+            );
+            self.finish_liquid_glass(
+                dc,
+                hwnd,
+                width,
+                height,
+                window,
+                apply_liquid,
+                amount,
+                Some(fb),
+            );
+            return;
         }
         // The caller already caches the finished widget background. A second
         // full-monitor bitmap is unnecessary.
@@ -762,8 +1101,17 @@ impl Glass {
             if scratch.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
                 scratch.take();
             }
-            self.draw_layer(dc, hwnd, width, height, bitmap, self.blur_size(), window);
-            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid);
+            self.draw_layer(
+                dc,
+                hwnd,
+                width,
+                height,
+                bitmap,
+                self.blur_size(),
+                window,
+                moving,
+            );
+            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid, amount, None);
             return;
         }
         if let Some(source) = &self.source {
@@ -777,6 +1125,7 @@ impl Glass {
                     sharp,
                     (self.width, self.height),
                     window,
+                    low_moving,
                 );
             }
         }
@@ -785,7 +1134,7 @@ impl Glass {
             if scratch.as_ref().is_some_and(|(owner, _)| *owner == hwnd) {
                 scratch.take();
             }
-            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid);
+            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid, amount, None);
             return;
         }
         let mut scratch = self.blend_buffer.borrow_mut();
@@ -805,6 +1154,7 @@ impl Glass {
                 bitmap,
                 self.blur_size(),
                 window,
+                moving,
             );
             AlphaBlend(
                 dc,
@@ -824,11 +1174,57 @@ impl Glass {
                     AlphaFormat: 0,
                 },
             );
-            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid);
+            self.finish_liquid_glass(dc, hwnd, width, height, window, apply_liquid, amount, None);
         }
         if crate::motion::low_power() && !moving {
             scratch.take();
         }
+    }
+    pub unsafe fn sample_blurred_tile(
+        &self,
+        hwnd: HWND,
+        window: RECT,
+        tw: usize,
+        th: usize,
+    ) -> Option<Vec<[u8; 3]>> {
+        if tw == 0 || th == 0 || tw > 512 || th > 512 {
+            return None;
+        }
+        let bmp = self.bitmap.as_ref()?.0;
+        let (buf, bw, bh, stride) = self.dib_slice(bmp)?;
+        let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
+        let placed = SharpPlacement {
+            buf,
+            w: bw,
+            h: bh,
+            stride,
+            left_f,
+            top_f,
+            dw,
+            dh,
+            tile: self.tile,
+            style: self.style,
+        };
+        let win_w = (window.right - window.left).max(1) as f32;
+        let win_h = (window.bottom - window.top).max(1) as f32;
+        let mut tile = Vec::with_capacity(tw * th);
+        for ty in 0..th {
+            let ly = (ty as f32 + 0.5) / th as f32 * win_h;
+            for tx in 0..tw {
+                let lx = (tx as f32 + 0.5) / tw as f32 * win_w;
+                let b = sample_placed_channel(&placed, lx, ly, 0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let g = sample_placed_channel(&placed, lx, ly, 1)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                let r = sample_placed_channel(&placed, lx, ly, 2)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                tile.push([b, g, r]);
+            }
+        }
+        Some(tile)
     }
     unsafe fn dib_slice<'a>(&self, bmp: HBITMAP) -> Option<(&'a [u8], usize, usize, usize)> {
         if bmp.is_null() {
@@ -854,6 +1250,7 @@ impl Glass {
             stride,
         ))
     }
+    #[allow(clippy::too_many_arguments)]
     unsafe fn finish_liquid_glass(
         &self,
         dc: HDC,
@@ -862,11 +1259,22 @@ impl Glass {
         height: i32,
         window: RECT,
         apply_liquid: bool,
+        amount: u8,
+        frost_blend: Option<&crate::fusion::FrostBlend>,
     ) {
         if apply_liquid {
-            self.apply_liquid_glass_with_source(dc, hwnd, width, height, window);
+            self.apply_liquid_glass_with_source(
+                dc,
+                hwnd,
+                width,
+                height,
+                window,
+                amount,
+                frost_blend,
+            );
         }
     }
+    #[allow(clippy::too_many_arguments)]
     unsafe fn apply_liquid_glass_with_source(
         &self,
         dc: HDC,
@@ -874,16 +1282,17 @@ impl Glass {
         width: i32,
         height: i32,
         window: RECT,
+        amount: u8,
+        frost_blend: Option<&crate::fusion::FrostBlend>,
     ) {
-        let sharp_bmp = self
+        let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
+        let sharp = self
             .source
             .as_ref()
             .map(|s| s.sharp_bitmap())
-            .filter(|b| !b.is_null());
-        let sharp = sharp_bmp.and_then(|bmp| {
-            let (buf, w, h, stride) = self.dib_slice(bmp)?;
-            let (left_f, top_f, dw, dh, _) = self.wallpaper_placement(hwnd, window);
-            Some(SharpPlacement {
+            .filter(|b| !b.is_null())
+            .and_then(|bmp| self.dib_slice(bmp))
+            .map(|(buf, w, h, stride)| SharpPlacement {
                 buf,
                 w,
                 h,
@@ -894,14 +1303,41 @@ impl Glass {
                 dh,
                 tile: self.tile,
                 style: self.style,
-            })
-        });
+            });
+        let blur = self
+            .bitmap
+            .as_ref()
+            .map(|b| b.0)
+            .filter(|b| !b.is_null())
+            .and_then(|bmp| self.dib_slice(bmp))
+            .map(|(buf, w, h, stride)| SharpPlacement {
+                buf,
+                w,
+                h,
+                stride,
+                left_f,
+                top_f,
+                dw,
+                dh,
+                tile: self.tile,
+                style: self.style,
+            });
         let sharp_input = match sharp {
             Some(ref placed) => SharpInput::Placed(placed),
             None => SharpInput::None,
         };
-        self.apply_liquid_glass_impl(dc, sharp_input, width, height, Some((hwnd, window)));
+        self.apply_liquid_glass_impl(
+            dc,
+            sharp_input,
+            blur.as_ref(),
+            amount,
+            width,
+            height,
+            Some((hwnd, window)),
+            frost_blend,
+        );
     }
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn apply_bridge_refraction(
         &self,
         hwnd: HWND,
@@ -911,6 +1347,22 @@ impl Glass {
         dpi: f32,
         pixels: &mut [u8],
         samples: &[(i32, i32, f32, f32, f32, f32, f32, f32)],
+    ) {
+        self.apply_bridge_refraction_with_frost(hwnd, window, w, h, dpi, pixels, samples, |_, _| {
+            1.0
+        });
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn apply_bridge_refraction_with_frost(
+        &self,
+        hwnd: HWND,
+        window: RECT,
+        w: i32,
+        h: i32,
+        dpi: f32,
+        pixels: &mut [u8],
+        samples: &[(i32, i32, f32, f32, f32, f32, f32, f32)],
+        frost_at: impl Fn(i32, i32) -> f32,
     ) {
         if samples.is_empty() || w <= 0 || h <= 0 {
             return;
@@ -968,7 +1420,7 @@ impl Glass {
         let has_sharp = sharp_placed.is_some();
         for &(x, y, d, nx, ny, a, edge, spec) in samples {
             let u = (-d / rim).clamp(0.0, 1.0);
-            let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp);
+            let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp, rim, bend, ca_strength);
             let disp = -bend * edge_align;
             let ca = ca_factor * ca_strength;
             let fx = x as f32 + 0.5;
@@ -977,6 +1429,24 @@ impl Glass {
             let fb = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, ca, dpi, 0);
             let fg = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, 0.0, dpi, 1);
             let fr = sample_placed_disp_2d(&blur_placed, fx, fy, nx, ny, disp, -ca, dpi, 2);
+
+            let local_frost = frost_at(x, y).clamp(0.0, 1.0);
+            let (fb, fg, fr) = if local_frost < 0.999 {
+                if let Some(ref sp) = sharp_placed {
+                    let sb0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, ca, dpi, 0);
+                    let sg0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, 0.0, dpi, 1);
+                    let sr0 = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, -ca, dpi, 2);
+                    (
+                        sb0 + (fb - sb0) * local_frost,
+                        sg0 + (fg - sg0) * local_frost,
+                        sr0 + (fr - sr0) * local_frost,
+                    )
+                } else {
+                    (fb, fg, fr)
+                }
+            } else {
+                (fb, fg, fr)
+            };
 
             let (b, g, r) = if let Some(ref sp) = sharp_placed {
                 if clarity > 0.001 {
@@ -998,8 +1468,11 @@ impl Glass {
 
             let i = ((y * w + x) * 4) as usize;
             let refr = [b, g, r];
+            let weight = inner_rim_weight(u);
             for c in 0..3 {
-                let lit = (refr[c] + (255.0 - refr[c]) * edge + spec).min(255.0);
+                let backing = pixels[i + c] as f32;
+                let value = backing + (refr[c] - backing) * weight;
+                let lit = (value + (255.0 - value) * edge + spec).min(255.0);
                 pixels[i + c] = (lit * a).round() as u8;
             }
         }
@@ -1008,15 +1481,19 @@ impl Glass {
     /// subtle specular rim only across the perimeter band of a 32-bit DIB.
     #[cfg(test)]
     unsafe fn apply_liquid_glass(&self, dc: HDC, width: i32, height: i32) {
-        self.apply_liquid_glass_impl(dc, SharpInput::None, width, height, None);
+        self.apply_liquid_glass_impl(dc, SharpInput::None, None, 255, width, height, None, None);
     }
+    #[allow(clippy::too_many_arguments)]
     unsafe fn apply_liquid_glass_impl(
         &self,
         dc: HDC,
         sharp_input: SharpInput<'_>,
+        blur_placed: Option<&SharpPlacement<'_>>,
+        amount: u8,
         width: i32,
         height: i32,
         fusion_owner: Option<(HWND, RECT)>,
+        frost_blend: Option<&crate::fusion::FrostBlend>,
     ) {
         if width < 16 || height < 16 {
             return;
@@ -1077,10 +1554,13 @@ impl Glass {
             h,
             src,
             sharp_input,
+            blur_placed,
+            amount,
             self.dpi,
             true,
             pane_radius,
             fusion,
+            frost_blend,
         );
         if crate::motion::low_power() {
             *src_guard = Vec::new();
@@ -1164,10 +1644,13 @@ pub fn apply_liquid_glass_rgba(
                 h: sh,
                 pad_f: pad as f32,
             },
+            None,
+            255,
             dpi,
             false,
             pane_radius,
             fusion,
+            None,
         );
         if crate::motion::low_power() && frosted.capacity() > 1024 * 1024 {
             *frosted = Vec::new();
@@ -1229,39 +1712,86 @@ fn sample_disp_2d(
     dpi: f32,
     ch: usize,
 ) -> f32 {
+    sample_refracted_channel(bx, by, nx, ny, disp, signed_ca, dpi, [1., 1.], |x, y| {
+        sample_channel(buf, bw, bh, x, y, ch)
+    })
+}
+
+#[inline]
+fn optical_fade(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
+}
+
+#[inline]
+fn inner_rim_weight(u: f32) -> f32 {
+    // Match the actual backing at the inner edge, including any difference
+    // between GDI's scaled wallpaper and the bilinear refraction sampler.
+    if u <= 0.75 { 1.0 } else { optical_fade((1.0 - u) * 4.0) }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn sample_refracted_channel(
+    bx: f32, by: f32, nx: f32, ny: f32, disp: f32, signed_ca: f32, dpi: f32,
+    pixel_scale: [f32; 2],
+    sample: impl Fn(f32, f32) -> f32,
+) -> f32 {
+    let px = nx * pixel_scale[0];
+    let py = ny * pixel_scale[1];
+    let cx = bx + px * disp;
+    let cy = by + py * disp;
     if signed_ca.abs() <= 0.05 {
-        sample_channel(buf, bw, bh, bx + nx * disp, by + ny * disp, ch)
+        sample(cx, cy)
     } else {
-        let d0 = disp + signed_ca * 0.35;
-        let d1 = disp + signed_ca;
-        let d2 = disp + signed_ca * 1.65;
-        let spread = (signed_ca.abs() * 0.45).max(0.75 * dpi);
-        let tx = -ny * spread;
-        let ty = nx * spread;
-        0.20 * sample_channel(buf, bw, bh, bx + nx * d0, by + ny * d0, ch)
-            + 0.30 * sample_channel(buf, bw, bh, bx + nx * d1, by + ny * d1, ch)
-            + 0.15 * sample_channel(buf, bw, bh, bx + nx * d1 + tx, by + ny * d1 + ty, ch)
-            + 0.15 * sample_channel(buf, bw, bh, bx + nx * d1 - tx, by + ny * d1 - ty, ch)
-            + 0.20 * sample_channel(buf, bw, bh, bx + nx * d2, by + ny * d2, ch)
+        // Shrink the existing five-sample footprint continuously to a point.
+        // This removes the filter threshold seam without extra texture taps.
+        let transition = 0.75 * dpi.max(1.0);
+        let footprint = if signed_ca.abs() >= 0.05 + transition {
+            1.0
+        } else {
+            optical_fade((signed_ca.abs() - 0.05) / transition)
+        };
+        let soft_ca = signed_ca * footprint;
+        let d0 = disp + soft_ca * 0.35;
+        let d1 = disp + soft_ca;
+        let d2 = disp + soft_ca * 1.65;
+        let spread = (signed_ca.abs() * 0.45).max(0.75 * dpi) * footprint;
+        let tx = -ny * spread * pixel_scale[0];
+        let ty = nx * spread * pixel_scale[1];
+        0.20 * sample(bx + px * d0, by + py * d0)
+            + 0.30 * sample(bx + px * d1, by + py * d1)
+            + 0.15 * sample(bx + px * d1 + tx, by + py * d1 + ty)
+            + 0.15 * sample(bx + px * d1 - tx, by + py * d1 - ty)
+            + 0.20 * sample(bx + px * d2, by + py * d2)
     }
 }
 
 /// Curved convex meniscus lens profile (`u = 0` outer rim -> `u = 1` flat interior).
-/// Strictly convex decay concentrates refraction cleanly at the glass bevel without a flat
-/// midpoint inflection (`smoothstep`), paired with a full-rim C² clarity falloff.
+/// Broad meniscus with a bounded gradient and a flat inner endpoint. The colour
+/// split uses the same curve in a narrower rim with its gradient preserved.
 #[inline]
-fn liquid_lens_profile(u: f32, has_sharp: bool) -> (f32, f32, f32) {
+fn liquid_lens_profile(u: f32, has_sharp: bool, rim: f32, bend: f32, ca_strength: f32) -> (f32, f32, f32) {
     let k = (1.0 - u).clamp(0.0, 1.0);
-    let edge_align = 0.65 * k * k * k + 0.35 * k * k;
-    let ca_env = (1.0 - u / 0.65).clamp(0.0, 1.0);
-    let ca_factor = ca_env * ca_env * (0.45 + 1.2 * (u / 0.65).min(1.0));
+    let edge_align = k * k * (2.0 - k);
+    let colour_k = (1.0 - u / 0.65).clamp(0.0, 1.0);
+    // Scale amplitude with width: confine costly colour taps to the bevel
+    // without steepening their coordinate gradient or weakening the main lens.
+    let ca_factor = (0.45 * 0.65) * colour_k * colour_k * (2.0 - colour_k);
     let clarity = if has_sharp && u < 0.88 {
         let s = (1.0 - u / 0.88).clamp(0.0, 1.0);
         0.52 * s * s * s * (s * (s * 6.0 - 15.0) + 10.0)
     } else {
         0.0
     };
-    (edge_align, ca_factor, clarity)
+    // This curve's maximum slope is 4/3, versus 2.65 for the old bevel.
+    // Keep full bending wherever possible instead of flattening every pane.
+    // Reserve the chromatic budget for the filter footprint's <=2.2 gain
+    // and its farthest 1.65 tap (0.45 * 2.2 * 1.65 < 1.65). Short pills
+    // still receive the same no-fold bound, for every tap rather than its mean.
+    let strain = (4.0 / 3.0) * (bend.abs() + 1.65 * ca_strength.abs());
+    let strength = (0.65 * rim.max(0.) / strain.max(1e-5)).min(1.);
+    (edge_align * strength, ca_factor * strength, clarity)
 }
 
 #[inline]
@@ -1329,21 +1859,19 @@ fn sample_placed_disp_2d(
     dpi: f32,
     ch: usize,
 ) -> f32 {
-    if signed_ca.abs() <= 0.05 {
-        sample_placed_channel(p, bx + nx * disp, by + ny * disp, ch)
-    } else {
-        let d0 = disp + signed_ca * 0.35;
-        let d1 = disp + signed_ca;
-        let d2 = disp + signed_ca * 1.65;
-        let spread = (signed_ca.abs() * 0.45).max(0.75 * dpi);
-        let tx = -ny * spread;
-        let ty = nx * spread;
-        0.20 * sample_placed_channel(p, bx + nx * d0, by + ny * d0, ch)
-            + 0.30 * sample_placed_channel(p, bx + nx * d1, by + ny * d1, ch)
-            + 0.15 * sample_placed_channel(p, bx + nx * d1 + tx, by + ny * d1 + ty, ch)
-            + 0.15 * sample_placed_channel(p, bx + nx * d1 - tx, by + ny * d1 - ty, ch)
-            + 0.20 * sample_placed_channel(p, bx + nx * d2, by + ny * d2, ch)
+    if !p.tile && p.style != 0 && p.style != 6 {
+        // Convert the lens into texture space once, rather than dividing and
+        // clamping desktop coordinates again for each chromatic filter tap.
+        let scale = [p.w as f32 / p.dw.max(1.), p.h as f32 / p.dh.max(1.)];
+        let x = (bx - p.left_f) * scale[0] - 0.5;
+        let y = (by - p.top_f) * scale[1] - 0.5;
+        return sample_refracted_channel(x, y, nx, ny, disp, signed_ca, dpi, scale, |x, y| {
+            sample_channel_stride(p.buf, p.w, p.h, p.stride, x, y, ch)
+        });
     }
+    sample_refracted_channel(bx, by, nx, ny, disp, signed_ca, dpi, [1., 1.], |x, y| {
+        sample_placed_channel(p, x, y, ch)
+    })
 }
 
 /// Evaluates a single Liquid Glass rim pixel (`[B, G, R]`) from an opaque BGRA
@@ -1365,7 +1893,7 @@ pub fn refract_bgra_card_pixel(
     dpi: f32,
 ) -> [u8; 3] {
     let u = (-d / rim).clamp(0.0, 1.0);
-    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false);
+    let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
     let disp = -bend * edge_align;
     let ca = ca_factor * ca_strength;
 
@@ -1381,11 +1909,17 @@ pub fn refract_bgra_card_pixel(
     } else {
         0.0
     };
-    [
-        (b + spec).min(255.0) as u8,
-        (g + spec).min(255.0) as u8,
-        (r + spec).min(255.0) as u8,
-    ]
+    let weight = inner_rim_weight(u);
+    std::array::from_fn(|ch| {
+        let refracted = ([b, g, r][ch] + spec).min(255.0);
+        let value = if weight < 1.0 {
+            let backing = sample_channel(source, sw, sh, x, y, ch);
+            backing + (refracted - backing) * weight
+        } else {
+            refracted
+        };
+        value.clamp(0.0, 255.0) as u8
+    })
 }
 
 /// Applies Liquid Glass edge refraction, 2D-blurred chromatic aberration, and a
@@ -1435,7 +1969,7 @@ pub fn apply_liquid_glass_premul_bgra(
                     let a = src[i + 3];
                     if a > 0 {
                         let u = (-d / rim).clamp(0.0, 1.0);
-                        let (edge_align, ca_factor, _) = liquid_lens_profile(u, false);
+                        let (edge_align, ca_factor, _) = liquid_lens_profile(u, false, rim, bend, ca_strength);
                         let disp = -bend * edge_align;
                         let ca = ca_factor * ca_strength;
 
@@ -1457,9 +1991,13 @@ pub fn apply_liquid_glass_premul_bgra(
                             0.0
                         };
 
-                        buf[i] = ((b + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
-                        buf[i + 1] = ((g + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
-                        buf[i + 2] = ((r + spec).min(255.0) * a_norm).round().min(a as f32) as u8;
+                        let weight = inner_rim_weight(u);
+                        for (ch, refracted) in [b, g, r].into_iter().enumerate() {
+                            let value = (refracted + spec).min(255.0) * a_norm;
+                            let backing = src[i + ch] as f32;
+                            buf[i + ch] = (backing + (value - backing) * weight)
+                                .round().clamp(0.0, a as f32) as u8;
+                        }
                     }
                 }
                 x += 1;
@@ -1479,10 +2017,13 @@ fn apply_liquid_glass_pixels(
     h: usize,
     frosted: &[u8],
     sharp_input: SharpInput<'_>,
+    blur_placed: Option<&SharpPlacement<'_>>,
+    amount: u8,
     dpi: f32,
     bgra: bool,
     pane_radius: Option<f32>,
     fusion: Option<(Vec<crate::fusion::geometry::Pane>, [f32; 2])>,
+    frost_blend: Option<&crate::fusion::FrostBlend>,
 ) {
     let dpi = dpi.max(1.0);
     let min_dim = w.min(h) as f32;
@@ -1502,100 +2043,192 @@ fn apply_liquid_glass_pixels(
     let corner_y = inset + radius.max(rim);
     let (ch_r, ch_g, ch_b) = if bgra { (2, 1, 0) } else { (0, 1, 2) };
     let has_sharp = !matches!(sharp_input, SharpInput::None);
+    let sharp_placed = match sharp_input {
+        SharpInput::Placed(p) => Some(p),
+        _ => None,
+    };
+    let blur_ratio = f32::from(amount) / 255.0;
 
-    let mut apply_pixel = |x: usize, y: usize, d: f32, nx: f32, ny: f32| {
-        if d <= -rim || d > 0.5 {
-            return;
-        }
-        let u = (-d / rim).clamp(0.0, 1.0);
-        let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp);
-        let disp = -bend * edge_align;
-        let ca = ca_factor * ca_strength;
+    // Workers only read wallpaper/snapshot bytes and own disjoint output rows.
+    // All HDC work and GdiFlush happen on the UI thread before this CPU pass.
+    let render_rows = |rows: Vec<(usize, &mut [u8])>| {
+        let apply_pixel = |dst_row: &mut [u8], x: usize, y: usize, d: f32, nx: f32, ny: f32| {
+            if d <= -rim || d > 0.5 {
+                return;
+            }
+            let u = (-d / rim).clamp(0.0, 1.0);
+            let (edge_align, ca_factor, clarity) = liquid_lens_profile(u, has_sharp, rim, bend, ca_strength);
+            let disp = -bend * edge_align;
+            let ca = ca_factor * ca_strength;
 
-        let fb = sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, ch_b);
-        let fg = sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, ch_g);
-        let fr = sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, ch_r);
-
-        let (b, g, r) = if clarity > 0.001 {
-            let ca_s = ca * 0.45;
-            match sharp_input {
-                SharpInput::None => (fb, fg, fr),
-                SharpInput::Buffer { buf, w: sw, h: sh, pad_f } => {
-                    let sx = x as f32 + pad_f;
-                    let sy = y as f32 + pad_f;
-                    let sb = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, ca_s, dpi, ch_b);
-                    let sg = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, 0.0, dpi, ch_g);
-                    let sr = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, -ca_s, dpi, ch_r);
-                    (
-                        fb + (sb - fb) * clarity,
-                        fg + (sg - fg) * clarity,
-                        fr + (sr - fr) * clarity,
-                    )
+            let local_blur = frost_blend.map_or(blur_ratio, |fb| fb.sample_local(x as i32, y as i32));
+            let (fb, fg, fr) = if let Some(bp) =
+                blur_placed.filter(|_| local_blur >= 0.999 || sharp_placed.is_some())
+            {
+                let fx = x as f32 + 0.5;
+                let fy = y as f32 + 0.5;
+                let bb = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, ca, dpi, ch_b);
+                let bg = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                let br = sample_placed_disp_2d(bp, fx, fy, nx, ny, disp, -ca, dpi, ch_r);
+                if local_blur < 0.999 {
+                    if let Some(sp) = sharp_placed {
+                        let sb = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, ca, dpi, ch_b);
+                        let sg = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                        let sr = sample_placed_disp_2d(sp, fx, fy, nx, ny, disp, -ca, dpi, ch_r);
+                        (
+                            sb + (bb - sb) * local_blur,
+                            sg + (bg - sg) * local_blur,
+                            sr + (br - sr) * local_blur,
+                        )
+                    } else {
+                        (bb, bg, br)
+                    }
+                } else {
+                    (bb, bg, br)
                 }
-                SharpInput::Placed(p) => {
-                    let fx = x as f32 + 0.5;
-                    let fy = y as f32 + 0.5;
-                    let sb = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, ca_s, dpi, ch_b);
-                    let sg = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
-                    let sr = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, -ca_s, dpi, ch_r);
-                    (
-                        fb + (sb - fb) * clarity,
-                        fg + (sg - fg) * clarity,
-                        fr + (sr - fr) * clarity,
-                    )
+            } else {
+                (
+                    sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, ca, dpi, ch_b),
+                    sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, 0.0, dpi, ch_g),
+                    sample_disp_2d(frosted, w, h, x as f32, y as f32, nx, ny, disp, -ca, dpi, ch_r),
+                )
+            };
+
+            let (b, g, r) = if clarity > 0.001 {
+                let ca_s = ca * 0.45;
+                match sharp_input {
+                    SharpInput::None => (fb, fg, fr),
+                    SharpInput::Buffer { buf, w: sw, h: sh, pad_f } => {
+                        let sx = x as f32 + pad_f;
+                        let sy = y as f32 + pad_f;
+                        let sb = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, ca_s, dpi, ch_b);
+                        let sg = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, 0.0, dpi, ch_g);
+                        let sr = sample_disp_2d(buf, sw, sh, sx, sy, nx, ny, disp, -ca_s, dpi, ch_r);
+                        (
+                            fb + (sb - fb) * clarity,
+                            fg + (sg - fg) * clarity,
+                            fr + (sr - fr) * clarity,
+                        )
+                    }
+                    SharpInput::Placed(p) => {
+                        let fx = x as f32 + 0.5;
+                        let fy = y as f32 + 0.5;
+                        let sb = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, ca_s, dpi, ch_b);
+                        let sg = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, 0.0, dpi, ch_g);
+                        let sr = sample_placed_disp_2d(p, fx, fy, nx, ny, disp, -ca_s, dpi, ch_r);
+                        (
+                            fb + (sb - fb) * clarity,
+                            fg + (sg - fg) * clarity,
+                            fr + (sr - fr) * clarity,
+                        )
+                    }
+                }
+            } else {
+                (fb, fg, fr)
+            };
+
+            let i = x * 4;
+            let weight = inner_rim_weight(u);
+            if weight >= 1.0 {
+                dst_row[i + ch_b] = b.clamp(0.0, 255.0) as u8;
+                dst_row[i + ch_g] = g.clamp(0.0, 255.0) as u8;
+                dst_row[i + ch_r] = r.clamp(0.0, 255.0) as u8;
+            } else {
+                let source_i = (y * w + x) * 4;
+                for (ch, refracted) in [(ch_b, b), (ch_g, g), (ch_r, r)] {
+                    let backing = frosted[source_i + ch] as f32;
+                    dst_row[i + ch] = (backing + (refracted - backing) * weight)
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
-        } else {
-            (fb, fg, fr)
         };
 
-        let i = y * dst_stride + x * 4;
-        dst_buf[i + ch_b] = b.clamp(0.0, 255.0) as u8;
-        dst_buf[i + ch_g] = g.clamp(0.0, 255.0) as u8;
-        dst_buf[i + ch_r] = r.clamp(0.0, 255.0) as u8;
-    };
-
-    if let Some((panes, origin)) = fusion {
-        let skip_margin = rim / dpi + 1.0;
-        crate::fusion::geometry::with_outline(&panes, |outline| {
-            for y in 0..h {
-                let gy = origin[1] + y as f32 + 0.5;
-                for x in 0..w {
-                    let gx = origin[0] + x as f32 + 0.5;
-                    if crate::fusion::geometry::covered_core_within(&panes, gx, gy, skip_margin) {
-                        continue;
-                    }
-                    let d = outline.distance([gx, gy]);
-                    if d > -rim && d <= 0.5 {
-                        let dx = outline.distance([gx + 1.0, gy]) - outline.distance([gx - 1.0, gy]);
-                        let dy = outline.distance([gx, gy + 1.0]) - outline.distance([gx, gy - 1.0]);
-                        let len = (dx * dx + dy * dy).sqrt().max(1e-5);
-                        apply_pixel(x, y, d, dx / len, dy / len);
+        if let Some((panes, origin)) = &fusion {
+            let skip_margin = rim / dpi + 1.0;
+            crate::fusion::geometry::with_outline(&panes, |outline| {
+                for (y, dst_row) in rows {
+                    let gy = origin[1] + y as f32 + 0.5;
+                    for x in 0..w {
+                        let gx = origin[0] + x as f32 + 0.5;
+                        if crate::fusion::geometry::covered_core_within(&panes, gx, gy, skip_margin) {
+                            continue;
+                        }
+                        let d = outline.distance([gx, gy]);
+                        if d > -rim && d <= 0.5 {
+                            let dx = outline.distance([gx + 1.0, gy]) - outline.distance([gx - 1.0, gy]);
+                            let dy = outline.distance([gx, gy + 1.0]) - outline.distance([gx, gy - 1.0]);
+                            let len = (dx * dx + dy * dy).sqrt().max(1e-5);
+                            apply_pixel(dst_row, x, y, d, dx / len, dy / len);
+                        }
                     }
                 }
-            }
-        });
-        return;
-    }
-
-    for y in 0..h {
-        let fy = y as f32 + 0.5;
-        let py = fy - inset;
-        let in_straight_band = fy >= corner_y && fy <= h as f32 - corner_y;
-
-        let mut x = 0usize;
-        while x < w {
-            if in_straight_band && x == rim_x && w > rim_x * 2 {
-                x = w - rim_x;
-            }
-            let fx = x as f32 + 0.5;
-            let px = fx - inset;
-            let (d, nx, ny) = rounded_rect_sdf(px, py, hw, hh, rx, ry, radius);
-            if d > -rim && d <= 0.5 {
-                apply_pixel(x, y, d, nx, ny);
-            }
-            x += 1;
+            });
+            return;
         }
+
+        for (y, dst_row) in rows {
+            let fy = y as f32 + 0.5;
+            let py = fy - inset;
+            let in_straight_band = fy >= corner_y && fy <= h as f32 - corner_y;
+
+            let mut x = 0usize;
+            while x < w {
+                if in_straight_band && x == rim_x && w > rim_x * 2 {
+                    x = w - rim_x;
+                }
+                let fx = x as f32 + 0.5;
+                let px = fx - inset;
+                let (d, nx, ny) = rounded_rect_sdf(px, py, hw, hh, rx, ry, radius);
+                if d > -rim && d <= 0.5 {
+                    apply_pixel(dst_row, x, y, d, nx, ny);
+                }
+                x += 1;
+            }
+        }
+    };
+
+    with_pixel_rows_parallel(dst_buf, dst_stride, 0..h, w * h, 196_608, render_rows);
+}
+
+/// CPU-only optical passes. Workers receive disjoint row slices; callers finish
+/// all GDI work before entering and don't present until the scoped jobs join.
+pub(crate) fn with_pixel_rows_parallel(
+    pixels: &mut [u8],
+    stride: usize,
+    rows: std::ops::Range<usize>,
+    work_pixels: usize,
+    threshold: usize,
+    render_rows: impl Fn(Vec<(usize, &mut [u8])>) + Sync,
+) {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let workers = if work_pixels < threshold || crate::motion::low_power() {
+        1
+    } else {
+        *WORKERS.get_or_init(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| (n.get() / 2).clamp(1, 8))
+        })
+    };
+    let workers = workers.min(if work_pixels < 196_608 { 4 } else { 8 });
+    let mut batches: Vec<Vec<_>> = (0..workers)
+        .map(|_| Vec::with_capacity(rows.len().div_ceil(workers)))
+        .collect();
+    for (y, row) in pixels.chunks_exact_mut(stride).enumerate().take(rows.end).skip(rows.start) {
+        // Interleave rows so top/bottom rims don't overload two workers while
+        // other workers only get the much cheaper flat middle of the card.
+        batches[y % workers].push((y, row));
+    }
+    if workers == 1 {
+        render_rows(batches.pop().unwrap());
+    } else {
+        std::thread::scope(|scope| {
+            let ui_rows = batches.pop().unwrap();
+            let render = &render_rows;
+            for rows in batches {
+                scope.spawn(move || render(rows));
+            }
+            render(ui_rows);
+        });
     }
 }
 impl Glass {
@@ -1650,6 +2283,66 @@ impl Glass {
         bitmap: HBITMAP,
         src_size: (i32, i32),
         window: RECT,
+        fast: bool,
+    ) {
+        let area = self.monitor_origin_size(hwnd);
+        let [ax, ay, aw, ah] = area;
+        let bytes = aw.max(0) as usize * ah.max(0) as usize * 4;
+        // Cache the shared wallpaper at monitor resolution, not a frozen
+        // widget frame. Every paint crops the CURRENT desktop coordinates and
+        // applies the current lens afterwards. Straddling/off-screen windows
+        // retain the original placement path.
+        if bitmap.is_null() || aw <= 0 || ah <= 0 || bytes > 32 * 1024 * 1024
+            || window.left < ax || window.top < ay
+            || window.left as i64 + width as i64 > ax as i64 + aw as i64
+            || window.top as i64 + height as i64 > ay as i64 + ah as i64
+        {
+            self.draw_layer_uncached(dc, hwnd, width, height, bitmap, src_size, window, fast);
+            return;
+        }
+        let key = (
+            self.path.clone(), self.revision(), bitmap as usize, area, self.style,
+            self.tile, self.dpi.to_bits(), src_size, self.natural.map(f32::to_bits),
+        );
+        NATIVE_LAYERS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let index = if let Some(index) = cache.iter().position(|(k, _)| *k == key) {
+                index
+            } else {
+                let Some(layer) = crate::compositor::Buffer::plain(aw, ah, 1.) else {
+                    self.draw_layer_uncached(dc, hwnd, width, height, bitmap, src_size, window, fast);
+                    return;
+                };
+                PatBlt(layer.dc, 0, 0, aw, ah, BLACKNESS);
+                self.draw_layer_uncached(
+                    layer.dc, hwnd, aw, ah, bitmap, src_size,
+                    RECT { left: ax, top: ay, right: ax + aw, bottom: ay + ah }, false,
+                );
+                GdiFlush();
+                while !cache.is_empty() && (cache.len() >= 6
+                    || cache.iter().map(|(_, b)| b.width as usize * b.height as usize * 4).sum::<usize>() + bytes > 64 * 1024 * 1024)
+                {
+                    cache.remove(0);
+                }
+                cache.push((key, layer));
+                cache.len() - 1
+            };
+            let layer = cache.remove(index);
+            BitBlt(dc, 0, 0, width, height, layer.1.dc, window.left - ax, window.top - ay, SRCCOPY);
+            cache.push(layer);
+        });
+    }
+
+    unsafe fn draw_layer_uncached(
+        &self,
+        dc: HDC,
+        hwnd: HWND,
+        width: i32,
+        height: i32,
+        bitmap: HBITMAP,
+        src_size: (i32, i32),
+        window: RECT,
+        fast: bool,
     ) {
         if bitmap.is_null() {
             return;
@@ -1659,8 +2352,10 @@ impl Glass {
         let top = top_f.round() as i32;
         let source = CreateCompatibleDC(dc);
         let previous = SelectObject(source, bitmap);
-        SetStretchBltMode(dc, HALFTONE);
-        SetBrushOrgEx(dc, 0, 0, null_mut());
+        SetStretchBltMode(dc, if fast { COLORONCOLOR } else { HALFTONE });
+        if !fast {
+            SetBrushOrgEx(dc, 0, 0, null_mut());
+        }
         if self.tile {
             let step_x = (dw.round() as i32).max(1);
             let step_y = (dh.round() as i32).max(1);
@@ -2076,6 +2771,234 @@ pub unsafe fn dib(width: i32, height: i32, bytes: &[u8]) -> Option<HBITMAP> {
 mod tests {
     use super::*;
     #[test]
+    fn liquid_meniscus_retains_outer_bend_and_strong_card_refraction() {
+        for dpi in [1., 1.25, 1.75, 2.] {
+            let (outer, colour, _) = liquid_lens_profile(0., false, 40. * dpi, 12.5 * dpi, 4.5 * dpi);
+            assert!(outer >= 0.97, "full-size glass must retain almost all original edge displacement");
+            assert!(colour >= 0.28, "the glass edge must retain visible colour separation");
+            let (card, _, _) = liquid_lens_profile(0., false, 20. * dpi, 10. * dpi, 3.5 * dpi);
+            assert!(card >= 0.60, "nested glass must not become visually flat");
+        }
+    }
+    #[test]
+    fn liquid_rim_never_folds_or_stretches_a_source_row_into_a_stripe() {
+        for dpi in [1., 1.25, 1.75, 2.] {
+            for (rim, bend, ca_strength) in [(40. * dpi, 12.5 * dpi, 4.5 * dpi),
+                (20. * dpi, 10. * dpi, 3.5 * dpi), (9. * dpi, 10. * dpi, 3.5 * dpi)] {
+                for channel_sign in [-1., 0., 1.] {
+                    let mapped = |depth: f32| {
+                        let (edge, ca, _) = liquid_lens_profile(depth / rim, false, rim, bend, ca_strength);
+                        let taps = RefCell::new(Vec::new());
+                        let mean = sample_refracted_channel(64., 64. + depth, 0., -1.,
+                            -bend * edge, channel_sign * ca_strength * ca, dpi, [1., 1.], |_, y| {
+                                taps.borrow_mut().push(y);
+                                y
+                            });
+                        (mean, taps.into_inner())
+                    };
+                    let step = rim / 2048.;
+                    for i in 0..2048 {
+                        let depth = i as f32 * step;
+                        let (a, taps_a) = mapped(depth);
+                        let (b, taps_b) = mapped(depth + step);
+                        let slope = (b - a) / step;
+                        assert!(slope >= 0.35, "source row collapses/folds: dpi={dpi} rim={rim} channel={channel_sign} depth={depth} slope={slope}");
+                        if taps_a.len() == taps_b.len() {
+                            for (a, b) in taps_a.into_iter().zip(taps_b) {
+                                let slope = (b - a) / step;
+                                assert!(slope >= 0.35, "individual optical tap stretches: dpi={dpi} rim={rim} channel={channel_sign} depth={depth} slope={slope}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn parallel_refraction_matches_serial_pixels_including_fusion_and_row_padding() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) { crate::motion::set_low_power(self.0); }
+        }
+        let _reset = Reset(crate::motion::low_power());
+        let (w, h) = (640usize, 400usize);
+        let stride = w * 4 + 16;
+        let source: Vec<u8> = (0..w * h)
+            .flat_map(|i| [((i * 37) % 256) as u8, ((i * 61) % 256) as u8, ((i * 17) % 256) as u8, 173])
+            .collect();
+        let mut initial = vec![29u8; stride * h];
+        for y in 0..h {
+            initial[y * stride..y * stride + w * 4]
+                .copy_from_slice(&source[y * w * 4..(y + 1) * w * 4]);
+        }
+        let pane = |id, rect| crate::fusion::geometry::Pane {
+            id, rect, radius: 34., dpi: 1.25, topmost: false,
+        };
+        for fusion in [None, Some((vec![
+            pane(1, [4., 4., 340., 396.]),
+            pane(2, [340., 40., 636., 396.]),
+        ], [0., 0.]))] {
+            let mut serial = initial.clone();
+            let mut parallel = initial.clone();
+            crate::motion::set_low_power(true);
+            apply_liquid_glass_pixels(
+                &mut serial, stride, w, h, &source, SharpInput::None, None,
+                255, 1.25, true, Some(34.), fusion.clone(), None,
+            );
+            crate::motion::set_low_power(false);
+            apply_liquid_glass_pixels(
+                &mut parallel, stride, w, h, &source, SharpInput::None, None,
+                255, 1.25, true, Some(34.), fusion, None,
+            );
+            assert!(serial == parallel, "parallel optics must produce identical pixels, alpha and padding");
+        }
+    }
+
+    #[test]
+    fn texture_space_refraction_matches_desktop_sampling_with_nonuniform_scale() {
+        let (w, h, stride) = (64usize, 40usize, 272usize);
+        let mut pixels = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    pixels[y * stride + x * 4 + c] = ((x * 37 + y * 61 + c * 17) % 256) as u8;
+                }
+            }
+        }
+        for (dw, dh) in [(193.5, 71.25), (31.75, 83.5)] {
+            for style in [0, 2, 6, 10, 22] {
+                for tile in [false, true] {
+                    let p = SharpPlacement {
+                        buf: &pixels, w, h, stride, left_f: -13.25, top_f: 7.5,
+                        dw, dh, tile, style,
+                    };
+                    for (bx, by) in [(-30., -10.), (0.25, 9.75), (21., 35.), (80., 50.), (200., 100.)] {
+                        for (nx, ny) in [(0., 1.), (1., 0.), (0.6, -0.8)] {
+                            for ca in [-5., -0.15, 0., 0.15, 5.] {
+                                for ch in 0..3 {
+                                    let expected = sample_refracted_channel(
+                                        bx, by, nx, ny, -7.25, ca, 1.75, [1., 1.],
+                                        |x, y| sample_placed_channel(&p, x, y, ch),
+                                    );
+                                    let actual = sample_placed_disp_2d(&p, bx, by, nx, ny, -7.25, ca, 1.75, ch);
+                                    assert!((actual - expected).abs() < 0.02,
+                                        "mapping changed: {actual} vs {expected}, style={style}, tile={tile}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Read-only wallpaper preview of the actual search and group glass paths"]
+    fn preview_textured_nested_glass() {
+        let _ui = crate::native_ui_test_lock();
+        let _runtime = crate::render::Runtime::start().unwrap();
+        let path = PathBuf::from(std::env::var_os("LUMEN_EDGE_WALLPAPER").expect("wallpaper path"));
+        let out = PathBuf::from(std::env::var_os("LUMEN_VERIFY_DIR").expect("output folder"));
+        std::fs::create_dir_all(&out).unwrap();
+        let prev = liquid_glass();
+        set_liquid_glass(true);
+        unsafe {
+            let dpi = 1.75;
+            let (w, h) = (926, 1040);
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                crate::model::wide("STATIC").as_ptr(),
+                crate::model::wide("Lumen nested glass preview").as_ptr(),
+                WS_POPUP, 100, 100, w, h,
+                null_mut(), null_mut(), null_mut(), std::ptr::null(),
+            );
+            assert!(!hwnd.is_null());
+            let glass = Glass::fixture_file(&path, 0., dpi);
+            let mut backing = crate::compositor::Buffer::new(w, h, dpi, 34.).unwrap();
+            glass.draw_blended(backing.dc, hwnd, w, h, 255);
+            backing.background_alpha(255);
+            let frame = crate::compositor::Buffer::new(w, h, dpi, 34.).unwrap();
+            frame.copy_from(backing.dc);
+            let search = [16., 14., w as f32 / dpi - 16., 60.];
+            let group = [16., 80., 322., 166.];
+            backing.restore_glass_card(frame.dc, search, 23.);
+            backing.restore_glass_card(frame.dc, group, 20.);
+            {
+                let _batch = crate::render::AlphaBatch::new(frame.dc, dpi);
+                let c = crate::render::Canvas::new(frame.dc, dpi);
+                c.search_surface(search, 23., 0x808080, false);
+                c.group_surface_live(group, 20., false);
+                c.text("Search apps...", [45., 26., 260., 52.], 14., false, 0xeeeeee, 0);
+                for (label, x, color) in [("Pr", 38., 0x990000), ("Ai", 137., 0x000033), ("Ps", 236., 0x332200)] {
+                    c.round([x, 90., x + 44., 134.], 9., color, 255, false, false);
+                    c.text(label, [x, 96., x + 44., 129.], 23., true, 0xeeddaa, 1);
+                }
+            }
+            crate::render::flush(frame.dc);
+            let mut pixels = frame.snapshot();
+            for p in pixels.chunks_exact_mut(4) { p.swap(0, 2); p[3] = 255; }
+            let image = image::RgbaImage::from_raw(w as u32, h as u32, pixels).unwrap();
+            image::imageops::crop_imm(&image, 0, 0, 620, 330)
+                .to_image().save(out.join("nested_glass.png")).unwrap();
+            DestroyWindow(hwnd);
+        }
+        set_liquid_glass(prev);
+    }
+
+    #[test]
+    fn dispersion_filter_is_continuous_at_the_single_sample_threshold() {
+        let (w, h) = (48usize, 48usize);
+        let mut pixels = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x + y) % 2 == 0 { 24 } else { 232 };
+                pixels[(y * w + x) * 4..][..4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let placed = SharpPlacement {
+            buf: &pixels, w, h, stride: w * 4,
+            left_f: 0., top_f: 0., dw: w as f32, dh: h as f32,
+            tile: false, style: 10,
+        };
+        for dpi in [1.0, 1.25, 1.75, 2.0] {
+            for (nx, ny) in [(0., 1.), (1., 0.), (0.6, 0.8)] {
+                for sign in [-1., 1.] {
+                    let a = sample_disp_2d(&pixels, w, h, 24., 24., nx, ny, 0., sign * 0.0499, dpi, 1);
+                    let b = sample_disp_2d(&pixels, w, h, 24., 24., nx, ny, 0., sign * 0.0501, dpi, 1);
+                    assert!((a - b).abs() < 0.5, "buffer threshold seam: {a} -> {b}, dpi={dpi}");
+                    let a = sample_placed_disp_2d(&placed, 24.5, 24.5, nx, ny, 0., sign * 0.0499, dpi, 1);
+                    let b = sample_placed_disp_2d(&placed, 24.5, 24.5, nx, ny, 0., sign * 0.0501, dpi, 1);
+                    assert!((a - b).abs() < 0.5, "wallpaper threshold seam: {a} -> {b}, dpi={dpi}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn liquid_inner_rim_blends_into_the_original_backing_without_a_scanline() {
+        let (w, h) = (200usize, 140usize);
+        let original = [64u8, 64, 64, 173].repeat(w * h);
+        let different_filter = [240u8, 240, 240, 255].repeat(w * h);
+        let placed = SharpPlacement {
+            buf: &different_filter, w, h, stride: w * 4,
+            left_f: 0., top_f: 0., dw: w as f32, dh: h as f32,
+            tile: false, style: 10,
+        };
+        let mut out = original.clone();
+        apply_liquid_glass_pixels(
+            &mut out, w * 4, w, h, &original, SharpInput::None, Some(&placed),
+            255, 1., true, Some(32.), None, None,
+        );
+        let at = |y: usize| out[(y * w + w / 2) * 4] as i32;
+        for y in 24..60 {
+            assert!((at(y + 1) - at(y)).abs() < 55, "inner rim cliff at y={y}: {} -> {}", at(y), at(y + 1));
+        }
+        assert_eq!(&out[(70 * w + 100) * 4..][..4], &[64, 64, 64, 173]);
+        assert!(out.chunks_exact(4).all(|p| p[3] == 173), "optics must not change alpha coverage");
+    }
+
+    #[test]
     fn viewport_render_matches_the_old_monitor_crop_and_only_blends_in_viewport_memory() {
         let _ui = crate::native_ui_test_lock();
         unsafe {
@@ -2141,7 +3064,7 @@ mod tests {
                 glass.style = style;
                 PatBlt(full.dc, 0, 0, full.width, full.height, BLACKNESS);
                 PatBlt(crop.dc, 0, 0, 96, 64, WHITENESS);
-                glass.draw_layer(
+                glass.draw_layer_uncached(
                     full.dc,
                     hwnd,
                     full.width,
@@ -2149,6 +3072,7 @@ mod tests {
                     glass.bitmap.as_ref().unwrap().0,
                     glass.blur_size(),
                     area,
+                    false,
                 );
                 glass.draw_blended(crop.dc, hwnd, 96, 64, 255);
                 for y in (0..64).step_by(8) {
@@ -2623,5 +3547,79 @@ mod tests {
         assert_eq!(glass.raw_wallpaper_accent(), dominant);
         assert_eq!(glass.wallpaper_accent(), crate::accent::vivid(dominant));
         assert_ne!(glass.raw_wallpaper_accent(), glass.wallpaper_accent());
+    }
+    #[test]
+    fn liquid_glass_stays_active_during_resize_outside_low_power() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                wide("STATIC").as_ptr(),
+                wide("Lumen liquid resize test").as_ptr(),
+                WS_POPUP,
+                100,
+                100,
+                120,
+                80,
+                null_mut(),
+                null_mut(),
+                windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            );
+            assert!(!hwnd.is_null());
+            struct Reset(HWND, bool, bool);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    set_resizing(self.0, false);
+                    set_liquid_glass(self.1);
+                    crate::motion::set_low_power(self.2);
+                    unsafe {
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _reset = Reset(hwnd, liquid_glass(), crate::motion::low_power());
+            set_liquid_glass(true);
+            set_resizing(hwnd, true);
+
+            let mut glass = Glass::new(0., 1.);
+            glass.style = 2; // Stretch across desktop
+            glass.width = 256;
+            glass.height = 256;
+            glass.natural = [256., 256.];
+            let wall: Vec<u8> = (0..256)
+                .flat_map(|y| {
+                    (0..256).flat_map(move |x| {
+                        let r = ((x * 3 + y) % 240) as u8;
+                        let g = ((x + y * 2) % 220) as u8;
+                        let b = 220u8.saturating_sub(((x * 2) % 180) as u8);
+                        [b, g, r, 255]
+                    })
+                })
+                .collect();
+            glass.bitmap = Some(Rc::new(OwnedBitmap(dib(256, 256, &wall).unwrap())));
+
+            crate::motion::set_low_power(false);
+            let normal = crate::compositor::Buffer::plain(120, 80, 1.0).unwrap();
+            glass.draw_blended(normal.dc, hwnd, 120, 80, 255);
+
+            crate::motion::set_low_power(true);
+            let low = crate::compositor::Buffer::plain(120, 80, 1.0).unwrap();
+            glass.draw_blended(low.dc, hwnd, 120, 80, 255);
+
+            let npx = normal.snapshot();
+            let lpx = low.snapshot();
+            let mut rim_diff = 0u32;
+            for x in 1..12usize {
+                let i = (40 * 120 + x) * 4;
+                rim_diff += npx[i].abs_diff(lpx[i]) as u32
+                    + npx[i + 1].abs_diff(lpx[i + 1]) as u32
+                    + npx[i + 2].abs_diff(lpx[i + 2]) as u32;
+            }
+            assert!(
+                rim_diff > 15,
+                "liquid glass rim must remain active while resizing outside low-power mode (rim_diff={rim_diff})"
+            );
+        }
     }
 }

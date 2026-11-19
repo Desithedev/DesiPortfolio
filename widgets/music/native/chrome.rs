@@ -1,7 +1,7 @@
 //! Dock material primitives and consistent media controls for all Music designs.
 use super::*;
 impl State {
-    pub(super) unsafe fn chrome(&mut self, bg: &mut Buffer, size: [f32; 2]) {
+    pub(super) unsafe fn chrome_into(&self, dc: HDC, pixel_size: [u32; 2], size: [f32; 2]) {
         let [w, h] = size;
         let color = self.surface_color();
         let light = crate::accent::light(color);
@@ -21,7 +21,7 @@ impl State {
         let radius = if fused { 0. } else { 34. };
         // Exactly Dock's coating order/units. draw_pane_overlay already includes
         // reflection_gradient: calling both makes the material doubly smoky.
-        let c = Canvas::new(bg.dc, self.dpi);
+        let c = Canvas::new(dc, self.dpi);
         if self.config.design == "disc" {
             // Disc's warm printed backing is part of its graphic identity.
             c.round(pane, radius, 0xf0eeed, 255, false, false);
@@ -41,7 +41,7 @@ impl State {
         crate::surface::paint(&c, pane, &self.config.palette, tint / 100.);
         c.coating(pane, radius);
         c.draw_pane_overlay(
-            [bg.width as u32, bg.height as u32],
+            pixel_size,
             self.dpi,
             tint / 100.,
             light,

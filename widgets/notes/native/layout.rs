@@ -12,37 +12,26 @@ impl Chrome {
     pub fn search_icon(self) -> bool {
         (self.tiny() || self.w < 298.) && !self.search_open
     }
-    pub fn large(self) -> bool {
-        crate::settings_ui::widget_title_visible(self.w, self.h)
-    }
     pub fn add(self) -> [f32; 4] {
         if self.tiny() {
             return [12., 12., 40., 40.];
         }
-        let y = if self.large() { 46. } else { 16. };
-        [18., y, 54., y + 36.]
+        [18., 16., 54., 52.]
     }
     pub fn search(self) -> [f32; 4] {
         if self.search_icon() {
             if self.tiny() {
                 return [44., 12., 72., 40.];
             }
-            let y = if self.large() { 48. } else { 18. };
-            return [66., y, 98., y + 32.];
+            return [66., 18., 98., 50.];
         }
         if self.tiny() {
             return [12., 50., self.w - 12., 78.];
         }
-        let y = if self.large() { 48. } else { 18. };
         if self.w < 320. && self.search_open {
-            return [20., y + 40., self.w - 20., y + 72.];
+            return [20., 58., self.w - 20., 90.];
         }
-        [
-            66.,
-            y,
-            self.w - if self.large() { 24. } else { 96. },
-            y + 32.,
-        ]
+        [66., 18., self.w - 96., 50.]
     }
     pub fn content_top(self) -> f32 {
         if self.tiny() && self.search_icon() {
@@ -172,9 +161,21 @@ mod tests {
                     "{design} must remain editable at {w}x{h}"
                 );
                 assert!(c.content_top() + height <= c.viewport()[1]);
-                assert!(!c.large());
             }
         }
+    }
+    #[test]
+    fn wide_chrome_keeps_add_and_search_on_top_row_with_header_clearance() {
+        let c = Chrome {
+            w: 520.,
+            h: 420.,
+            search_open: false,
+        };
+        assert_eq!(c.add(), [18., 16., 54., 52.]);
+        let search = c.search();
+        assert_eq!(search, [66., 18., 424., 50.]);
+        assert!(search[2] <= c.w - 96.);
+        assert_eq!(c.content_top(), 66.);
     }
     #[test]
     fn narrow_palette_keeps_all_seven_colors_inside_the_card() {

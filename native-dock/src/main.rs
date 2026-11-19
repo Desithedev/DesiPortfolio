@@ -5,6 +5,7 @@ mod catalog;
 mod color_picker;
 mod compositor;
 mod contrast;
+mod d2d;
 mod desktop_layer;
 mod desktop_sync;
 mod fusion;

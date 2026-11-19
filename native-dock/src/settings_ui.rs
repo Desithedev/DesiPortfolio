@@ -1321,9 +1321,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             if s.drag.take().is_some() {
+                crate::glass::set_resizing(hwnd, false);
                 s.key.clear();
             }
             s.pressed = None;
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+            }
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1341,7 +1345,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 .by(-((wp >> 16) as i16 as f32 / 120. * 72.), now);
             s.scroll = s.smooth_scroll.value(now);
             SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
-            InvalidateRect(hwnd, null(), 0);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER if wp == 1 => {
@@ -1437,7 +1443,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 .by(if wp == 0x21 { -240. } else { 240. }, now);
             s.scroll = s.smooth_scroll.value(now);
             SetTimer(hwnd, 1, crate::motion::frame_interval_ms().min(16), None);
-            InvalidateRect(hwnd, null(), 0);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_SIZE => {

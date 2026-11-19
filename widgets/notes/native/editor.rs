@@ -121,6 +121,281 @@ struct ParaFormat2 {
     border_width: u16,
     borders: u16,
 }
+unsafe fn ensure_richedit_loaded() -> Result<(), String> {
+    static RICH_EDIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let module = *RICH_EDIT.get_or_init(|| LoadLibraryW(wide("Msftedit.dll").as_ptr()) as usize);
+    if module == 0 {
+        return Err("Windows RichEdit could not be loaded".into());
+    }
+    // Msftedit remains loaded for the lifetime of this process (window class owner).
+    Ok(())
+}
+fn prepare_note_rtf(note: &model::Note) -> String {
+    let mut rtf = note.rich_text();
+    if note.rtf.is_none() {
+        rtf = rtf
+            .replace("Segoe UI;", "Segoe UI Variable Text;")
+            .replace("\\fs24", "\\fs21")
+            .replace("\\fs22", "\\fs21");
+    }
+    rtf
+}
+unsafe fn stream_note_rtf(edit: HWND, note: &model::Note) -> bool {
+    let rtf = prepare_note_rtf(note);
+    let mut bytes = Bytes {
+        data: rtf.into_bytes(),
+        offset: 0,
+    };
+    let mut stream = Stream {
+        cookie: &mut bytes as *mut _ as usize,
+        error: 0,
+        callback: Some(read),
+    };
+    SendMessageW(edit, WM_USER + 73, 2, &mut stream as *mut _ as isize);
+    stream.error == 0
+}
+unsafe fn set_edit_default_char_format(edit: HWND, body_size: f32, clear_styles: bool) {
+    if edit.is_null() {
+        return;
+    }
+    let mut cf: CharFormat = zeroed();
+    cf.size = size_of::<CharFormat>() as u32;
+    cf.mask = 0x2000_0000 | 0x8000_0000; // CFM_FACE | CFM_SIZE
+    cf.height = (body_size * 15.).round() as i32;
+    if clear_styles {
+        // CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_COLOR
+        cf.mask |= 1 | 2 | 4 | 8 | 0x4000_0000;
+        cf.effects = 0x4000_0000; // CFE_AUTOCOLOR
+    }
+    let face = wide("Segoe UI Variable Text");
+    let len = face.len().min(cf.face.len());
+    cf.face[..len].copy_from_slice(&face[..len]);
+    SendMessageW(edit, WM_USER + 68, 0, &cf as *const _ as isize); // SCF_DEFAULT
+    if clear_styles {
+        SendMessageW(edit, WM_USER + 68, 4, &cf as *const _ as isize); // SCF_ALL
+    }
+}
+unsafe fn set_edit_zoom(edit: HWND, dpi: f32, initial_dpi: f32) {
+    let mut numerator = (dpi * 96.).round().max(1.) as usize;
+    let mut denominator = (initial_dpi * 96.).round().max(1.) as usize;
+    let (mut a, mut b) = (numerator, denominator);
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    numerator /= a;
+    denominator /= a;
+    SendMessageW(edit, WM_USER + 225, numerator, denominator as isize);
+}
+unsafe fn apply_edit_line_spacing(
+    edit: HWND,
+    dpi: f32,
+    leading: f32,
+    preserve_selection: bool,
+) {
+    if edit.is_null() {
+        return;
+    }
+    #[repr(C)]
+    struct CharRange {
+        min: i32,
+        max: i32,
+    }
+    let left_margin = (2. * dpi).round().max(1.) as u16;
+    SendMessageW(edit, 0x00D3, 3, left_margin as isize);
+    let mut prev_sel = CharRange { min: 0, max: 0 };
+    if preserve_selection {
+        SendMessageW(edit, WM_USER + 52, 0, &mut prev_sel as *mut _ as isize);
+    }
+    let all = CharRange { min: 0, max: -1 };
+    SendMessageW(edit, WM_USER + 55, 0, &all as *const _ as isize);
+    let mut pf2: ParaFormat2 = zeroed();
+    pf2.base.size = size_of::<ParaFormat2>() as u32;
+    pf2.base.mask = 0x0000_0100; // PFM_LINESPACING
+    pf2.line_spacing_rule = 4; // tomLineSpaceExactly (in twips)
+    pf2.line_spacing = (leading * 15.).round() as i32;
+    SendMessageW(edit, WM_USER + 71, 0, &pf2 as *const _ as isize);
+    SendMessageW(edit, WM_USER + 55, 0, &prev_sel as *const _ as isize);
+}
+unsafe fn print_richedit_to_image(
+    edit: HWND,
+    width: i32,
+    height: i32,
+    ink: u32,
+) -> Option<crate::render::Image> {
+    if edit.is_null() || width <= 0 || height <= 0 {
+        return None;
+    }
+    let mut mattes = Vec::new();
+    PRINTING.with(|p| p.set(true));
+    for white in [false, true] {
+        if let Some(buffer) = Buffer::plain(width, height, 1.) {
+            PatBlt(
+                buffer.dc,
+                0,
+                0,
+                width,
+                height,
+                if white { WHITENESS } else { BLACKNESS },
+            );
+            SendMessageW(edit, WM_USER + 67, 0, if white { 0xffffff } else { 0 });
+            SendMessageW(
+                edit,
+                WM_PRINTCLIENT,
+                buffer.dc as usize,
+                (PRF_CLIENT | PRF_ERASEBKGND) as isize,
+            );
+            mattes.push(buffer.snapshot());
+        }
+    }
+    PRINTING.with(|p| p.set(false));
+    if mattes.len() != 2 {
+        return None;
+    }
+    let mut pixels = crate::render::recover_icon_alpha(&mattes[0], &mattes[1]);
+    for (p, w) in pixels.chunks_exact_mut(4).zip(mattes[1].chunks_exact(4)) {
+        // Native automatic black glyphs adopt the card ink using
+        // the white-matte grayscale coverage so color and opacity
+        // match out-of-focus GDI+ text; retain colored selection highlights.
+        if p[..3].iter().all(|v| *v < 24) {
+            let cov = (1. - w[1] as f32 / 255.).clamp(0., 1.);
+            let a = (cov.powf(0.58) * 255.).round().clamp(0., 255.) as u32;
+            p[3] = a as u8;
+            p[0] = ((ink & 255) * a / 255) as u8;
+            p[1] = (((ink >> 8) & 255) * a / 255) as u8;
+            p[2] = (((ink >> 16) & 255) * a / 255) as u8;
+        }
+    }
+    crate::render::Image::from_rgba(width as u32, height as u32, pixels)
+}
+pub(super) struct RichEditRasterizer {
+    host: HWND,
+    edit: HWND,
+    font: HFONT,
+    initial_dpi: f32,
+    size: [i32; 2],
+}
+impl RichEditRasterizer {
+    pub(super) unsafe fn new(board: HWND) -> Result<Self, String> {
+        ensure_richedit_loaded()?;
+        let host = CreateWindowExW(
+            0,
+            wide("STATIC").as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD | WS_DISABLED,
+            0,
+            0,
+            1,
+            1,
+            board,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if host.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let edit = CreateWindowExW(
+            0,
+            wide("RICHEDIT50W").as_ptr(),
+            wide("").as_ptr(),
+            WS_CHILD
+                | WS_VISIBLE
+                | ES_AUTOVSCROLL as u32
+                | ES_MULTILINE as u32
+                | ES_WANTRETURN as u32,
+            0,
+            0,
+            100,
+            100,
+            host,
+            100usize as _,
+            GetModuleHandleW(null()),
+            null(),
+        );
+        if edit.is_null() {
+            DestroyWindow(host);
+            return Err("Cannot create native RichEdit rasterizer".into());
+        }
+        let initial_dpi = (GetDpiForWindow(board) as f32 / 96.).max(1.);
+        let font = CreateFontW(
+            -(14.0 * initial_dpi).round() as i32,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            0,
+            0,
+            ANTIALIASED_QUALITY as u32,
+            0,
+            wide("Segoe UI Variable Text").as_ptr(),
+        );
+        SendMessageW(edit, WM_SETFONT, font as usize, 1);
+        SendMessageW(
+            edit,
+            windows_sys::Win32::UI::Controls::EM_LIMITTEXT,
+            200_000,
+            0,
+        );
+        Ok(Self {
+            host,
+            edit,
+            font,
+            initial_dpi,
+            size: [100, 100],
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn render(
+        &mut self,
+        note: &model::Note,
+        width_px: i32,
+        height_px: i32,
+        dpi: f32,
+        body_size: f32,
+        leading: f32,
+        ink: u32,
+    ) -> Option<crate::render::Image> {
+        if width_px <= 0 || height_px <= 0 || self.edit.is_null() {
+            return None;
+        }
+        if self.size != [width_px, height_px] {
+            MoveWindow(self.edit, 0, 0, width_px, height_px, 0);
+            self.size = [width_px, height_px];
+        }
+        set_edit_zoom(self.edit, dpi, self.initial_dpi);
+        SetWindowTextW(self.edit, wide("").as_ptr());
+        set_edit_default_char_format(self.edit, body_size, true);
+        let mut pf: ParaFormat = zeroed();
+        pf.size = size_of::<ParaFormat>() as u32;
+        pf.mask = 0x20; // PFM_NUMBERING
+        pf.numbering = 0;
+        SendMessageW(self.edit, WM_USER + 71, 0, &pf as *const _ as isize);
+        if !stream_note_rtf(self.edit, note) {
+            return None;
+        }
+        apply_edit_line_spacing(self.edit, dpi, leading, false);
+        SendMessageW(self.edit, 0x0115, 6, 0); // WM_VSCROLL, SB_TOP
+        print_richedit_to_image(self.edit, width_px, height_px, ink)
+    }
+}
+impl Drop for RichEditRasterizer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.host.is_null() {
+                DestroyWindow(self.host);
+            }
+            if !self.font.is_null() {
+                DeleteObject(self.font);
+            }
+        }
+    }
+}
 impl Editor {
     pub unsafe fn create(
         board: HWND,
@@ -130,13 +405,7 @@ impl Editor {
         query: String,
         _floating: bool,
     ) -> Result<Self, String> {
-        static RICH_EDIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let module =
-            *RICH_EDIT.get_or_init(|| LoadLibraryW(wide("Msftedit.dll").as_ptr()) as usize);
-        if module == 0 {
-            return Err("Windows RichEdit could not be loaded".into());
-        }
-        // Msftedit remains loaded for the lifetime of this process (window class owner).
+        ensure_richedit_loaded()?;
         register(CLASS, Some(proc));
         let mut state = Box::new(RefCell::new(State {
             hwnd: null_mut(),
@@ -241,31 +510,15 @@ impl Editor {
                 0,
             );
             s.set_default_char_format();
+            let edit = s.edit;
             if let Some(note) = &s.note {
-                let mut rtf = note.rich_text();
-                if note.rtf.is_none() {
-                    rtf = rtf
-                        .replace("Segoe UI;", "Segoe UI Variable Text;")
-                        .replace("\\fs24", "\\fs21")
-                        .replace("\\fs22", "\\fs21");
-                }
-                let mut bytes = Bytes {
-                    data: rtf.into_bytes(),
-                    offset: 0,
-                };
-                let mut stream = Stream {
-                    cookie: &mut bytes as *mut _ as usize,
-                    error: 0,
-                    callback: Some(read),
-                };
-                SendMessageW(s.edit, WM_USER + 73, 2, &mut stream as *mut _ as isize);
-                if stream.error != 0 {
+                if !stream_note_rtf(edit, note) {
                     DestroyWindow(hwnd);
                     return Err("Cannot read note formatting; data left untouched".into());
                 }
                 s.apply_line_spacing();
             } else {
-                SetWindowTextW(s.edit, wide(&s.query).as_ptr());
+                SetWindowTextW(edit, wide(&s.query).as_ptr());
             }
             s.changed = false;
             s.loading = false;
@@ -342,17 +595,7 @@ impl Editor {
             if scale_changed {
                 s.apply_line_spacing();
             }
-            let mut numerator = (dpi * 96.).round().max(1.) as usize;
-            let mut denominator = (s.initial_dpi * 96.).round().max(1.) as usize;
-            let (mut a, mut b) = (numerator, denominator);
-            while b != 0 {
-                let remainder = a % b;
-                a = b;
-                b = remainder;
-            }
-            numerator /= a;
-            denominator /= a;
-            SendMessageW(s.edit, WM_USER + 225, numerator, denominator as isize);
+            set_edit_zoom(s.edit, dpi, s.initial_dpi);
             let old_size = [s.rect[2] - s.rect[0], s.rect[3] - s.rect[1]];
             if old_size != size || scale_changed || s.text_rect != desired_text_rect {
                 s.snapshot = None;
@@ -402,47 +645,8 @@ impl Editor {
             return;
         }
         if s.snapshot.as_ref().is_none_or(|(old, _)| *old != ink) {
-            let mut mattes = Vec::new();
-            PRINTING.with(|p| p.set(true));
-            for white in [false, true] {
-                if let Some(buffer) = Buffer::plain(width, height, 1.) {
-                    PatBlt(
-                        buffer.dc,
-                        0,
-                        0,
-                        width,
-                        height,
-                        if white { WHITENESS } else { BLACKNESS },
-                    );
-                    SendMessageW(s.edit, WM_USER + 67, 0, if white { 0xffffff } else { 0 });
-                    SendMessageW(
-                        s.edit,
-                        WM_PRINTCLIENT,
-                        buffer.dc as usize,
-                        (PRF_CLIENT | PRF_ERASEBKGND) as isize,
-                    );
-                    mattes.push(buffer.snapshot());
-                }
-            }
-            PRINTING.with(|p| p.set(false));
-            if mattes.len() == 2 {
-                let mut pixels = crate::render::recover_icon_alpha(&mattes[0], &mattes[1]);
-                for (p, w) in pixels.chunks_exact_mut(4).zip(mattes[1].chunks_exact(4)) {
-                    // Native automatic black glyphs adopt the card ink using
-                    // the white-matte grayscale coverage so color and opacity
-                    // match out-of-focus GDI+ text; retain colored selection highlights.
-                    if p[..3].iter().all(|v| *v < 24) {
-                        let cov = (1. - w[1] as f32 / 255.).clamp(0., 1.);
-                        let a = (cov.powf(0.58) * 255.).round().clamp(0., 255.) as u32;
-                        p[3] = a as u8;
-                        p[0] = ((ink & 255) * a / 255) as u8;
-                        p[1] = (((ink >> 8) & 255) * a / 255) as u8;
-                        p[2] = (((ink >> 16) & 255) * a / 255) as u8;
-                    }
-                }
-                s.snapshot = crate::render::Image::from_rgba(width as u32, height as u32, pixels)
-                    .map(|image| (ink, image));
-            }
+            s.snapshot = print_richedit_to_image(s.edit, width, height, ink)
+                .map(|image| (ink, image));
         }
         let c = Canvas::new(dc, d);
         if let Some((_, image)) = &s.snapshot {
@@ -849,43 +1053,16 @@ impl Drop for Editor {
 }
 impl State {
     unsafe fn set_default_char_format(&self) {
-        if self.edit.is_null() {
-            return;
-        }
-        let mut cf: CharFormat = zeroed();
-        cf.size = size_of::<CharFormat>() as u32;
-        cf.mask = 0x2000_0000 | 0x8000_0000; // CFM_FACE | CFM_SIZE
-        cf.height = (self.body_size * 15.).round() as i32;
-        let face = wide("Segoe UI Variable Text");
-        let len = face.len().min(cf.face.len());
-        cf.face[..len].copy_from_slice(&face[..len]);
-        SendMessageW(self.edit, WM_USER + 68, 0, &cf as *const _ as isize); // SCF_DEFAULT
+        set_edit_default_char_format(self.edit, self.body_size, false);
     }
     unsafe fn apply_line_spacing(&mut self) {
         if self.edit.is_null() || self.note.is_none() {
             return;
         }
-        #[repr(C)]
-        struct CharRange {
-            min: i32,
-            max: i32,
-        }
         let was_loading = self.loading;
         let was_changed = self.changed;
         self.loading = true;
-        let left_margin = (2. * self.dpi).round().max(1.) as u16;
-        SendMessageW(self.edit, 0x00D3, 3, left_margin as isize);
-        let mut prev_sel = CharRange { min: 0, max: 0 };
-        SendMessageW(self.edit, WM_USER + 52, 0, &mut prev_sel as *mut _ as isize);
-        let all = CharRange { min: 0, max: -1 };
-        SendMessageW(self.edit, WM_USER + 55, 0, &all as *const _ as isize);
-        let mut pf2: ParaFormat2 = zeroed();
-        pf2.base.size = size_of::<ParaFormat2>() as u32;
-        pf2.base.mask = 0x0000_0100; // PFM_LINESPACING
-        pf2.line_spacing_rule = 4; // tomLineSpaceExactly (in twips)
-        pf2.line_spacing = (self.leading * 15.).round() as i32;
-        SendMessageW(self.edit, WM_USER + 71, 0, &pf2 as *const _ as isize);
-        SendMessageW(self.edit, WM_USER + 55, 0, &prev_sel as *const _ as isize);
+        apply_edit_line_spacing(self.edit, self.dpi, self.leading, true);
         self.changed = was_changed;
         self.loading = was_loading;
     }
@@ -1558,6 +1735,81 @@ mod tests {
             assert_eq!(note.body, "Ghi chú mới – 😀");
             drop(editor);
             drop(host);
+        }
+    }
+
+    #[test]
+    fn rich_edit_rasterizer_matches_editor_pixels() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _graphics = crate::render::Runtime::start().unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "lumen-rich-raster-{}-{}",
+                std::process::id(),
+                model::now()
+            ));
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            let host = Host::create(&root, glass, true, true).unwrap();
+            let board = host.state.borrow().hwnd;
+            let mut b = model::Board::default();
+            b.create().unwrap();
+            let mut note = b.notes.remove(0);
+            note.body = "đê ăơư mới rồi <b>đậm</b> <i>nghiêng</i>".into();
+            let metrics = typography::Metrics::for_theme("lumen");
+            let rect = [24., 112., 360., 330.];
+            let dpi = 1.;
+            let ink = rgb(36, 30, 22);
+            let events = Rc::new(RefCell::new(vec![]));
+            let editor = Editor::create(
+                board,
+                root.clone(),
+                events,
+                Some(note.clone()),
+                String::new(),
+                false,
+            )
+            .unwrap();
+            editor.place(rect, [110., 594.], dpi, metrics, 0.);
+            let draw_buf = Buffer::plain(400, 400, 1.).unwrap();
+            editor.draw(draw_buf.dc, ink);
+
+            unsafe fn blit_image_pixels(img: &crate::render::Image) -> ([u32; 2], Vec<u8>) {
+                let [w, h] = img.pixel_size();
+                let buf = Buffer::plain(w as i32, h as i32, 1.).unwrap();
+                PatBlt(buf.dc, 0, 0, w as i32, h as i32, BLACKNESS);
+                {
+                    let c = Canvas::new(buf.dc, 1.);
+                    c.image(img, [0., 0., w as f32, h as f32]);
+                }
+                ([w, h], buf.snapshot())
+            }
+
+            let (ed_size, ed_pixels) = {
+                let s = editor.state.borrow();
+                let (_, ref img) = s.snapshot.as_ref().unwrap();
+                blit_image_pixels(img)
+            };
+            let tr = metrics.text_rect([rect[2] - rect[0], rect[3] - rect[1]]);
+            let width = ((tr[2] - tr[0]) * dpi).round() as i32;
+            let height = ((tr[3] - tr[1]) * dpi).round() as i32;
+            let mut raster = RichEditRasterizer::new(board).unwrap();
+            let rich_img = raster
+                .render(&note, width, height, dpi, metrics.body, metrics.leading, ink)
+                .unwrap();
+            let (rich_size, rich_pixels) = blit_image_pixels(&rich_img);
+            assert_eq!(rich_size, [width as u32, height as u32]);
+            assert_eq!(ed_size, rich_size);
+            assert!(
+                rich_pixels
+                    .chunks_exact(4)
+                    .any(|p| p[0] > 0 || p[1] > 0 || p[2] > 0 || p[3] > 0),
+                "RichEditRasterizer must produce visible ink pixels"
+            );
+            assert_eq!(ed_pixels, rich_pixels);
+            drop(raster);
+            drop(editor);
+            drop(host);
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

@@ -73,6 +73,17 @@ const CMD_REMOVE: u32 = 20;
 const CMD_LEFT: u32 = 21;
 const CMD_RIGHT: u32 = 22;
 const CMD_REVEAL: u32 = 23;
+const EM_GETMARGINS: u32 = 0x00D4;
+const SEARCH_PLACEHOLDER_GAP: f32 = 2.5;
+
+fn search_placeholder_offset(left_margin_px: u16, dpi: f32) -> f32 {
+    left_margin_px as f32 / dpi.max(1.) + SEARCH_PLACEHOLDER_GAP
+}
+
+unsafe fn edit_placeholder_offset(edit: HWND, dpi: f32) -> f32 {
+    let margins = SendMessageW(edit, EM_GETMARGINS, 0, 0) as u32;
+    search_placeholder_offset((margins & 0xffff) as u16, dpi)
+}
 
 #[derive(Clone, Copy)]
 struct Palette {
@@ -163,8 +174,10 @@ struct App {
     label_shadows: HashMap<String, (u32, render::Image)>,
     labels: HashMap<String, (String, render::Image)>,
     tile_cache: HashMap<String, (String, f32, render::Image)>,
+    pub(super) add_tile: Option<((i32, i32, i32, u32, u32, u32, bool), render::Image)>,
     profile_counts: [u32; 4],
     label_budget: u8,
+    icon_budget: u8,
     cache_pending: bool,
     status: String,
     status_ticks: u8,
@@ -1161,6 +1174,7 @@ impl App {
         let counts_before = self.profile_counts;
         let now = self.now();
         self.label_budget = if self.scroll.moving(now) { 2 } else { 64 };
+        self.icon_budget = if self.scroll.moving(now) { 0 } else { 8 };
         self.cache_pending = false;
         render::take_cost();
         let mut ps: PAINTSTRUCT = zeroed();
@@ -1305,15 +1319,17 @@ impl App {
                 [4., 4., w as f32 - 4., h as f32 - 4.]
             };
             let radius = if fused { 0. } else { 34. };
-            {
-                let c = Canvas::new(dc, self.dpi);
+            let theme_color = self.theme_color();
+            let light = self.dock.light;
+            frame.paint_frosted_chrome_for(hwnd, frosted, |chrome_dc| {
+                let c = Canvas::new(chrome_dc, self.dpi);
                 if crate::surface::managed(&self.dock.theme) {
                     crate::surface::paint(&c, pane, &self.dock.theme, tint / 100.);
                 } else {
                     c.round(
                         pane,
                         radius,
-                        self.theme_color(),
+                        theme_color,
                         (tint * 2.55).round() as u8,
                         false,
                         false,
@@ -1324,7 +1340,7 @@ impl App {
                     [client.right as u32, client.bottom as u32],
                     self.dpi,
                     tint / 100.,
-                    self.dock.light,
+                    light,
                     [
                         0.,
                         0.,
@@ -1332,16 +1348,10 @@ impl App {
                         client.bottom as f32 / self.dpi,
                     ],
                 );
-            }
+                c.widget_corner_reflection_for(hwnd, pane, radius, light);
+            });
             self.search_frost = None;
-            Canvas::new(dc, self.dpi).widget_corner_reflection_for(
-                hwnd,
-                pane,
-                34.,
-                self.dock.light,
-            );
-            frame.bevel_for(hwnd);
-            if !moving {
+            if !moving || (crate::glass::liquid_glass() && !crate::motion::low_power()) {
                 let cache = self
                     .background
                     .take()
@@ -1455,7 +1465,7 @@ impl App {
                 search_accent,
                 search_light,
                 self.dock.opacity,
-                moving,
+                moving && crate::motion::low_power(),
                 true,
             );
         }
@@ -1635,9 +1645,15 @@ impl App {
                 DeleteDC(edit_dc);
             }
             if self.query.trim().is_empty() {
+                let placeholder_x = 58. + edit_placeholder_offset(self.edit, self.dpi);
                 Canvas::new(dc, self.dpi).text_alpha(
                     "Search app...",
-                    [58., 26., header.placeholder_right, 49.],
+                    [
+                        placeholder_x,
+                        26.,
+                        header.placeholder_right.max(placeholder_x + 1.),
+                        49.,
+                    ],
                     13.5,
                     false,
                     p.muted,
@@ -1737,7 +1753,7 @@ impl App {
             if let Some(shadow) = &self.window_shadow {
                 shadow.hide();
             }
-        } else if !self.moving_window {
+        } else if !self.moving_window && !(fast_reused_header && self.window_shadow.is_some()) {
             if self.window_shadow.is_none() {
                 self.window_shadow = crate::compositor::WindowShadow::new(hwnd);
             }
@@ -2048,12 +2064,13 @@ unsafe extern "system" fn search_proc(
                 let mut rect: RECT = zeroed();
                 GetClientRect(hwnd, &mut rect);
                 FillRect(dc, &rect, app.search_brush);
+                let placeholder_x = edit_placeholder_offset(hwnd, app.dpi);
                 Canvas::new(dc, app.dpi).text_alpha(
                     "Search app...",
                     [
+                        placeholder_x,
                         0.,
-                        0.,
-                        rect.right as f32 / app.dpi,
+                        (rect.right as f32 / app.dpi).max(placeholder_x + 1.),
                         rect.bottom as f32 / app.dpi,
                     ],
                     13.5,
@@ -2451,8 +2468,11 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_CAPTURECHANGED => {
-            app.resize_drag = None;
-            app.pending_resize = None;
+            if app.resize_drag.take().is_some() {
+                app.pending_resize = None;
+                crate::glass::set_resizing(hwnd, false);
+                InvalidateRect(hwnd, null(), 0);
+            }
             app.clear_pressed = false;
             app.toolbar_pressed = None;
             app.add_pressed = false;
@@ -2469,6 +2489,11 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_CANCELMODE | WM_KILLFOCUS => {
+            if app.resize_drag.take().is_some() {
+                app.pending_resize = None;
+                crate::glass::set_resizing(hwnd, false);
+                InvalidateRect(hwnd, null(), 0);
+            }
             if let Some(selection) = &mut app.group_selection {
                 selection.pressed = None;
             }
@@ -2476,6 +2501,9 @@ unsafe extern "system" fn wndproc(
                 app.popup = None;
             }
             app.cancel_pointer(hwnd);
+            if message == WM_CANCELMODE {
+                ReleaseCapture();
+            }
             0
         }
         WM_GETMINMAXINFO => {
@@ -2548,6 +2576,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_EXITSIZEMOVE => {
             app.moving_window = false;
+            crate::glass::set_resizing(hwnd, false);
             if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
                 eprintln!("native-move freeze=false");
             }
@@ -2576,7 +2605,9 @@ unsafe extern "system" fn wndproc(
             app.motion.hover(None, p, now);
             app.hover = None;
             app.arm_motion(hwnd);
-            InvalidateRect(hwnd, null(), 0);
+            if !app.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_KEYDOWN | KEY_FROM_SEARCH => {
@@ -2702,6 +2733,9 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_MOUSEWHEEL => {
+            if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
+                eprintln!("native-wheel queued={} timer={}", app.frame_queued, app.motion.timer_running);
+            }
             let delta = ((wparam >> 16) as u16 as i16) as i32;
             let now = app.now();
             if app.popup_wheel(hwnd, delta) {
@@ -2713,7 +2747,9 @@ unsafe extern "system" fn wndproc(
             app.motion.group_target(None, now);
             app.scroll.by(-(delta as f32) / 120. * 72., now);
             app.arm_motion(hwnd);
-            InvalidateRect(hwnd, null(), 0);
+            if !app.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_CONTEXTMENU => {
@@ -2763,10 +2799,15 @@ unsafe extern "system" fn wndproc(
             0
         }
         WM_TIMER if wparam == MOTION_TIMER => {
-            app.motion_tick(hwnd);
+            if !app.frame_queued {
+                app.motion_tick(hwnd);
+            }
             0
         }
         MOTION_FRAME => {
+            if std::env::var_os("LUMEN_TRACE_FRAMES").is_some() {
+                eprintln!("native-tick queued={} timer={}", app.frame_queued, app.motion.timer_running);
+            }
             app.frame_queued = false;
             if app.motion.timer_running {
                 app.motion_tick(hwnd);
@@ -2926,6 +2967,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_DESTROY => {
             report_metrics(app.started.elapsed().as_secs_f64(), app.cpu_start);
+            crate::logger::info("app", format!("shutdown complete (pid={})", std::process::id()));
             KillTimer(hwnd, PIN_TIMER);
             KillTimer(hwnd, SMOKE_TIMER);
             KillTimer(hwnd, UPDATE_CHECK_TIMER);
@@ -2955,6 +2997,34 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
     }
+}
+
+unsafe fn pump_low_priority_messages() -> u32 {
+    let mut pending: MSG = zeroed();
+    let mut timer_pumped = 0u32;
+    while timer_pumped < 16
+        && PeekMessageW(&mut pending, null_mut(), WM_TIMER, WM_TIMER, PM_REMOVE) != 0
+    {
+        DispatchMessageW(&pending);
+        timer_pumped += 1;
+    }
+    // Advance all active HWNDs before painting any of them. Their paints then
+    // share one compositor deadline instead of one DwmFlush per widget.
+    for frame in [MOTION_FRAME, crate::motion::VSYNC_FRAME, crate::widget_header::HEADER_FRAME] {
+        let mut pumped = 0;
+        while pumped < 16 && PeekMessageW(&mut pending, null_mut(), frame, frame, PM_REMOVE) != 0 {
+            DispatchMessageW(&pending);
+            pumped += 1;
+        }
+    }
+    let mut paint_pumped = 0u32;
+    while paint_pumped < 16
+        && PeekMessageW(&mut pending, null_mut(), WM_PAINT, WM_PAINT, PM_REMOVE) != 0
+    {
+        DispatchMessageW(&pending);
+        paint_pumped += 1;
+    }
+    paint_pumped
 }
 
 pub fn run() -> Result<(), String> {
@@ -3015,9 +3085,15 @@ pub fn run() -> Result<(), String> {
         // state through the same WM_CLOSE path as Quit in the tray.
         if std::env::args().any(|arg| arg == "--quit") {
             let existing = FindWindowW(wide("LumenNativeDockWindow").as_ptr(), null());
-            if !existing.is_null() {
-                PostMessageW(existing, WM_CLOSE, 0, 0);
-            }
+            let posted = !existing.is_null() && PostMessageW(existing, WM_CLOSE, 0, 0) != 0;
+            crate::logger::info(
+                "app",
+                format!(
+                    "quit requested via --quit (found={}, posted={})",
+                    !existing.is_null(),
+                    posted
+                ),
+            );
             CloseHandle(mutex);
             return Ok(());
         }
@@ -3134,8 +3210,10 @@ pub fn run() -> Result<(), String> {
             label_shadows: HashMap::new(),
             labels: HashMap::new(),
             tile_cache: HashMap::new(),
+            add_tile: None,
             profile_counts: [0; 4],
             label_budget: 2,
+            icon_budget: 8,
             cache_pending: false,
             status: String::new(),
             status_ticks: 0,
@@ -3229,6 +3307,15 @@ pub fn run() -> Result<(), String> {
                 }
             }
         }
+        crate::logger::info(
+            "app",
+            format!(
+                "dock ready (pid={}, launcher_visible={}, startup_widgets={:?})",
+                std::process::id(),
+                IsWindowVisible(hwnd) != 0,
+                startup
+            ),
+        );
         if smoke {
             for id in startup {
                 app.borrow_mut().show_package(&id);
@@ -3244,7 +3331,14 @@ pub fn run() -> Result<(), String> {
         }
         let mut message: MSG = zeroed();
         loop {
-            let result = GetMessageW(&mut message, null_mut(), 0, 0);
+            // GetMessage normally prioritizes posted messages over hardware
+            // input. Our self-posted frame stream must never starve mouse or
+            // keyboard events while another widget animates continuously.
+            let result = if PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE | PM_QS_INPUT) != 0 {
+                if message.message == WM_QUIT { 0 } else { 1 }
+            } else {
+                GetMessageW(&mut message, null_mut(), 0, 0)
+            };
             if result <= 0 {
                 if result == -1 {
                     DestroyWindow(hwnd);
@@ -3265,32 +3359,17 @@ pub fn run() -> Result<(), String> {
             if crate::notes::translate(&message) {
                 continue;
             }
-            if matches!(
+            let motion_frame = matches!(
                 message.message,
                 MOTION_FRAME
                     | crate::motion::VSYNC_FRAME
                     | crate::widget_header::HEADER_FRAME
-            ) {
-                let mut pending: MSG = zeroed();
-                let mut pumped = 0;
-                while pumped < 16
-                    && PeekMessageW(&mut pending, null_mut(), WM_PAINT, WM_PAINT, PM_REMOVE) != 0
-                {
-                    DispatchMessageW(&pending);
-                    pumped += 1;
-                }
-                let mut timers = 0;
-                while timers < 16
-                    && PeekMessageW(&mut pending, null_mut(), WM_TIMER, WM_TIMER, PM_REMOVE) != 0
-                {
-                    DispatchMessageW(&pending);
-                    timers += 1;
-                }
-            }
+            );
             let was_paint = message.message == WM_PAINT;
             TranslateMessage(&message);
             DispatchMessageW(&message);
-            if was_paint
+            let paint_pumped = if was_paint || motion_frame { pump_low_priority_messages() } else { 0 };
+            if (was_paint || motion_frame || paint_pumped > 0)
                 && ((GetQueueStatus(QS_PAINT) >> 16) & QS_PAINT == 0)
             {
                 crate::motion::flush_pending_vsync(std::time::Instant::now());
@@ -3301,6 +3380,7 @@ pub fn run() -> Result<(), String> {
         app.borrow_mut().general.take();
         app.borrow_mut().packages.shutdown();
         drop(app);
+        crate::d2d::shutdown();
         crate::gpu::shutdown();
         if context != INVALID_HANDLE_VALUE {
             if activation_cookie != 0 {
@@ -3566,5 +3646,108 @@ mod tests {
         crate::glass::set_liquid_glass(prev_lg);
         crate::glass::set_frosted_glass(prev_fg);
         crate::motion::set_low_power(prev_lp);
+    }
+    #[test]
+    fn search_placeholder_offset_clears_edit_caret_across_dpis_and_margins() {
+        for dpi in [1.0_f32, 1.25, 1.5, 2.0] {
+            for left_margin_px in [0_u16, 2, 4, 6] {
+                let caret_x = left_margin_px as f32 / dpi;
+                let offset = search_placeholder_offset(left_margin_px, dpi);
+                assert!((offset - (caret_x + 2.5)).abs() < 1e-6);
+                assert!(offset > caret_x);
+            }
+        }
+    }
+    #[test]
+    fn pump_low_priority_messages_dispatches_due_timers_under_vsync_load() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_CLASS_ID: AtomicUsize = AtomicUsize::new(1);
+
+        unsafe extern "system" fn timer_test_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == crate::motion::VSYNC_FRAME {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AtomicUsize;
+                if !ptr.is_null() {
+                    (*ptr).fetch_add(256, Ordering::Relaxed);
+                }
+                return 0;
+            }
+            if msg == WM_TIMER && wparam == 77 {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const AtomicUsize;
+                if !ptr.is_null() {
+                    (*ptr).fetch_add(1, Ordering::Relaxed);
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        let _ui = crate::native_ui_test_lock();
+        let timer_fired = AtomicUsize::new(0);
+        unsafe {
+            let hinst = GetModuleHandleW(null());
+            let cls_id = NEXT_CLASS_ID.fetch_add(1, Ordering::Relaxed);
+            let cls = wide(format!(
+                "LumenPumpLowPriorityTest-{}-{cls_id}",
+                std::process::id()
+            ));
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(timer_test_wndproc),
+                hInstance: hinst,
+                lpszClassName: cls.as_ptr(),
+                ..zeroed()
+            };
+            assert_ne!(RegisterClassW(&wc), 0);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                cls.as_ptr(),
+                wide("Lumen timer pump test").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            SetWindowLongPtrW(
+                hwnd,
+                GWLP_USERDATA,
+                (&timer_fired as *const AtomicUsize) as isize,
+            );
+            assert_ne!(SetTimer(hwnd, 77, 15, None), 0);
+            std::thread::sleep(std::time::Duration::from_millis(35));
+            assert_ne!(
+                PostMessageW(hwnd, crate::motion::VSYNC_FRAME, 0, 0),
+                0
+            );
+
+            pump_low_priority_messages();
+            let fired = timer_fired.load(Ordering::Relaxed);
+
+            let mut drained: MSG = zeroed();
+            while PeekMessageW(
+                &mut drained,
+                hwnd,
+                crate::motion::VSYNC_FRAME,
+                crate::motion::VSYNC_FRAME,
+                PM_REMOVE,
+            ) != 0
+            {}
+            KillTimer(hwnd, 77);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd);
+            UnregisterClassW(cls.as_ptr(), hinst);
+
+            assert!(fired & 255 > 0, "expected WM_TIMER to fire during low-priority pump");
+            assert_eq!(fired >> 8, 1, "queued widget tick must join the same paint batch");
+        }
     }
 }

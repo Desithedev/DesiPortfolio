@@ -68,6 +68,117 @@ impl Drop for Buffer {
         }
     }
 }
+pub(crate) struct Seam {
+    vertical: bool,
+    seam: f32,
+    span: [f32; 2],
+    scale: f32,
+    bounds: [i32; 4],
+}
+
+pub(crate) fn collect_seams(
+    panes: &[crate::fusion::geometry::Pane],
+    own: &crate::fusion::geometry::Pane,
+    rect: RECT,
+    width: i32,
+    height: i32,
+) -> Vec<Seam> {
+    let a = own.rect;
+    panes
+        .iter()
+        .filter(|p| crate::fusion::geometry::adjacent(own, p))
+        .map(|p| {
+            let b = p.rect;
+            let scale = own.dpi.max(p.dpi);
+            let reach_n = 140. * scale;
+            let reach_t = 140. * scale;
+            let corner_pad = own.radius.max(p.radius);
+            let vertical = crate::fusion::geometry::touching_edges(a[2], b[0], scale)
+                || crate::fusion::geometry::touching_edges(b[2], a[0], scale);
+            if vertical {
+                let seam = if crate::fusion::geometry::touching_edges(a[2], b[0], scale) {
+                    (a[2] + b[0]) * 0.5
+                } else {
+                    (a[0] + b[2]) * 0.5
+                };
+                let span = [
+                    a[1].max(b[1]) - corner_pad,
+                    a[3].min(b[3]) + corner_pad,
+                ];
+                Seam {
+                    vertical: true,
+                    seam,
+                    span,
+                    scale,
+                    bounds: [
+                        ((seam - reach_n - rect.left as f32).floor() as i32).clamp(0, width),
+                        ((span[0] - reach_t - rect.top as f32).floor() as i32).clamp(0, height),
+                        ((seam + reach_n - rect.left as f32).ceil() as i32).clamp(0, width),
+                        ((span[1] + reach_t - rect.top as f32).ceil() as i32).clamp(0, height),
+                    ],
+                }
+            } else {
+                let seam = if crate::fusion::geometry::touching_edges(a[3], b[1], scale) {
+                    (a[3] + b[1]) * 0.5
+                } else {
+                    (a[1] + b[3]) * 0.5
+                };
+                let span = [
+                    a[0].max(b[0]) - corner_pad,
+                    a[2].min(b[2]) + corner_pad,
+                ];
+                Seam {
+                    vertical: false,
+                    seam,
+                    span,
+                    scale,
+                    bounds: [
+                        ((span[0] - reach_t - rect.left as f32).floor() as i32).clamp(0, width),
+                        ((seam - reach_n - rect.top as f32).floor() as i32).clamp(0, height),
+                        ((span[1] + reach_t - rect.left as f32).ceil() as i32).clamp(0, width),
+                        ((seam + reach_n - rect.top as f32).ceil() as i32).clamp(0, height),
+                    ],
+                }
+            }
+        })
+        .collect()
+}
+
+#[inline]
+pub(crate) fn seams_bounds(seams: &[Seam]) -> [i32; 4] {
+    [
+        seams.iter().map(|s| s.bounds[0]).min().unwrap_or(0),
+        seams.iter().map(|s| s.bounds[1]).min().unwrap_or(0),
+        seams.iter().map(|s| s.bounds[2]).max().unwrap_or(0),
+        seams.iter().map(|s| s.bounds[3]).max().unwrap_or(0),
+    ]
+}
+
+#[inline]
+pub(crate) fn seam_weight(seams: &[Seam], x: i32, y: i32, gx: f32, gy: f32) -> f32 {
+    let mut weight = 0f32;
+    for s in seams {
+        if x < s.bounds[0] || x >= s.bounds[2] || y < s.bounds[1] || y >= s.bounds[3] {
+            continue;
+        }
+        let (normal, tangent) = if s.vertical {
+            (
+                (gx - s.seam).abs(),
+                (s.span[0] - gy).max(gy - s.span[1]).max(0.),
+            )
+        } else {
+            (
+                (gy - s.seam).abs(),
+                (s.span[0] - gx).max(gx - s.span[1]).max(0.),
+            )
+        };
+        weight = weight.max(crate::fusion::geometry::material_weight(
+            normal, tangent, s.scale,
+        ));
+    }
+    weight
+}
+
 impl Buffer {
     pub fn matches_geometry(&self, width: i32, height: i32, dpi: f32, radius: f32) -> bool {
         self.width == width && self.height == height && self.dpi == dpi && self.radius == radius
@@ -285,7 +396,7 @@ impl Buffer {
                     && (fx < inset + radius || fx > w - inset - radius)
                     && (fy < inset + radius || fy > h - inset - radius)
                 {
-                    let sub = if crate::motion::low_power() { 4 } else { 16 };
+                    let sub = 4;
                     let mut inside = 0;
                     for sy in 0..sub {
                         for sx in 0..sub {
@@ -363,7 +474,7 @@ impl Buffer {
         })
     }
     pub unsafe fn bevel(&mut self) {
-        self.bevel_inner(None);
+        self.bevel_inner(None, false);
     }
     /// Internal seams do not get a second bright rim. The fused signed-distance
     /// outline controls both the bevel and the final antialiased coverage.
@@ -374,17 +485,16 @@ impl Buffer {
     /// underlying shared wallpaper.
     pub unsafe fn bevel_for(&mut self, hwnd: HWND) {
         crate::fusion::prepare(hwnd, self.radius);
-        if crate::fusion::may_fuse() && !crate::fusion::is_moving(hwnd) {
+        let moving = crate::fusion::is_moving(hwnd) || crate::glass::is_resizing(hwnd);
+        if crate::fusion::may_fuse() && !moving {
             GdiFlush();
             let source =
                 std::slice::from_raw_parts(self.bits, (self.width * self.height * 4) as usize);
-            crate::fusion::publish_material(
+            crate::fusion::publish_chrome_for(
                 hwnd,
-                crate::fusion::material::Material::from_bgra(
-                    self.width as usize,
-                    self.height as usize,
-                    source,
-                ),
+                self.width as usize,
+                self.height as usize,
+                source,
             );
         }
         let rect = crate::fusion::window_rect(hwnd);
@@ -393,119 +503,30 @@ impl Buffer {
             if let Some(material) =
                 crate::fusion::shared_material(hwnd, self.width, self.height, self.dpi)
             {
-                    GdiFlush();
-                    let pixels = std::slice::from_raw_parts_mut(
-                        self.bits,
-                        (self.width * self.height * 4) as usize,
-                    );
-                    if let Some(own) = panes.iter().find(|p| p.id == hwnd as usize) {
-                        struct Seam {
-                            vertical: bool,
-                            seam: f32,
-                            span: [f32; 2],
-                            scale: f32,
-                            bounds: [i32; 4],
-                        }
-                        let a = own.rect;
-                        let seams: Vec<Seam> = panes
-                            .iter()
-                            .filter(|p| crate::fusion::geometry::adjacent(own, p))
-                            .map(|p| {
-                                let b = p.rect;
-                                let scale = own.dpi.max(p.dpi);
-                                let reach_n = 140. * scale;
-                                let reach_t = 80. * scale;
-                                let vertical =
-                                    crate::fusion::geometry::touching_edges(a[2], b[0], scale)
-                                        || crate::fusion::geometry::touching_edges(b[2], a[0], scale);
-                                if vertical {
-                                    let seam = if crate::fusion::geometry::touching_edges(
-                                        a[2], b[0], scale,
-                                    ) {
-                                        (a[2] + b[0]) * 0.5
-                                    } else {
-                                        (a[0] + b[2]) * 0.5
-                                    };
-                                    let span = [a[1].max(b[1]), a[3].min(b[3])];
-                                    Seam {
-                                        vertical: true,
-                                        seam,
-                                        span,
-                                        scale,
-                                        bounds: [
-                                            ((seam - reach_n - rect.left as f32).floor() as i32)
-                                                .clamp(0, self.width),
-                                            ((span[0] - reach_t - rect.top as f32).floor() as i32)
-                                                .clamp(0, self.height),
-                                            ((seam + reach_n - rect.left as f32).ceil() as i32)
-                                                .clamp(0, self.width),
-                                            ((span[1] + reach_t - rect.top as f32).ceil() as i32)
-                                                .clamp(0, self.height),
-                                        ],
+                GdiFlush();
+                let pixels = std::slice::from_raw_parts_mut(
+                    self.bits,
+                    (self.width * self.height * 4) as usize,
+                );
+                if let Some(own) = panes.iter().find(|p| p.id == hwnd as usize) {
+                    let seams = collect_seams(panes, own, rect, self.width, self.height);
+                    let [x_min, y_min, x_max, y_max] = seams_bounds(&seams);
+                    for y in y_min..y_max {
+                        let gy = rect.top as f32 + y as f32 + 0.5;
+                        for x in x_min..x_max {
+                            let gx = rect.left as f32 + x as f32 + 0.5;
+                            let weight = seam_weight(&seams, x, y, gx, gy);
+                            if weight > 0. {
+                                let i = ((y * self.width + x) * 4) as usize;
+                                let color = material.sample(gx, gy);
+                                if material.is_delta {
+                                    for c in 0..3 {
+                                        pixels[i + c] = (pixels[i + c] as f32 + color[c] * weight)
+                                            .round()
+                                            .clamp(0., 255.)
+                                            as u8;
                                     }
                                 } else {
-                                    let seam = if crate::fusion::geometry::touching_edges(
-                                        a[3], b[1], scale,
-                                    ) {
-                                        (a[3] + b[1]) * 0.5
-                                    } else {
-                                        (a[1] + b[3]) * 0.5
-                                    };
-                                    let span = [a[0].max(b[0]), a[2].min(b[2])];
-                                    Seam {
-                                        vertical: false,
-                                        seam,
-                                        span,
-                                        scale,
-                                        bounds: [
-                                            ((span[0] - reach_t - rect.left as f32).floor() as i32)
-                                                .clamp(0, self.width),
-                                            ((seam - reach_n - rect.top as f32).floor() as i32)
-                                                .clamp(0, self.height),
-                                            ((span[1] + reach_t - rect.left as f32).ceil() as i32)
-                                                .clamp(0, self.width),
-                                            ((seam + reach_n - rect.top as f32).ceil() as i32)
-                                                .clamp(0, self.height),
-                                        ],
-                                    }
-                                }
-                            })
-                            .collect();
-                        let x_min = seams.iter().map(|s| s.bounds[0]).min().unwrap_or(0);
-                        let y_min = seams.iter().map(|s| s.bounds[1]).min().unwrap_or(0);
-                        let x_max = seams.iter().map(|s| s.bounds[2]).max().unwrap_or(0);
-                        let y_max = seams.iter().map(|s| s.bounds[3]).max().unwrap_or(0);
-                        for y in y_min..y_max {
-                            let gy = rect.top as f32 + y as f32 + 0.5;
-                            for x in x_min..x_max {
-                                let gx = rect.left as f32 + x as f32 + 0.5;
-                                let mut weight = 0f32;
-                                for s in &seams {
-                                    if x < s.bounds[0]
-                                        || x >= s.bounds[2]
-                                        || y < s.bounds[1]
-                                        || y >= s.bounds[3]
-                                    {
-                                        continue;
-                                    }
-                                    let (normal, tangent) = if s.vertical {
-                                        (
-                                            (gx - s.seam).abs(),
-                                            (s.span[0] - gy).max(gy - s.span[1]).max(0.),
-                                        )
-                                    } else {
-                                        (
-                                            (gy - s.seam).abs(),
-                                            (s.span[0] - gx).max(gx - s.span[1]).max(0.),
-                                        )
-                                    };
-                                    weight = weight.max(crate::fusion::geometry::material_weight(
-                                        normal, tangent, s.scale,
-                                    ));
-                                }
-                                if weight > 0. {
-                                    let i = ((y * self.width + x) * 4) as usize;
-                                    let color = material.sample(gx, gy);
                                     for c in 0..3 {
                                         pixels[i + c] = (pixels[i + c] as f32 * (1. - weight)
                                             + color[c] * weight)
@@ -517,13 +538,154 @@ impl Buffer {
                         }
                     }
                 }
+            }
         }
-        self.bevel_inner(group.map(|p| (p, [rect.left as f32, rect.top as f32])));
+        self.bevel_inner(
+            group.map(|p| (p, [rect.left as f32, rect.top as f32])),
+            moving,
+        );
+    }
+    pub unsafe fn paint_frosted_chrome_for(
+        &mut self,
+        hwnd: HWND,
+        frosted: bool,
+        draw_chrome: impl FnOnce(HDC),
+    ) {
+        crate::fusion::prepare(hwnd, self.radius);
+        if !frosted || !crate::fusion::frosted_wallpaper_active() {
+            draw_chrome(self.dc);
+            self.bevel_for(hwnd);
+            return;
+        }
+        thread_local! {
+            static OVERLAY_SCRATCH: std::cell::RefCell<Option<Buffer>> = const { std::cell::RefCell::new(None) };
+        }
+        let overlay = OVERLAY_SCRATCH
+            .with(|cell| {
+                let mut slot = cell.borrow_mut();
+                let reusable = slot.as_ref().is_some_and(|b| {
+                    b.width == self.width
+                        && b.height == self.height
+                        && (b.dpi - self.dpi).abs() < 1e-4
+                });
+                if reusable {
+                    slot.take()
+                } else {
+                    None
+                }
+            })
+            .or_else(|| Buffer::plain(self.width, self.height, self.dpi));
+        let Some(overlay) = overlay else {
+            draw_chrome(self.dc);
+            self.bevel_for(hwnd);
+            return;
+        };
+        let byte_len = (self.width * self.height * 4) as usize;
+        std::ptr::write_bytes(overlay.bits, 0, byte_len);
+        {
+            let alpha_batch = crate::render::AlphaBatch::new(overlay.dc, self.dpi);
+            draw_chrome(overlay.dc);
+            drop(alpha_batch);
+            GdiFlush();
+        }
+        let moving = crate::fusion::is_moving(hwnd) || crate::glass::is_resizing(hwnd);
+        let group = crate::fusion::group(hwnd);
+        let inset_px = if group.is_some() {
+            1
+        } else {
+            (4.0 * self.dpi).ceil() as usize
+        };
+        let overlay_px = std::slice::from_raw_parts(overlay.bits, byte_len);
+        if crate::fusion::may_fuse() && !moving {
+            crate::fusion::publish_overlay_for(
+                hwnd,
+                self.width as usize,
+                self.height as usize,
+                overlay_px,
+                inset_px,
+            );
+        }
+        let rect = crate::fusion::window_rect(hwnd);
+        let shared = group
+            .as_ref()
+            .and_then(|_| crate::fusion::shared_overlay(hwnd, self.width, self.height));
+        GdiFlush();
+        let pixels = std::slice::from_raw_parts_mut(self.bits, byte_len);
+        let seam_field = shared.as_ref().and_then(|field| {
+            let panes = group.as_ref()?;
+            let own = panes.iter().find(|p| p.id == hwnd as usize)?;
+            let seams = collect_seams(panes, own, rect, self.width, self.height);
+            if seams.is_empty() {
+                return None;
+            }
+            let [x_min, y_min, x_max, y_max] = seams_bounds(&seams);
+            Some((field, seams, x_min, y_min, x_max, y_max))
+        });
+        for y in 0..self.height {
+            let gy = rect.top as f32 + y as f32 + 0.5;
+            let in_y = seam_field
+                .as_ref()
+                .is_some_and(|(_, _, _, y_min, _, y_max)| y >= *y_min && y < *y_max);
+            for x in 0..self.width {
+                let i = ((y * self.width + x) * 4) as usize;
+                let weight = if in_y {
+                    if let Some((_, seams, x_min, _, x_max, _)) = &seam_field {
+                        if x >= *x_min && x < *x_max {
+                            let gx = rect.left as f32 + x as f32 + 0.5;
+                            seam_weight(seams, x, y, gx, gy)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                if weight > 0.0 {
+                    let (field, _, _, _, _, _) = seam_field.as_ref().unwrap();
+                    let gx = rect.left as f32 + x as f32 + 0.5;
+                    let s = field.sample(gx, gy);
+                    let ov = std::array::from_fn::<f32, 4, _>(|c| {
+                        overlay_px[i + c] as f32 * (1.0 - weight) + s[c] * weight
+                    });
+                    let keep = (1.0 - ov[3] / 255.0).clamp(0.0, 1.0);
+                    for c in 0..3 {
+                        pixels[i + c] =
+                            (pixels[i + c] as f32 * keep + ov[c]).round().clamp(0.0, 255.0) as u8;
+                    }
+                } else {
+                    let oa = overlay_px[i + 3] as u32;
+                    if oa > 0 {
+                        let inv = 255 - oa;
+                        for c in 0..3 {
+                            pixels[i + c] = (overlay_px[i + c] as u32
+                                + (pixels[i + c] as u32 * inv + 127) / 255)
+                                .min(255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+        if !(crate::motion::low_power() && byte_len > 4 * 1024 * 1024) {
+            OVERLAY_SCRATCH.with(|cell| {
+                *cell.borrow_mut() = Some(overlay);
+            });
+        }
+        self.bevel_inner(
+            group.map(|p| (p, [rect.left as f32, rect.top as f32])),
+            moving,
+        );
     }
     unsafe fn bevel_inner(
         &mut self,
         group: Option<(Vec<crate::fusion::geometry::Pane>, [f32; 2])>,
+        moving: bool,
     ) {
+        let skip_rim = group.is_none() && moving && crate::motion::low_power();
+        if skip_rim {
+            return;
+        }
         GdiFlush();
         let bytes = std::slice::from_raw_parts_mut(
             self.bits,
@@ -531,12 +693,27 @@ impl Buffer {
         );
         let liquid = crate::glass::liquid_glass();
         if let Some((ref panes, origin)) = group {
+            // Compute fused cluster bounding box across the panes (+ 48.0 * dpi padding)
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            for p in panes {
+                min_x = min_x.min(p.rect[0]);
+                min_y = min_y.min(p.rect[1]);
+                max_x = max_x.max(p.rect[2]);
+                max_y = max_y.max(p.rect[3]);
+            }
+            let pad = 48.0 * self.dpi;
+            let cluster_w = (max_x - min_x + pad * 2.0).max(1.0);
+            let cluster_h = (max_y - min_y + pad * 2.0).max(1.0);
+
             // The new concave boundary can pass through an old transparent
             // corner, so it must not reuse just the old rounded-rect rim list.
             let w = self.width;
             let h = self.height;
             let dpi = self.dpi;
-            let spec_w = liquid_spec_width(dpi, w as f32, h as f32);
+            let spec_w = liquid_spec_width(dpi, cluster_w, cluster_h);
             let band = (self.radius + 10.) * dpi + if liquid { spec_w } else { 0. };
             let min_d = if liquid { -spec_w } else { -2.5 * dpi };
             crate::fusion::geometry::with_outline(panes, |outline| {
@@ -988,6 +1165,19 @@ impl Buffer {
     /// Restore an independent glass card from the owned, fully opaque backing.
     /// No desktop capture and no per-card bitmap allocation.
     pub unsafe fn restore_glass_card(&self, dc: HDC, r: [f32; 4], radius: f32) {
+        self.restore_glass_card_impl(dc, r, radius, true);
+    }
+    /// Fast rounded-card restore without per-pixel liquid refraction (for active scroll/motion).
+    pub unsafe fn restore_glass_card_fast(&self, dc: HDC, r: [f32; 4], radius: f32) {
+        self.restore_glass_card_impl(dc, r, radius, false);
+    }
+    unsafe fn restore_glass_card_impl(
+        &self,
+        dc: HDC,
+        r: [f32; 4],
+        radius: f32,
+        allow_liquid: bool,
+    ) {
         crate::render::flush(dc);
         let mut dib: DIBSECTION = zeroed();
         if GetObjectW(
@@ -1013,7 +1203,7 @@ impl Buffer {
         let card_h = (bottom - top).max(1.0);
         let min_dim = card_w.min(card_h);
         let radius = (radius * self.dpi).min(min_dim * 0.5);
-        let liquid = crate::glass::liquid_glass() && min_dim >= 16.0;
+        let liquid = allow_liquid && crate::glass::liquid_glass() && min_dim >= 16.0;
         let hw = card_w * 0.5;
         let hh = card_h * 0.5;
         let rx = (hw - radius).max(0.0);
@@ -1021,26 +1211,43 @@ impl Buffer {
         let rim = (20.0 * self.dpi).clamp(8.0, min_dim * 0.42);
         let bend = 10.0 * self.dpi;
         let ca_strength = 3.5 * self.dpi;
-        for y in (top.floor() as i32).max(0).max(clip.top)
-            ..(bottom.ceil() as i32).min(height).min(clip.bottom)
-        {
-            for x in (left.floor() as i32).max(0).max(clip.left)
-                ..(right.ceil() as i32).min(width).min(clip.right)
-            {
+        let y_start = (top.floor() as i32).max(0).max(clip.top);
+        let y_end = (bottom.ceil() as i32).min(height).min(clip.bottom);
+        let x_start = (left.floor() as i32).max(0).max(clip.left);
+        let x_end = (right.ceil() as i32).min(width).min(clip.right);
+        if y_start >= y_end || x_start >= x_end {
+            return;
+        }
+        let corner_pad = radius.max(rim) + 2.0;
+        let iy0 = ((top + corner_pad - 0.5).ceil() as i32).max(y_start);
+        let iy1 = ((top + card_h - corner_pad - 0.5).floor() as i32 + 1).min(y_end);
+        let ix0 = ((left + corner_pad - 0.5).ceil() as i32).max(x_start);
+        let ix1 = ((left + card_w - corner_pad - 0.5).floor() as i32 + 1).min(x_end);
+        let has_interior = iy0 < iy1 && ix0 < ix1;
+        let dest_stride = dib.dsBm.bmWidth;
+        let src_stride = self.width;
+        let source_h = self.height as usize;
+        let dpi = self.dpi;
+        let blend_span = |dest: &mut [u8], y: i32, x0: i32, x1: i32| {
+            let fy = y as f32 + 0.5 - top;
+            let src_row = y * src_stride;
+            for x in x0..x1 {
                 let fx = x as f32 + 0.5 - left;
-                let fy = y as f32 + 0.5 - top;
                 let (d, nx, ny) = if liquid {
                     crate::glass::rounded_rect_sdf(fx, fy, hw, hh, rx, ry, radius)
                 } else {
                     (distance(fx, fy, card_w, card_h, radius, 0.), 0.0, 0.0)
                 };
                 let alpha = ((0.5 - d).clamp(0., 1.) * 255.).round() as u32;
-                let dst = ((y * dib.dsBm.bmWidth + x) * 4) as usize;
+                if alpha == 0 {
+                    continue;
+                }
+                let dst = (x * 4) as usize;
                 let pixel = if liquid && d > -rim && d <= 0.5 {
                     crate::glass::refract_bgra_card_pixel(
                         source,
-                        self.width as usize,
-                        self.height as usize,
+                        src_stride as usize,
+                        source_h,
                         x as f32,
                         y as f32,
                         d,
@@ -1049,19 +1256,61 @@ impl Buffer {
                         rim,
                         bend,
                         ca_strength,
-                        self.dpi,
+                        dpi,
                     )
                 } else {
-                    let src = ((y * self.width + x) * 4) as usize;
+                    let src = ((src_row + x) * 4) as usize;
                     [source[src], source[src + 1], source[src + 2]]
                 };
-                for c in 0..4 {
-                    let value = if c == 3 { 255 } else { pixel[c] as u32 };
-                    dest[dst + c] =
-                        ((value * alpha + dest[dst + c] as u32 * (255 - alpha) + 127) / 255) as u8;
+                if alpha == 255 {
+                    dest[dst] = pixel[0];
+                    dest[dst + 1] = pixel[1];
+                    dest[dst + 2] = pixel[2];
+                    dest[dst + 3] = 255;
+                } else {
+                    let inv = 255 - alpha;
+                    for c in 0..3 {
+                        dest[dst + c] =
+                            ((pixel[c] as u32 * alpha + dest[dst + c] as u32 * inv + 127) / 255)
+                                as u8;
+                    }
+                    dest[dst + 3] = ((255 * alpha + dest[dst + 3] as u32 * inv + 127) / 255) as u8;
                 }
             }
-        }
+        };
+        let render_rows = |rows: Vec<(usize, &mut [u8])>| {
+            for (y, dest) in rows {
+                let y = y as i32;
+                if has_interior && y >= iy0 && y < iy1 {
+                    if x_start < ix0 {
+                        blend_span(dest, y, x_start, ix0);
+                    }
+                    let dst_start = (ix0 * 4) as usize;
+                    let dst_end = (ix1 * 4) as usize;
+                    let src_start = ((y * src_stride + ix0) * 4) as usize;
+                    let src_end = ((y * src_stride + ix1) * 4) as usize;
+                    for (d, s) in dest[dst_start..dst_end]
+                        .chunks_exact_mut(4)
+                        .zip(source[src_start..src_end].chunks_exact(4))
+                    {
+                        d[0] = s[0];
+                        d[1] = s[1];
+                        d[2] = s[2];
+                        d[3] = 255;
+                    }
+                    if ix1 < x_end {
+                        blend_span(dest, y, ix1, x_end);
+                    }
+                } else {
+                    blend_span(dest, y, x_start, x_end);
+                }
+            }
+        };
+        let work_pixels = if liquid { ((x_end - x_start) * (y_end - y_start)) as usize } else { 0 };
+        crate::glass::with_pixel_rows_parallel(
+            dest, dest_stride as usize * 4, y_start as usize..y_end as usize,
+            work_pixels, 32_768, render_rows,
+        );
     }
     /// Composite opaque chrome UNDER already drawn controls. Filling only the
     /// missing alpha preserves glyphs, icons, reflections and pressed states.
@@ -1183,11 +1432,12 @@ impl Buffer {
             self.bits,
             self.width as usize * self.height as usize * 4,
         );
-        for (i, p) in pixels.chunks_exact_mut(4).enumerate() {
-            let a = self
-                .fusion_cover
-                .as_ref()
-                .map_or(self.cover[i], |(_, _, c)| c[i]) as u32;
+        let cover = self
+            .fusion_cover
+            .as_ref()
+            .map_or(self.cover.as_slice(), |(_, _, c)| c.as_slice());
+        for (p, &cov) in pixels.chunks_exact_mut(4).zip(cover.iter()) {
+            let a = cov as u32;
             if a == 255 {
                 p[3] = if preserve_alpha { p[3].max(1) } else { 255 };
                 continue;
@@ -1219,19 +1469,22 @@ impl Buffer {
     pub unsafe fn upload_alpha(&self, hwnd: HWND, opacity: u8) -> bool {
         let pending = crate::fusion::pending_move_point(hwnd);
         if crate::gpu::is_gpu_window(hwnd) {
-            let mut wr: RECT = std::mem::zeroed();
-            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
-            let need_size = (wr.right - wr.left) != self.width || (wr.bottom - wr.top) != self.height;
-            if pending.is_some() || need_size {
-                let (x, y) = pending.map(|p| (p.x, p.y)).unwrap_or((wr.left, wr.top));
-                let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
-                if pending.is_none() {
-                    flags |= SWP_NOMOVE;
+            if !crate::fusion::in_wm_moving() {
+                let mut wr: RECT = std::mem::zeroed();
+                windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut wr);
+                let need_size =
+                    (wr.right - wr.left) != self.width || (wr.bottom - wr.top) != self.height;
+                if pending.is_some() || need_size {
+                    let (x, y) = pending.map(|p| (p.x, p.y)).unwrap_or((wr.left, wr.top));
+                    let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+                    if pending.is_none() {
+                        flags |= SWP_NOMOVE;
+                    }
+                    if !need_size {
+                        flags |= SWP_NOSIZE;
+                    }
+                    SetWindowPos(hwnd, null_mut(), x, y, self.width, self.height, flags);
                 }
-                if !need_size {
-                    flags |= SWP_NOSIZE;
-                }
-                SetWindowPos(hwnd, null_mut(), x, y, self.width, self.height, flags);
             }
             GdiFlush();
             let len = self.width as usize * self.height as usize * 4;
@@ -1423,14 +1676,11 @@ impl WindowShadow {
     }
     pub unsafe fn sync_with_radius(&mut self, owner: HWND, dpi: f32, opacity: u8, radius: f32) {
         self.owner = owner;
-        self.stack_below_owner();
         crate::fusion::opacity(owner, opacity);
-        if crate::fusion::fused(owner) {
-            ShowWindow(self.hwnd, SW_HIDE);
-            return;
-        }
-        if IsWindowVisible(owner) == 0 || IsIconic(owner) != 0 {
-            ShowWindow(self.hwnd, SW_HIDE);
+        if crate::fusion::fused(owner) || IsWindowVisible(owner) == 0 || IsIconic(owner) != 0 {
+            if IsWindowVisible(self.hwnd) != 0 {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
             return;
         }
         let r = crate::fusion::window_rect(owner);
@@ -1442,6 +1692,8 @@ impl WindowShadow {
         {
             if IsWindowVisible(self.hwnd) == 0 {
                 ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                self.stack_below_owner();
+            } else if GetWindow(owner, GW_HWNDNEXT) != self.hwnd {
                 self.stack_below_owner();
             }
             return;
@@ -1533,6 +1785,7 @@ impl WindowShadow {
             height,
             SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
         );
+        self.stack_below_owner();
         if let Some(buffer) = upload {
             // UpdateLayeredWindow copies the surface. Keep only the small
             // nine-slice alpha template after upload, not a duplicate CPU DIB.
@@ -1959,6 +2212,137 @@ mod tests {
             let a = distance(x as f32, 18., 180., 100., 34., 4.);
             let b = distance(180. - x as f32, 18., 180., 100., 34., 4.);
             assert!((a - b).abs() < 0.001);
+        }
+    }
+    #[test]
+    fn restore_glass_card_matches_full_sdf_across_interior_and_rim() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass());
+        crate::glass::set_liquid_glass(true);
+        unsafe {
+            let w = 180i32;
+            let h = 120i32;
+            let dpi = 1.25f32;
+            let card = [12.3, 10.7, 131.7, 85.3];
+            let radius = 20.0f32;
+            let backing = Buffer::plain(w, h, dpi).unwrap();
+            let src_px = std::slice::from_raw_parts_mut(backing.bits, (w * h * 4) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let i = ((y * w + x) * 4) as usize;
+                    src_px[i] = ((x * 3 + y) & 0xff) as u8;
+                    src_px[i + 1] = ((x + y * 5) & 0xff) as u8;
+                    src_px[i + 2] = (((x ^ y) * 7) & 0xff) as u8;
+                    src_px[i + 3] = 255;
+                }
+            }
+            let source = backing.snapshot();
+            let frame = Buffer::plain(w, h, dpi).unwrap();
+            let init = [15u8, 25, 35, 80];
+            for px in std::slice::from_raw_parts_mut(frame.bits, (w * h * 4) as usize)
+                .chunks_exact_mut(4)
+            {
+                px.copy_from_slice(&init);
+            }
+            let mut reference = frame.snapshot();
+            backing.restore_glass_card(frame.dc, card, radius);
+            let actual = frame.snapshot();
+
+            let [left, top, right, bottom] = card.map(|v| v * dpi);
+            let card_w = (right - left).max(1.0);
+            let card_h = (bottom - top).max(1.0);
+            let min_dim = card_w.min(card_h);
+            let r_px = (radius * dpi).min(min_dim * 0.5);
+            let hw = card_w * 0.5;
+            let hh = card_h * 0.5;
+            let rx = (hw - r_px).max(0.0);
+            let ry = (hh - r_px).max(0.0);
+            let rim = (20.0 * dpi).clamp(8.0, min_dim * 0.42);
+            let bend = 10.0 * dpi;
+            let ca_strength = 3.5 * dpi;
+            for y in (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(h) {
+                for x in (left.floor() as i32).max(0)..(right.ceil() as i32).min(w) {
+                    let fx = x as f32 + 0.5 - left;
+                    let fy = y as f32 + 0.5 - top;
+                    let (d, nx, ny) = crate::glass::rounded_rect_sdf(fx, fy, hw, hh, rx, ry, r_px);
+                    let alpha = ((0.5 - d).clamp(0., 1.) * 255.).round() as u32;
+                    let dst = ((y * w + x) * 4) as usize;
+                    let pixel = if d > -rim && d <= 0.5 {
+                        crate::glass::refract_bgra_card_pixel(
+                            &source,
+                            w as usize,
+                            h as usize,
+                            x as f32,
+                            y as f32,
+                            d,
+                            nx,
+                            ny,
+                            rim,
+                            bend,
+                            ca_strength,
+                            dpi,
+                        )
+                    } else {
+                        [source[dst], source[dst + 1], source[dst + 2]]
+                    };
+                    for c in 0..4 {
+                        let value = if c == 3 { 255 } else { pixel[c] as u32 };
+                        reference[dst + c] =
+                            ((value * alpha + reference[dst + c] as u32 * (255 - alpha) + 127)
+                                / 255) as u8;
+                    }
+                }
+            }
+            assert_eq!(actual, reference);
+            let center = ((h / 2) * w + (w / 2)) as usize * 4;
+            assert_eq!(&actual[center..center + 3], &source[center..center + 3]);
+            assert_eq!(actual[center + 3], 255);
+            assert_eq!(&actual[0..4], &init);
+            let rim_px = (top.ceil() as usize + 3) * w as usize * 4 + (w / 2) as usize * 4;
+            assert_ne!(&actual[rim_px..rim_px + 3], &source[rim_px..rim_px + 3]);
+        }
+    }
+
+    #[test]
+    fn parallel_nested_glass_preserves_clipping_and_matches_serial_pixels() {
+        let _ui = crate::native_ui_test_lock();
+        struct Reset(bool, bool);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::glass::set_liquid_glass(self.0);
+                crate::motion::set_low_power(self.1);
+            }
+        }
+        let _reset = Reset(crate::glass::liquid_glass(), crate::motion::low_power());
+        crate::glass::set_liquid_glass(true);
+        unsafe {
+            let (w, h, dpi) = (640, 480, 1.75);
+            let mut backing = Buffer::plain(w, h, dpi).unwrap();
+            for (i, p) in backing.pixels_mut().chunks_exact_mut(4).enumerate() {
+                p.copy_from_slice(&[((i * 37) % 256) as u8, ((i * 61) % 256) as u8, ((i * 17) % 256) as u8, 255]);
+            }
+            let mut serial = Buffer::plain(w, h, dpi).unwrap();
+            let mut parallel = Buffer::plain(w, h, dpi).unwrap();
+            let initial = [15u8, 25, 35, 80].repeat((w * h) as usize);
+            serial.pixels_mut().copy_from_slice(&initial);
+            parallel.pixels_mut().copy_from_slice(&initial);
+            IntersectClipRect(serial.dc, 18, 23, 610, 354);
+            IntersectClipRect(parallel.dc, 18, 23, 610, 354);
+            let card = [8.25, 10.5, 350.5, 225.5];
+            crate::motion::set_low_power(true);
+            backing.restore_glass_card(serial.dc, card, 23.);
+            crate::motion::set_low_power(false);
+            backing.restore_glass_card(parallel.dc, card, 23.);
+            let result = parallel.snapshot();
+            assert!(result == serial.snapshot(), "parallel card must match the serial optical path");
+            assert_eq!(&result[..4], &initial[..4], "clipped pixels must stay untouched");
+            assert_ne!(result, initial, "test must exercise optical rendering");
         }
     }
 }

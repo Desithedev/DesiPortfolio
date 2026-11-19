@@ -1,15 +1,10 @@
 //! Responsive theme layouts for Wide, Tall, and CompactSquare clock sizes.
 use super::{hour, layout, Face};
-use crate::render::Canvas;
 use windows_sys::Win32::Foundation::SYSTEMTIME;
 
 fn sunset_tall_metrics(w: f32, h: f32) -> (f32, f32, f32, f32) {
     let b = layout::content_box(w, h);
-    let top = if w >= 140. && h >= 210. {
-        b[1] + 30.
-    } else {
-        b[1]
-    };
+    let top = b[1];
     let bar_y = b[3] - 20.;
     let date_top = bar_y - 42.;
     let avail = (date_top - top).max(60.);
@@ -60,47 +55,6 @@ pub(super) fn afterglow_emblem_rect(w: f32, h: f32) -> [f32; 4] {
             let emb_w = emb_h * 1.38;
             [b[2] - emb_w, b[3] - 14. - emb_h, b[2], b[3] - 14.]
         }
-    }
-}
-
-pub(super) fn draw_location(c: &Canvas, w: f32, h: f32, label: &str, ink: u32) {
-    match layout::mode(w, h) {
-        layout::Mode::Classic => {
-            let (x, y, s) = layout::frame(w, h);
-            if 12. * s >= 7. && w >= 220. {
-                let f = Face {
-                    c,
-                    s,
-                    x,
-                    y,
-                    ink,
-                    muted: ink,
-                    accent: ink,
-                    mono: false,
-                };
-                f.round([24.5, 32.5, 27.5, 35.5], 1.5, ink, 170);
-                c.text_medium(label, f.r([34., 21., 246., 47.]), 12. * s, ink, 0);
-            }
-        }
-        layout::Mode::Wide if w >= 220. && h >= 135. => {
-            c.round([22., 26.5, 25., 29.5], 1.5, ink, 170, false, false);
-            c.text_medium(
-                label,
-                [30., 19., (w * 0.56).min(w - 78.).max(54.), 37.],
-                10.5,
-                ink,
-                0,
-            );
-        }
-        layout::Mode::Tall if w >= 140. && h >= 210. => {
-            c.round([22., 29.5, 25., 32.5], 1.5, ink, 170, false, false);
-            c.text_medium(label, [30., 22., (w - 78.).max(54.), 40.], 10.5, ink, 0);
-        }
-        layout::Mode::CompactSquare if w >= 165. && h >= 165. => {
-            c.round([20., 25.5, 23., 28.5], 1.5, ink, 170, false, false);
-            c.text_medium(label, [28., 18., w - 76., 36.], 10., ink, 0);
-        }
-        _ => {}
     }
 }
 
@@ -740,7 +694,7 @@ fn draw_sunset(
     match mode {
         layout::Mode::Wide => {
             let lx1 = emb[0] - 12.;
-            let top = if w >= 220. && h >= 135. { b[1] + 24. } else { b[1] };
+            let top = b[1];
             let bh_left = b[3] - top;
             let bar_y = b[3] - 18.;
             let time_bot = (bar_y - if bh_left >= 95. { 24. } else { 18. }).max(top + 28.);
@@ -765,7 +719,7 @@ fn draw_sunset(
             f.text(&format!("{}%", (progress * 100.) as u32), [b[2] - 38., bar_y + 5., b[2], b[3]], 8., false, f.ink, 2);
         }
         _ => {
-            let top = if w >= 165. && h >= 165. { b[1] + 22. } else { b[1] };
+            let top = b[1];
             let bar_y = b[3] - 12.;
             let time_r = [b[0], top, b[2], (emb[1] - 4.).max(top + 28.)];
             let sz = f.fit_digital(t, cfg, time_r, 56.);

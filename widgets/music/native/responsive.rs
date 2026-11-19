@@ -730,8 +730,10 @@ impl State {
             if !browse_inline {
                 if w >= 220. {
                     self.corner_open(c, w);
-                } else {
+                } else if self.playback.signed_in {
                     self.media_button(c, [18., 12., 46., 40.], Action::Browse, true);
+                } else if w >= 196. {
+                    self.media_button(c, [w - 118., 12., w - 90., 40.], Action::Browse, true);
                 }
             }
             return;
@@ -809,8 +811,10 @@ impl State {
         if !browse_by_title {
             if w >= 220. {
                 self.corner_open(c, w);
-            } else {
+            } else if self.playback.signed_in {
                 self.media_button(c, [18., 12., 46., 40.], Action::Browse, true);
+            } else if w >= 196. {
+                self.media_button(c, [w - 118., 12., w - 90., 40.], Action::Browse, true);
             }
         }
     }

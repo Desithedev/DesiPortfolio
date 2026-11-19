@@ -140,6 +140,9 @@ struct State {
     button_lenses: lenses::Lenses,
     image_cache: std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
     card_cache: std::collections::HashMap<String, (String, crate::render::Image)>,
+    rich_raster: Option<editor::RichEditRasterizer>,
+    text_cache: std::collections::HashMap<String, (String, crate::render::Image)>,
+    layout_cache: Option<(u64, Vec<(String, [f32; 4])>, f32)>,
     selected_image: Option<(String, usize)>,
     image_drag: Option<ImageDrag>,
 }
@@ -277,6 +280,9 @@ impl Host {
             button_lenses: Default::default(),
             image_cache: Default::default(),
             card_cache: Default::default(),
+            rich_raster: None,
+            text_cache: Default::default(),
+            layout_cache: None,
             selected_image: None,
             image_drag: None,
         }));
@@ -428,6 +434,8 @@ impl Drop for Host {
                 s.flush();
                 s.settings.take();
                 s.shadow.take();
+                s.rich_raster.take();
+                s.text_cache.clear();
                 s.hwnd
             };
             DestroyWindow(hwnd);
@@ -494,6 +502,7 @@ impl State {
                         let id = note.id.clone();
                         *old = note;
                         self.card_cache.remove(&id);
+                        self.text_cache.remove(&id);
                         if layout_changed {
                             self.place_editor();
                         }
@@ -722,6 +731,7 @@ impl State {
                 self.image_cache.remove(&name);
             }
             self.card_cache.remove(&note_id);
+            self.text_cache.remove(&note_id);
             self.place_editor();
             self.schedule();
         }
@@ -759,6 +769,7 @@ impl State {
                 self.selected_image = Some((from_id.to_string(), insert_at));
                 self.sync_editor_images(from_id);
                 self.card_cache.remove(from_id);
+                self.text_cache.remove(from_id);
                 self.place_editor();
                 self.schedule();
             }
@@ -785,6 +796,8 @@ impl State {
                 self.sync_editor_images(&target_id);
                 self.card_cache.remove(from_id);
                 self.card_cache.remove(&target_id);
+                self.text_cache.remove(from_id);
+                self.text_cache.remove(&target_id);
                 self.place_editor();
                 self.schedule();
             }
@@ -822,6 +835,8 @@ impl State {
         self.typography.clear();
         self.button_lenses.clear();
         self.card_cache.clear();
+        self.rich_raster.take();
+        self.text_cache.clear();
         self.background_key.clear();
         self.header_base_key.clear();
         self.bg_ink = None;
@@ -967,6 +982,7 @@ impl State {
         }
         self.sync_editor_images(&id);
         self.card_cache.remove(&id);
+        self.text_cache.remove(&id);
         self.place_editor();
         self.schedule();
         InvalidateRect(self.hwnd, null(), 0);
@@ -1029,7 +1045,7 @@ impl State {
         }
     }
     unsafe fn layout(&mut self) -> Vec<(String, [f32; 4])> {
-        let [w, _] = self.dimensions();
+        let [w, h] = self.dimensions();
         if self.viewport()[1] <= self.viewport()[0] {
             self.scroll.bounds(0., self.now());
             return Vec::new();
@@ -1043,69 +1059,105 @@ impl State {
                     .unwrap_or(usize::MAX)
             });
         }
-        let cols = if self.board.design == "lumen" {
-            ((w - 42.) / 240.).floor().max(1.) as usize
-        } else {
-            1
-        };
-        let chrome = self.chrome();
-        let type_scale = self.type_scale();
-        let inset = chrome.card_inset(&self.board.design);
-        let top = self.content_top();
-        let gap = 14.;
-        let width = (w - inset * 2. - gap * (cols - 1) as f32) / cols as f32;
-        let text_width = (width - type_scale.left - 16.).max(type_scale.body);
-        let dpi = self.dpi;
-        let notes_meta: Vec<(String, usize, Vec<String>, bool, bool)> = list
-            .iter()
-            .map(|&index| {
+        let search_open = self.editor.as_ref().is_some_and(|e| e.note_id().is_none());
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            w.to_bits().hash(&mut hasher);
+            h.to_bits().hash(&mut hasher);
+            self.dpi.to_bits().hash(&mut hasher);
+            search_open.hash(&mut hasher);
+            self.board.design.hash(&mut hasher);
+            self.query.hash(&mut hasher);
+            list.len().hash(&mut hasher);
+            for &index in &list {
                 let note = &self.board.notes[index];
-                let (text_empty, rich_lines) = richtext::wrap_note(
-                    note,
-                    text_width,
-                    dpi,
-                    type_scale.body,
-                    &mut self.typography,
-                );
-                let empty = text_empty && note.images.is_empty();
-                (
-                    note.id.clone(),
-                    rich_lines.len(),
-                    note.images.clone(),
-                    text_empty,
-                    empty,
-                )
-            })
-            .collect();
-        let mut out = Vec::with_capacity(notes_meta.len());
-        let mut row_top = top;
-        for chunk in notes_meta.chunks(cols) {
-            let mut row_height = 0f32;
-            for (col, (id, lines, images, text_empty, empty)) in chunk.iter().enumerate() {
-                let img_h = self.images_height(images, text_width);
-                let img_gap = if img_h > 0. && !*text_empty { 6. } else { 0. };
-                let needed = type_scale.top
-                    + (*lines as f32) * type_scale.leading
-                    + img_gap
-                    + img_h
-                    + 34.;
-                let raw_h = if *empty {
-                    type_scale.card_height(true)
-                } else {
-                    needed.max(type_scale.height)
-                };
-                let h = if raw_h <= type_scale.height {
-                    chrome.card_height(raw_h)
-                } else {
-                    raw_h
-                };
-                row_height = row_height.max(h);
-                let x = inset + col as f32 * (width + gap);
-                out.push((id.clone(), [x, row_top, x + width, row_top + h]));
+                note.id.hash(&mut hasher);
+                note.body.hash(&mut hasher);
+                note.rtf.hash(&mut hasher);
+                note.pinned.hash(&mut hasher);
+                note.images.hash(&mut hasher);
+                for img in &note.images {
+                    self.image_cache
+                        .get(img)
+                        .map(|(iw, ih, _)| (*iw, *ih))
+                        .hash(&mut hasher);
+                }
             }
-            row_top += row_height + gap;
-        }
-        let content_bottom = if out.is_empty() { top } else { row_top - gap };
+            hasher.finish()
+        };
+        let (mut out, content_bottom) = match &self.layout_cache {
+            Some((cached_key, cached_out, cached_bottom)) if *cached_key == key => {
+                (cached_out.clone(), *cached_bottom)
+            }
+            _ => {
+                let cols = if self.board.design == "lumen" {
+                    ((w - 42.) / 240.).floor().max(1.) as usize
+                } else {
+                    1
+                };
+                let chrome = self.chrome();
+                let type_scale = self.type_scale();
+                let inset = chrome.card_inset(&self.board.design);
+                let top = self.content_top();
+                let gap = 14.;
+                let width = (w - inset * 2. - gap * (cols - 1) as f32) / cols as f32;
+                let text_width = (width - type_scale.left - 16.).max(type_scale.body);
+                let dpi = self.dpi;
+                let notes_meta: Vec<(String, usize, Vec<String>, bool, bool)> = list
+                    .iter()
+                    .map(|&index| {
+                        let note = &self.board.notes[index];
+                        let (text_empty, rich_lines) = richtext::wrap_note(
+                            note,
+                            text_width,
+                            dpi,
+                            type_scale.body,
+                            &mut self.typography,
+                        );
+                        let empty = text_empty && note.images.is_empty();
+                        (
+                            note.id.clone(),
+                            rich_lines.len(),
+                            note.images.clone(),
+                            text_empty,
+                            empty,
+                        )
+                    })
+                    .collect();
+                let mut out = Vec::with_capacity(notes_meta.len());
+                let mut row_top = top;
+                for chunk in notes_meta.chunks(cols) {
+                    let mut row_height = 0f32;
+                    for (col, (id, lines, images, text_empty, empty)) in chunk.iter().enumerate() {
+                        let img_h = self.images_height(images, text_width);
+                        let img_gap = if img_h > 0. && !*text_empty { 6. } else { 0. };
+                        let needed = type_scale.top
+                            + (*lines as f32) * type_scale.leading
+                            + img_gap
+                            + img_h
+                            + 34.;
+                        let raw_h = if *empty {
+                            type_scale.card_height(true)
+                        } else {
+                            needed.max(type_scale.height)
+                        };
+                        let h = if raw_h <= type_scale.height {
+                            chrome.card_height(raw_h)
+                        } else {
+                            raw_h
+                        };
+                        row_height = row_height.max(h);
+                        let x = inset + col as f32 * (width + gap);
+                        out.push((id.clone(), [x, row_top, x + width, row_top + h]));
+                    }
+                    row_top += row_height + gap;
+                }
+                let content_bottom = if out.is_empty() { top } else { row_top - gap };
+                self.layout_cache = Some((key, out.clone(), content_bottom));
+                (out, content_bottom)
+            }
+        };
         // Keep 14 DIP bottom clearance so the last card's shadow is fully scrollable into view.
         let max = if out.is_empty() {
             0.
@@ -1296,6 +1348,79 @@ impl State {
         }
         InvalidateRect(self.hwnd, null(), 0);
     }
+    fn cached_note_images_height(
+        note: &model::Note,
+        text_w: f32,
+        image_cache: &std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
+    ) -> f32 {
+        let mut total = 0f32;
+        for name in &note.images {
+            if let Some((iw, ih, _)) = image_cache.get(name) {
+                if *iw > 0 {
+                    let scaled_h = (*ih as f32 / *iw as f32) * text_w;
+                    if total > 0. {
+                        total += 6.;
+                    }
+                    total += scaled_h;
+                }
+            }
+        }
+        total
+    }
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn cached_rich_text<'a>(
+        hwnd: HWND,
+        raster: &mut Option<editor::RichEditRasterizer>,
+        cache: &'a mut std::collections::HashMap<String, (String, crate::render::Image)>,
+        note: &model::Note,
+        card_size: [f32; 2],
+        images_h: f32,
+        dpi: f32,
+        type_scale: &typography::Metrics,
+        ink: u32,
+    ) -> Option<(&'a crate::render::Image, [f32; 4])> {
+        use std::hash::{Hash, Hasher};
+        let mut tr = type_scale.text_rect(card_size);
+        tr[3] = (tr[3] - images_h).max(tr[1] + type_scale.leading);
+        let width_px = ((tr[2] - tr[0]) * dpi).round() as i32;
+        let height_px = ((tr[3] - tr[1]) * dpi).round() as i32;
+        if width_px <= 0 || height_px <= 0 || hwnd.is_null() {
+            return None;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        note.body.hash(&mut hasher);
+        note.rtf.hash(&mut hasher);
+        let text_key = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            width_px,
+            height_px,
+            dpi.to_bits(),
+            type_scale.body.to_bits(),
+            type_scale.leading.to_bits(),
+            ink,
+            hasher.finish()
+        );
+        if cache.get(&note.id).is_none_or(|(k, _)| *k != text_key) {
+            if raster.is_none() {
+                *raster = editor::RichEditRasterizer::new(hwnd).ok();
+            }
+            let r = raster.as_mut()?;
+            let img = r.render(
+                note,
+                width_px,
+                height_px,
+                dpi,
+                type_scale.body,
+                type_scale.leading,
+                ink,
+            )?;
+            cache.insert(note.id.clone(), (text_key.clone(), img));
+        }
+        cache
+            .get(&note.id)
+            .filter(|(k, _)| *k == text_key)
+            .map(|(_, img)| (img, tr))
+    }
     #[allow(clippy::too_many_arguments)]
     unsafe fn draw_card_contents(
         c: &Canvas,
@@ -1317,6 +1442,7 @@ impl State {
         image_cache: &std::collections::HashMap<String, (u32, u32, crate::render::Image)>,
         dpi: f32,
         draw_text: bool,
+        rich_text: Option<(&crate::render::Image, [f32; 4])>,
     ) {
         let [x, y, right, bottom] = rect;
         if !paper && !index && !honey {
@@ -1449,16 +1575,32 @@ impl State {
             return;
         }
         let compact_card = typography::compact_card([right - x, bottom - y]);
-        richtext::draw_lines(
-            c,
-            &rich_lines,
-            content_x,
-            right - 16.,
-            y + type_scale.top,
-            type_scale.leading,
-            type_scale.body,
-            if text_empty { card_muted } else { card_ink },
-        );
+        if let (false, Some((img, tr))) = (text_empty, rich_text) {
+            let [iw, ih] = img.pixel_size();
+            let px = ((x + tr[0]) * dpi).round();
+            let py = ((y + tr[1] - 1.) * dpi).round();
+            c.image(
+                img,
+                [
+                    px / dpi,
+                    py / dpi,
+                    (px + iw as f32) / dpi,
+                    (py + ih as f32) / dpi,
+                ],
+            );
+        } else {
+            richtext::draw_lines(
+                c,
+                &rich_lines,
+                content_x,
+                right - 16.,
+                y + type_scale.top,
+                type_scale.leading,
+                type_scale.body,
+                if text_empty { card_muted } else { card_ink },
+                dpi,
+            );
+        }
         if !compact_card {
             c.text(
                 &icons::note_day(note.updated_at),
@@ -1600,6 +1742,8 @@ impl State {
                         1.
                     },
                 );
+                drop(c);
+                frame.bevel_for(self.hwnd);
             } else {
                 if frosted {
                     source_glass.borrow().draw_blended(
@@ -1615,11 +1759,11 @@ impl State {
                 } else {
                     1.
                 };
-                {
-                    let c = Canvas::new(frame.dc, self.dpi);
-                    let fused = crate::fusion::fused(self.hwnd);
-                    let pane = [0., 0., w, h];
-                    let paint_r = if fused { 0. } else { 30. };
+                let fused = crate::fusion::fused(self.hwnd);
+                let pane = [0., 0., w, h];
+                let paint_r = if fused { 0. } else { 30. };
+                frame.paint_frosted_chrome_for(self.hwnd, frosted, |chrome_dc| {
+                    let c = Canvas::new(chrome_dc, self.dpi);
                     if !crate::surface::managed(&self.board.palette) {
                         c.round(
                             pane,
@@ -1630,12 +1774,7 @@ impl State {
                             false,
                         );
                     }
-                    crate::surface::paint(
-                        &c,
-                        pane,
-                        &self.board.palette,
-                        tint,
-                    );
+                    crate::surface::paint(&c, pane, &self.board.palette, tint);
                     c.coating(pane, paint_r);
                     c.draw_pane_overlay(
                         [r.right as u32, r.bottom as u32],
@@ -1645,9 +1784,8 @@ impl State {
                         [0., 0., w, h],
                     );
                     c.widget_corner_reflection_for(self.hwnd, [0., 0., w, h], paint_r, paper);
-                }
+                });
             }
-            frame.bevel_for(self.hwnd);
             if let Some(b) = self
                 .background
                 .take()
@@ -1686,7 +1824,7 @@ impl State {
                 self.hwnd,
                 self.dpi,
                 w,
-                "Sticky Notes",
+                "",
                 ink,
                 header_action(self.hover.as_ref()),
                 header_action(self.pressed.as_ref()),
@@ -1950,6 +2088,10 @@ impl State {
             self.card_cache
                 .retain(|id, _| self.board.notes.iter().any(|n| n.id == *id));
         }
+        if self.text_cache.len() > 128 {
+            self.text_cache
+                .retain(|id, _| self.board.notes.iter().any(|n| n.id == *id));
+        }
         let mut batch = Some(crate::render::Batch::new(frame.dc, self.dpi));
         {
             for (pos, (id, rect)) in layout.iter().enumerate() {
@@ -2012,6 +2154,25 @@ impl State {
                             pad + ch_px as f32 / self.dpi,
                         ];
                         let dpi = self.dpi;
+                        let card_size = [cw_px as f32 / dpi, ch_px as f32 / dpi];
+                        let text_w = (card_size[0] - type_scale.left - 16.).max(type_scale.body);
+                        let images_h =
+                            Self::cached_note_images_height(note, text_w, &self.image_cache);
+                        let rich_text = if !note.body.trim().is_empty() {
+                            Self::cached_rich_text(
+                                self.hwnd,
+                                &mut self.rich_raster,
+                                &mut self.text_cache,
+                                note,
+                                card_size,
+                                images_h,
+                                dpi,
+                                &type_scale,
+                                ink,
+                            )
+                        } else {
+                            None
+                        };
                         let typography = &mut self.typography;
                         let image_cache = &self.image_cache;
                         if let Some(sprite) = Canvas::render_sprite(
@@ -2021,7 +2182,7 @@ impl State {
                             |c| {
                                 Self::draw_card_contents(
                                     c,
-                                    &note,
+                                    note,
                                     local,
                                     color,
                                     ink,
@@ -2039,6 +2200,7 @@ impl State {
                                     image_cache,
                                     dpi,
                                     true,
+                                    rich_text,
                                 );
                             },
                         ) {
@@ -2049,24 +2211,30 @@ impl State {
                         (&batch, self.card_cache.get(id).filter(|(k, _)| *k == card_key))
                     {
                         if self.board.opacity < 100. {
-                            backing.restore_glass_card(
-                                frame.dc,
-                                *rect,
-                                if paper {
-                                    14.
-                                } else if index {
-                                    0.
-                                } else {
-                                    18.
-                                },
-                            );
+                            let card_r = if paper {
+                                14.
+                            } else if index {
+                                0.
+                            } else {
+                                18.
+                            };
+                            if scrolling {
+                                backing.restore_glass_card_fast(frame.dc, *rect, card_r);
+                            } else {
+                                backing.restore_glass_card(frame.dc, *rect, card_r);
+                            }
                         }
                         let [sw, sh] = sprite.pixel_size();
+                        let ay = if scrolling {
+                            y
+                        } else {
+                            (y * self.dpi).round() / self.dpi
+                        };
                         let sprite_rect = [
                             ax - pad,
-                            y - pad,
+                            ay - pad,
                             ax - pad + sw as f32 / self.dpi,
-                            y - pad + sh as f32 / self.dpi,
+                            ay - pad + sh as f32 / self.dpi,
                         ];
                         if b.blit(sprite, sprite_rect, !scrolling) {
                             continue;
@@ -2077,22 +2245,40 @@ impl State {
                 // At full background opacity the cached frame already contains
                 // this exact backing. Avoid a GDI flush and pixel mask per card.
                 if self.board.opacity < 100. {
-                    backing.restore_glass_card(
-                        frame.dc,
-                        *rect,
-                        if paper {
-                            14.
-                        } else if index {
-                            0.
-                        } else {
-                            18.
-                        },
-                    );
+                    let card_r = if paper {
+                        14.
+                    } else if index {
+                        0.
+                    } else {
+                        18.
+                    };
+                    if scrolling {
+                        backing.restore_glass_card_fast(frame.dc, *rect, card_r);
+                    } else {
+                        backing.restore_glass_card(frame.dc, *rect, card_r);
+                    }
                 }
+                let text_w = (right - (x + type_scale.left) - 16.).max(type_scale.body);
+                let images_h = Self::cached_note_images_height(note, text_w, &self.image_cache);
+                let rich_text = if !has_editor && !note.body.trim().is_empty() {
+                    Self::cached_rich_text(
+                        self.hwnd,
+                        &mut self.rich_raster,
+                        &mut self.text_cache,
+                        note,
+                        [right - x, bottom - y],
+                        images_h,
+                        self.dpi,
+                        &type_scale,
+                        ink,
+                    )
+                } else {
+                    None
+                };
                 let c = Canvas::new(frame.dc, self.dpi);
                 Self::draw_card_contents(
                     &c,
-                    &note,
+                    note,
                     *rect,
                     color,
                     ink,
@@ -2110,6 +2296,7 @@ impl State {
                     &self.image_cache,
                     self.dpi,
                     !has_editor,
+                    rich_text,
                 );
                 drop(c);
                 if let Some(e) = self
@@ -2424,10 +2611,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             }
             0
         }
-        WM_CAPTURECHANGED => {
+        WM_CAPTURECHANGED | WM_CANCELMODE => {
             s.pressed = None;
             s.scrollbar_drag = None;
             s.image_drag = None;
+            if s.moving || s.resizing {
+                let st = &mut *s;
+                crate::widget_interaction::exit_size_move(hwnd, &mut st.moving, &mut st.resizing);
+                st.background_key.clear();
+            }
+            if msg == WM_CANCELMODE {
+                ReleaseCapture();
+                InvalidateRect(hwnd, null(), 0);
+                drop(s);
+                return DefWindowProcW(hwnd, msg, w, l);
+            }
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_LBUTTONDBLCLK => {
@@ -2542,7 +2741,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 s.scroll_clock = Some(crate::motion::FrameClock::start());
             }
             SetTimer(hwnd, ANIMATE, crate::motion::frame_interval_ms(), None);
-            InvalidateRect(hwnd, null(), 0);
+            if !s.frame_queued {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER if w == ANIMATE => {
@@ -3611,6 +3812,7 @@ mod tests {
                 let no_img_frame = s.frame.as_ref().unwrap().snapshot();
                 s.board.notes[0].images.push("note-pic.png".into());
                 s.card_cache.clear();
+                s.text_cache.clear();
                 s.paint();
                 let card_rect = s.layout()[0].1;
                 let rects = s.note_image_rects(&id, card_rect);
