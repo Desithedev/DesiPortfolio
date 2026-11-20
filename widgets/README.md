@@ -8,7 +8,7 @@ Lumen's native manager discovers `widgets/*/widget.json`. The six current packag
 are App Dock (`launcher`), Clock, Calendar, YouTube Music, Notes and Control Center.
 They share one Rust process, the compositor, wallpaper cache, settings controls,
 window placement and snap/fuse. No Electron process is started for widget UI.
-Music retains its existing optional playback/browser adapter.
+Music uses its native Rust Chrome/Edge CDP playback backend.
 
 Each manager row has an On/Off switch and a separate Settings action. Closing a
 widget updates the switch; visibility is restored next launch. Switching a
@@ -52,8 +52,8 @@ main HWND for snap/fuse; settings/editor windows stay separate.
 
 App Dock is the bootstrap package: its entry is `native/host.rs`, with
 `nativeModule: "window"`. Shared services remain in `native-dock/src`; per-widget
-models, themes and windows stay with their packages. Only native UI packages
-remain; the optional Chrome playback adapter lives under `music/adapter/`.
+models, themes and windows stay with their packages. Only native Rust widget packages remain; YouTube Music playback uses
+`music/native/backend/`.
 
 ## Adding or updating a package
 

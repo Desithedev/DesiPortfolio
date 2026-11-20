@@ -14,21 +14,15 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-          cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Install locked build tools
-        run: npm ci
       - name: Validate tag and source safety
         run: |
           python -c "import os,tomllib; v=tomllib.load(open('native-dock/Cargo.toml','rb'))['package']['version']; tag=os.environ.get('GITHUB_REF_NAME',''); assert not os.environ.get('GITHUB_REF','').startswith('refs/tags/') or tag=='v'+v"
-          node scripts/check-safe.mjs
-          node --test --test-isolation=none scripts/test-check-safe.mjs scripts/test-native-music.mjs
+          python scripts/check_safe.py
+          python -m unittest discover -s scripts -p "test_check_safe.py"
           python -m unittest test_startup_windows
       - name: Native regression tests
         run: cargo test --locked --manifest-path native-dock/Cargo.toml -- --test-threads=1
@@ -38,7 +32,7 @@ jobs:
           python -c "import pathlib,subprocess,sys; p=next(pathlib.Path('share').glob('Lumen-*-windows-x86_64')); subprocess.check_call([sys.executable,'scripts/verify-portable.py',str(p)])"
           python -c "import pathlib,subprocess,sys; p=next(pathlib.Path('share').glob('Lumen-*-windows-x86_64.zip')); subprocess.check_call([sys.executable,'scripts/test-portable.py',str(p)])"
           python scripts/export-source.py --destination .scratch/source-export
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Lumen-windows-x86_64
           path: |

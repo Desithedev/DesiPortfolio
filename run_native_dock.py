@@ -16,12 +16,12 @@ BINARY = ROOT / "native-dock" / "target" / "debug" / "lumen.exe"
 
 def needs_build() -> bool:
     """New/changed native source packages are picked up by the double-click launcher."""
-    if not BINARY.is_file() or not (ROOT / "native-dock/target/debug/music-bridge.cjs").is_file():
+    if not BINARY.is_file():
         return True
     built = BINARY.stat().st_mtime_ns
-    sources = [MANIFEST, ROOT / "native-dock" / "build.rs", ROOT / "native-dock" / "Cargo.lock", ROOT / "scripts/build-native-music.mjs", ROOT / "package-lock.json"]
+    sources = [MANIFEST, ROOT / "native-dock" / "build.rs", ROOT / "native-dock" / "Cargo.lock"]
     for folder in (ROOT / "native-dock" / "src", ROOT / "native-dock" / "assets", ROOT / "widgets"):
-        sources.extend(p for p in folder.rglob("*") if p.is_file() and (p.suffix in (".rs", ".svg", ".png", ".toml", ".ts") or p.name == "widget.json"))
+        sources.extend(p for p in folder.rglob("*") if p.is_file() and (p.suffix in (".rs", ".svg", ".png", ".toml") or p.name == "widget.json"))
     return any(p.is_file() and p.stat().st_mtime_ns > built for p in sources)
 
 
@@ -80,16 +80,12 @@ def main() -> int:
         if not (args.check or args.build_only or args.smoke_test):
             import startup_windows
             startup_windows.ensure(ROOT)
-        node = shutil.which("node")
-        if not node:
-            raise RuntimeError("Node.js is required to run the repository's safety guard.")
-        subprocess.run([node, str(ROOT / "scripts" / "check-safe.mjs")], cwd=ROOT, check=True)
+        subprocess.run([sys.executable, str(ROOT / "scripts" / "check_safe.py")], cwd=ROOT, check=True)
         if not args.no_build:
-            subprocess.run([node, str(ROOT / "scripts" / "build-native-music.mjs")], cwd=ROOT, check=True)
             cargo, environment = toolchain()
             environment["LUMEN_PYTHON"] = sys.executable
             if args.check:
-                subprocess.run([node, "--test", "--test-isolation=none", str(ROOT / "scripts" / "test-check-safe.mjs")], cwd=ROOT, check=True)
+                subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", str(ROOT / "scripts"), "-p", "test_check_safe.py"], cwd=ROOT, check=True)
                 subprocess.run([cargo, "test", "--locked", "--manifest-path", str(MANIFEST)], cwd=ROOT, env=environment, check=True)
             subprocess.run([cargo, "build", "--locked", "--manifest-path", str(MANIFEST)], cwd=ROOT, env=environment, check=True)
         if args.check or args.build_only:

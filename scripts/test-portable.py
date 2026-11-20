@@ -26,12 +26,8 @@ def main():
         print(output);assert code==0
         for item in ['native-dock-ready','native-clock-created','native-calendar-ready','native-music-ready','native-notes-ready','native-controls-ready']:
             assert item in output,item
-        node=subprocess.run([str(root/'runtime/node.exe'),'-e',"const k=require('./runtime/node_modules/koffi'); k.load('user32.dll'); console.log('Bundled Node and Koffi OK')"],cwd=root,env=env,capture_output=True,text=True,timeout=10)
-        print(node.stdout,node.stderr);assert node.returncode==0
-        bridge=subprocess.run([str(root/'runtime/node.exe'),str(root/'runtime/music-bridge.cjs')],cwd=root,env=env,input='{"action":"info"}\n{"action":"quit"}\n',capture_output=True,text=True,timeout=15)
-        print(bridge.stdout,bridge.stderr);assert bridge.returncode==0
-        assert '"type":"ready"' in bridge.stdout
-        assert '"type":"error"' not in bridge.stdout
+        assert not (root/'runtime/node.exe').exists()
+        assert not (root/'runtime/music-bridge.cjs').exists()
         print('Relocated portable smoke test passed without developer tools on PATH')
         # Python is optional. Test both entry files from an unrelated cwd, with
         # spaces in the extracted path and no developer tools available on PATH.

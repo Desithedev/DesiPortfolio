@@ -3,7 +3,7 @@ Lumen 0.1.7 polishes Liquid Glass rendering, 120Hz responsiveness, and widget re
 - **Liquid Glass & Fused-Pane Polish**: Softened Liquid Glass edge refraction and chromatic dispersion without rim stretching, added seamless fused-pane chrome/frost blending, Direct2D text/run layout acceleration, and refined DirectComposition/GPU compositor lifecycle handling.
 - **120Hz Scroll, Animation & Timer Responsiveness**: Improved 120Hz frame pacing across widgets and pumped low-priority `WM_TIMER` messages during high-frequency animation frames so background polling never stalls.
 - **Sticky Notes Unified Rich Text**: Matched non-editing Sticky Notes card typography pixel-for-pixel with the RichEdit editor via Direct2D/RichEdit rasterization.
-- **YouTube Music Live Sync & Coverflow Cache**: Added native Chrome/Edge CDP pipe sync, instant push notifications on track/playback updates, Video-mode support, SMTC fallback improvements, and an expanded Coverflow artwork cache (`40` covers).
+- **YouTube Music Live Sync & Coverflow Cache**: Replaced the Node.js music runtime/adapter with native Rust Chrome/Edge CDP integration, added instant push notifications on track/playback updates, Video-mode support, SMTC fallback improvements, and an expanded Coverflow artwork cache (`40` covers).
 - **Control Center, Clock & App Dock**: Added fast Control Center device snapshots without blocking on DDC/CI I2C queries, asynchronous wakeups, and UI/layout refinements.
 
 Optional Python entry points remain available:

@@ -10,7 +10,7 @@ been removed.
 Download `Lumen-<version>-windows-x86_64.zip` from
 [GitHub Releases](https://github.com/nhatnguyends/Lumen/releases), extract the
 whole archive to a writable folder, and open **Lumen.exe**. The native portable
-edition bundles its Music runtime: Python, Node, Rust and Visual Studio do not
+edition runs natively without external runtimes: Python, Node, Rust and Visual Studio do not
 need to be installed. Music playback uses installed Chrome or Edge and internet;
 the other widgets do not require a browser. No Electron or WebView runtime is used.
 
@@ -41,20 +41,18 @@ to `config/logs/python-launcher.log`.
 
 ## Run from source
 
-Build prerequisites: Node.js, Rust MSVC and Visual Studio C++ Build Tools (Python is no longer required). Run `npm ci` once for the optional music playback adapter and build tools.
+Build prerequisites: Rust MSVC, Visual Studio C++ Build Tools, and Python 3.10+ (for source safety checks and packaging scripts).
 
 Build and run in release mode:
 
 ```text
-node scripts/check-safe.mjs
-node scripts/build-native-music.mjs
+python scripts/check_safe.py
 cargo build --release --locked --manifest-path native-dock/Cargo.toml
 .\native-dock\target\release\lumen.exe
 ```
 
 Local release builds output to `native-dock/target/release/lumen.exe` (debug builds to `native-dock/target/debug/lumen.exe`). Always stop any running `lumen.exe` instance before rebuilding, then launch it again afterwards. Portable packaging uses a separate static-CRT build under `native-dock/target/portable-debug/`, writing ZIPs under `share/`; no installer is generated.
-The optional music adapter controls an owned Chrome player over JSON pipes;
-widget windows remain Rust. See [Music](docs/youtube-music.md).
+YouTube Music playback runs natively in Rust against an owned Chrome or Edge profile over DevTools pipes; widget windows remain Rust. See [Music](docs/youtube-music.md).
 
 ## Widgets
 
@@ -74,8 +72,9 @@ more content remains. Soft Violet uses the raised pale glass material.
 ## Checks
 
 ```text
-node scripts/check-safe.mjs
-node --test scripts/test-check-safe.mjs scripts/test-native-music.mjs
+python scripts/check_safe.py
+python -m unittest discover -s scripts -p "test_check_safe.py"
+python -m unittest test_startup_windows
 cargo test --locked --manifest-path native-dock/Cargo.toml
 ```
 
@@ -88,8 +87,8 @@ Created by **Nhat Ng**. Copyright © 2026 Nhat Ng.
 Lumen's original source is licensed under [MIT](LICENSE.txt).
 
 Thank you to the developers and contributors behind Rust, windows-rs, resvg,
-tiny-skia, image, Serde, RustCrypto, zip-rs, Node.js, Koffi, Lucide, Feather,
-Vite, Rolldown, TypeScript, Python and all transitive dependencies.
+tiny-skia, image, Serde, RustCrypto, zip-rs, Lucide, Feather, Python and all
+transitive dependencies.
 See [Credits](CREDITS.md) and the [third-party inventory](LICENSES/THIRD-PARTY-NOTICES.md).
 Full license texts are included under `LICENSES/` in source and portable packages.
 General Settings → Credits & licenses opens the acknowledgements.

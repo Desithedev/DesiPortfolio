@@ -154,6 +154,10 @@ pub unsafe fn flush_pending_vsync(frame_started: std::time::Instant) {
         );
     }
 }
+pub fn clear_pending_vsync() {
+    PENDING_VSYNC.with(|q| q.borrow_mut().clear());
+    PENDING_VSYNC_START.with(|c| c.set(None));
+}
 pub unsafe fn pace_vsync(
     hwnd: windows_sys::Win32::Foundation::HWND,
     frame_started: std::time::Instant,

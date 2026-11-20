@@ -93,27 +93,6 @@ it does not assert that every listed package is part of the running app.
 | [zopfli](https://github.com/zopfli-rs/zopfli) | 0.8.4 | Apache-2.0 | [COPYING](rust/zopfli-0.8.4/COPYING) |
 | [zune-core](https://github.com/etemesi254/zune-image) | 0.5.3 | MIT OR Apache-2.0 OR Zlib | [LICENSE-APACHE](rust/zune-core-0.5.3/LICENSE-APACHE), [LICENSE-MIT](rust/zune-core-0.5.3/LICENSE-MIT), [LICENSE-ZLIB](rust/zune-core-0.5.3/LICENSE-ZLIB) |
 | [zune-jpeg](https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg) | 0.5.15 | MIT OR Apache-2.0 OR Zlib | [LICENSE-APACHE](rust/zune-jpeg-0.5.15/LICENSE-APACHE), [LICENSE-MIT](rust/zune-jpeg-0.5.15/LICENSE-MIT), [LICENSE-ZLIB](rust/zune-jpeg-0.5.15/LICENSE-ZLIB) |
-| [@koromix/koffi-win32-x64](https://github.com/Koromix/koffi) | 3.3.6 | MIT | [LICENSE.txt](npm/-koromix-koffi-win32-x64-3.3.6/LICENSE.txt) |
-| [@oxc-project/types](https://github.com/oxc-project/oxc) | 0.156.0 | MIT | [LICENSE](npm/-oxc-project-types-0.156.0/LICENSE) |
-| [@rolldown/binding-win32-x64-msvc](https://github.com/rolldown/rolldown) | 1.2.16 | MIT | [LICENSE](npm/-rolldown-binding-win32-x64-msvc-1.2.16/LICENSE), [THIRD-PARTY-LICENSE](npm/-rolldown-binding-win32-x64-msvc-1.2.16/THIRD-PARTY-LICENSE) |
-| [@types/node](https://github.com/DefinitelyTyped/DefinitelyTyped) | 22.20.5 | MIT | [LICENSE](npm/-types-node-22.20.5/LICENSE) |
-| detect-libc | 2.1.2 | Apache-2.0 | [LICENSE](npm/detect-libc-2.1.2/LICENSE) |
-| [fdir](https://github.com/thecodrr/fdir) | 6.5.0 | MIT | [LICENSE](npm/fdir-6.5.0/LICENSE) |
-| [koffi](https://github.com/Koromix/koffi) | 3.3.6 | MIT | [LICENSE.txt](npm/koffi-3.3.6/LICENSE.txt) |
-| [lightningcss](https://github.com/parcel-bundler/lightningcss) | 1.33.0 | MPL-2.0 | [LICENSE](npm/lightningcss-1.33.0/LICENSE) |
-| [lightningcss-win32-x64-msvc](https://github.com/parcel-bundler/lightningcss) | 1.33.0 | MPL-2.0 | [LICENSE](npm/lightningcss-win32-x64-msvc-1.33.0/LICENSE) |
-| nanoid | 3.3.20 | MIT | [LICENSE](npm/nanoid-3.3.20/LICENSE) |
-| picocolors | 1.1.1 | ISC | [LICENSE](npm/picocolors-1.1.1/LICENSE) |
-| picomatch | 4.0.7 | MIT | [LICENSE](npm/picomatch-4.0.7/LICENSE) |
-| postcss | 8.5.32 | MIT | [LICENSE](npm/postcss-8.5.32/LICENSE) |
-| [rolldown](https://github.com/rolldown/rolldown) | 1.2.16 | MIT | [LICENSE](npm/rolldown-1.2.16/LICENSE), [THIRD-PARTY-LICENSE](npm/rolldown-1.2.16/THIRD-PARTY-LICENSE) |
-| [@rolldown/pluginutils](https://github.com/rolldown/plugins) | 1.0.1 | MIT | [LICENSE](npm/-rolldown-pluginutils-1.0.1/LICENSE) |
-| source-map-js | 1.2.2 | BSD-3-Clause | [LICENSE](npm/source-map-js-1.2.2/LICENSE) |
-| [tinyglobby](https://github.com/SuperchupuDev/tinyglobby) | 0.2.17 | MIT | [LICENSE](npm/tinyglobby-0.2.17/LICENSE) |
-| [typescript](https://github.com/microsoft/TypeScript) | 5.9.3 | Apache-2.0 | [LICENSE.txt](npm/typescript-5.9.3/LICENSE.txt) |
-| [undici-types](https://github.com/nodejs/undici) | 6.21.0 | MIT | [LICENSE](npm/undici-types-6.21.0/LICENSE) |
-| [vite](https://github.com/vitejs/vite) | 8.3.5 | MIT | [LICENSE.md](npm/vite-8.3.5/LICENSE.md) |
-| [Node.js](https://github.com/nodejs/node) | 24.19.0 | MIT and bundled third-party licenses | [LICENSE](node/node-24.19.0/LICENSE) |
 | [Rust standard library](https://github.com/rust-lang/rust) | 1.99.1 | MIT OR Apache-2.0; component notices apply | [LICENSE-MIT](runtime/rust-1.99.1/LICENSE-MIT), [LICENSE-APACHE](runtime/rust-1.99.1/LICENSE-APACHE) |
 | [lucide-music](https://github.com/lucide-icons/lucide) | vendored | ISC; Feather-derived icons MIT | [LICENSE-lucide.txt](assets/lucide-music-vendored/LICENSE-lucide.txt) |
 | [lucide-controls](https://github.com/lucide-icons/lucide) | vendored | ISC; Feather-derived icons MIT | [LICENSE](assets/lucide-controls-vendored/LICENSE) |

@@ -1,6 +1,6 @@
-//! Native Win32 host. Dock/static widgets have no browser or WebView; Music
-//! explicitly delegates playback to its existing Node/browser adapter. No global
-//! input hooks or screen capture are used by this host.
+//! Native Win32 host. All six widgets share one native Rust process with a
+//! native Chrome/Edge CDP backend for YouTube Music. No Electron, WebView,
+//! Node.js runtime, global input hooks, or screen capture are used by this host.
 //!
 //! FFI safety: handles are used only on their creating UI thread. The window's
 //! user-data pointer refers to a boxed RefCell which outlives DestroyWindow.
@@ -2974,6 +2974,7 @@ unsafe extern "system" fn wndproc(
             for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
                 KillTimer(hwnd, id);
             }
+            request_quit();
             PostQuitMessage(0);
             0
         }
@@ -2997,6 +2998,22 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
     }
+}
+
+thread_local! {
+    static QUIT_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn request_quit() {
+    QUIT_REQUESTED.with(|q| q.set(true));
+}
+
+fn reset_quit_requested() {
+    QUIT_REQUESTED.with(|q| q.set(false));
+}
+
+unsafe fn quit_pending() -> bool {
+    QUIT_REQUESTED.with(|q| q.get())
 }
 
 unsafe fn pump_low_priority_messages() -> u32 {
@@ -3329,8 +3346,12 @@ pub fn run() -> Result<(), String> {
         if std::env::args().any(|a| a == "--manage-widgets") {
             app.borrow_mut().show_general();
         }
+        reset_quit_requested();
         let mut message: MSG = zeroed();
         loop {
+            if quit_pending() {
+                break;
+            }
             // GetMessage normally prioritizes posted messages over hardware
             // input. Our self-posted frame stream must never starve mouse or
             // keyboard events while another widget animates continuously.
@@ -3368,13 +3389,21 @@ pub fn run() -> Result<(), String> {
             let was_paint = message.message == WM_PAINT;
             TranslateMessage(&message);
             DispatchMessageW(&message);
+            if quit_pending() {
+                break;
+            }
             let paint_pumped = if was_paint || motion_frame { pump_low_priority_messages() } else { 0 };
+            if quit_pending() {
+                break;
+            }
             if (was_paint || motion_frame || paint_pumped > 0)
                 && ((GetQueueStatus(QS_PAINT) >> 16) & QS_PAINT == 0)
             {
                 crate::motion::flush_pending_vsync(std::time::Instant::now());
             }
         }
+        crate::motion::clear_pending_vsync();
+        reset_quit_requested();
         crate::fusion::shutdown();
         CloseHandle(mutex);
         app.borrow_mut().general.take();
@@ -3748,6 +3777,79 @@ mod tests {
 
             assert!(fired & 255 > 0, "expected WM_TIMER to fire during low-priority pump");
             assert_eq!(fired >> 8, 1, "queued widget tick must join the same paint batch");
+        }
+    }
+    #[test]
+    fn quit_message_is_not_starved_by_posted_vsync_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT_CLASS_ID: AtomicUsize = AtomicUsize::new(1);
+
+        struct ResetQuit;
+        impl Drop for ResetQuit {
+            fn drop(&mut self) {
+                reset_quit_requested();
+            }
+        }
+
+        let _ui = crate::native_ui_test_lock();
+        let _reset = ResetQuit;
+        reset_quit_requested();
+        unsafe {
+            let hinst = GetModuleHandleW(null());
+            let cls_id = NEXT_CLASS_ID.fetch_add(1, Ordering::Relaxed);
+            let cls = wide(format!(
+                "LumenQuitPriorityTest-{}-{cls_id}",
+                std::process::id()
+            ));
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: hinst,
+                lpszClassName: cls.as_ptr(),
+                ..zeroed()
+            };
+            assert_ne!(RegisterClassW(&wc), 0);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                cls.as_ptr(),
+                wide("Lumen quit priority test").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                10,
+                10,
+                null_mut(),
+                null_mut(),
+                hinst,
+                null(),
+            );
+            assert!(!hwnd.is_null());
+
+            assert_ne!(
+                PostMessageW(hwnd, crate::motion::VSYNC_FRAME, 0, 0),
+                0
+            );
+            request_quit();
+            PostQuitMessage(0);
+
+            assert!(
+                quit_pending(),
+                "expected quit_pending() to detect shutdown immediately while VSYNC_FRAME is queued"
+            );
+
+            let mut msg: MSG = zeroed();
+            let mut saw_quit = false;
+            for _ in 0..32 {
+                if PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) == 0 {
+                    break;
+                }
+                if msg.message == WM_QUIT {
+                    saw_quit = true;
+                    break;
+                }
+            }
+            assert!(saw_quit, "expected WM_QUIT to remain queued until drained");
+            DestroyWindow(hwnd);
+            UnregisterClassW(cls.as_ptr(), hinst);
         }
     }
 }

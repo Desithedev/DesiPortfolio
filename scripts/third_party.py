@@ -39,7 +39,7 @@ def fetch_notice(url,destination):
     destination.write_bytes(data)
 
 
-def collect(output,metadata=None,node_license=None):
+def collect(output,metadata=None):
     output=Path(output)
     output.mkdir(parents=True,exist_ok=True)
     cargo,env=native.toolchain()
@@ -68,30 +68,6 @@ def collect(output,metadata=None,node_license=None):
         if not files:raise RuntimeError(f"No upstream license text found for Rust crate {package['name']}")
         add("rust",package["name"],package["version"],package.get("license"),package.get("repository"),files,"Cargo resolved graph (runtime/build/target-specific)")
 
-    lock=json.loads((ROOT/"package-lock.json").read_text(encoding="utf-8"))
-    for path,locked in sorted(lock["packages"].items()):
-        if not path:continue
-        folder=ROOT/path
-        if not (folder/"package.json").is_file():continue # Optional packages for other platforms are not installed.
-        package=json.loads((folder/"package.json").read_text(encoding="utf-8"))
-        if package.get("version")!=locked.get("version"):
-            raise RuntimeError(f"Installed npm package does not match lockfile: {path}; run npm ci")
-        files=[p for p in folder.iterdir() if notice_file(p)]
-        name=package.get("name",path.removeprefix("node_modules/"))
-        if name.startswith("@koromix/koffi-") and not files:
-            files=[ROOT/"node_modules/koffi/LICENSE.txt"]
-        if name.startswith("@rolldown/binding-") and not files:
-            files=[ROOT/"node_modules/rolldown/LICENSE",ROOT/"node_modules/rolldown/THIRD-PARTY-LICENSE"]
-        if not files:raise RuntimeError(f"No upstream license text found for installed npm package {name}")
-        add("npm",name,package["version"],package.get("license",locked.get("license")),package.get("repository"),files,"installed locked npm package; includes build tooling")
-
-    node_version=subprocess.check_output([shutil.which("node") or "node","--version"],text=True).strip().removeprefix("v")
-    node_notice=output/"node"/f"node-{node_version}"/"LICENSE"
-    node_notice.parent.mkdir(parents=True,exist_ok=True)
-    if node_license is not None:shutil.copyfile(node_license,node_notice)
-    else:fetch_notice(f"https://raw.githubusercontent.com/nodejs/node/v{node_version}/LICENSE",node_notice)
-    entries.append(dict(ecosystem="runtime",name="Node.js",version=node_version,license="MIT and bundled third-party licenses",repository="https://github.com/nodejs/node",scope="bundled Music runtime",notices=[node_notice.relative_to(output).as_posix()]))
-
     rustc=Path(cargo).with_name("rustc.exe")
     rust_version=subprocess.check_output([str(rustc),"--version"],env=env,text=True).split()[1]
     rust_notices=[]
@@ -107,7 +83,7 @@ def collect(output,metadata=None,node_license=None):
     (output/"CREDITS.md").write_text(credits,encoding="utf-8")
     (output/"CREDITS.txt").write_text(credits+"\nFull dependency inventory: THIRD-PARTY-NOTICES.txt in this folder.\n",encoding="utf-8")
     shutil.copyfile(ROOT/"LICENSE.txt",output/"LICENSE.txt")
-    (output/"inventory.json").write_text(json.dumps({"schemaVersion":1,"scope":"Cargo resolved graph and installed npm packages; not a runtime-only SBOM","entries":entries},indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
+    (output/"inventory.json").write_text(json.dumps({"schemaVersion":1,"scope":"Cargo resolved graph and vendored assets; not a runtime-only SBOM","entries":entries},indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     lines=["# Third-party notices", "", "Thank you to all upstream developers and contributors.", "", "Lumen is created by Nhat Ng and licensed under MIT. These components keep", "their own licenses. Exact upstream notice files are linked below.", "", "This inventory includes build tools and target-specific Cargo packages;", "it does not assert that every listed package is part of the running app.", "", "| Component | Version | Declared license | Full notices |", "| --- | --- | --- | --- |"]
     for entry in entries:
         title=entry["name"]

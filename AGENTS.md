@@ -11,24 +11,24 @@ publishing again. Local edits, builds and checks remain authorized.
 The user retired the Electron version on 2026-11-11. All widget UI runs in the
 native Rust host. Do not restore Electron, React renderers, or WebViews.
 
-Python launchers have been retired; build and run directly with Node.js and
-Cargo (`node scripts/build-native-music.mjs` and
-`cargo build --release --locked --manifest-path native-dock/Cargo.toml`, or
+All Node.js tooling/adapters and Python launchers are retired from runtime;
+build and verify directly with Cargo and Python (`python scripts/check_safe.py`
+and `cargo build --release --locked --manifest-path native-dock/Cargo.toml`, or
 debug builds under `native-dock/target/debug/`). The user subsequently
 authorized GitHub source and package publishing and requested maximum
 portability on 2026-11-11. Native Rust portable ZIPs under `share/` are now in
 scope; keep packaging builds under `native-dock/target/`. Do not restore
 Electron or create installers.
 
-- Keep `scripts/check-safe.mjs` passing; no PowerShell helper scripts.
+- Keep `scripts/check_safe.py` passing; no PowerShell helper scripts.
 - Do not enumerate local users/groups or inject keystrokes.
 - Prefer source edits and restarting `lumen.exe` for testing.
 - Preserve `config/`, including legacy settings used for first-run migration.
-- The optional Node/Chrome playback adapter belongs to `widgets/music/adapter`;
-  it does not host widget UI or use Electron.
+- YouTube Music playback and CDP integration run natively in Rust under
+  `widgets/music/native/backend/` (no Node.js, Electron, or WebView).
 - App-wide logging writes to `logs/lumen.log` (2 MB rotation) under the install/workspace
   root (`native-dock/src/logger.rs`), capturing app/widget lifecycle, panics,
-  SMTC fallback (`widgets/music/native/smtc.rs`), and piped `music-adapter` stderr.
+  and SMTC fallback (`widgets/music/native/smtc.rs`).
 - Always stop any running `lumen.exe` instance before rebuilding `native-dock/target/release/lumen.exe` (or `native-dock/target/debug/lumen.exe`), and start it again after the build succeeds.
 
 ## 120Hz Every-Frame Scroll & Animation Standard

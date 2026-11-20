@@ -38,28 +38,19 @@ Toolbar SVGs include adaptations to stroke width and sizing. Full Lucide/Feather
 notices are included in the license collection; see [Lucide](https://lucide.dev/)
 and [Feather](https://feathericons.com/).
 
-## Music runtime and development tools
+## Development and launcher tools
 
-- **Node.js contributors and the OpenJS community** — the optional Music adapter
-  uses Node.js. Its MIT license and bundled third-party notices are included with
-  the exact Node runtime shipped in each portable build.
-- **Niels Martignène and Koffi contributors** — [Koffi](https://koffi.dev/), MIT,
-  for the optional Music adapter's native window integration.
-- **VoidZero, Vite, Rolldown and their contributors** — MIT-licensed build and
-  bundling tools. Their bundled third-party notices remain included.
-- **Microsoft, TypeScript and DefinitelyTyped contributors** — TypeScript is
-  Apache-2.0; the Node type declarations use MIT. These are development tools.
-- **Python Software Foundation and Python contributors** — the source and
-  optional Python launchers use an installed Python interpreter. Python itself
-  is not bundled with Lumen. See [Python's license](https://docs.python.org/3/license.html).
+- **Python Software Foundation and Python contributors** — the packaging
+  scripts and optional Python launchers use an installed Python interpreter.
+  Python itself is not bundled with Lumen. See [Python's license](https://docs.python.org/3/license.html).
 
 ## Full notices and inventory
 
 The repository's `LICENSES/` directory and portable ZIPs contain the collected
 license/copyright/notice files and `THIRD-PARTY-NOTICES.md`. Exact versions are
-generated from Cargo metadata and the installed npm packages matching the lock
-file. The inventory deliberately includes build dependencies and resolved
-target-specific packages; it is not a claim that every entry runs at runtime.
+generated from Cargo metadata matching the lock file. The inventory deliberately
+includes build dependencies and resolved target-specific packages; it is not a
+claim that every entry runs at runtime.
 
 Generate an updated collection with:
 

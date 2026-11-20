@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tomllib
-import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,8 +34,7 @@ def main():
     cargo, env = native.toolchain()
     env["RUSTFLAGS"] = "-C target-feature=+crt-static"
     env["CARGO_TARGET_DIR"] = str(ROOT / "native-dock/target/portable-debug")
-    subprocess.run(["node", "scripts/check-safe.mjs"], cwd=ROOT, check=True)
-    subprocess.run(["node", "scripts/build-native-music.mjs"], cwd=ROOT, check=True)
+    subprocess.run([sys.executable, "scripts/check_safe.py"], cwd=ROOT, check=True)
     subprocess.run([cargo, "build", "--locked", "--manifest-path", str(native.MANIFEST)], env=env, cwd=ROOT, check=True)
     destination = ROOT / "share" / f"Lumen-{version}-windows-x86_64"
     if (destination / "lumen-portable.json").exists() and "--refresh" not in sys.argv:
@@ -54,30 +52,17 @@ def main():
     copy(ROOT / "LICENSE.txt", "LICENSE.txt")
     copy(ROOT / "resources/tray.png", "resources/tray.png")
     copy(ROOT / "native-dock/lumen.manifest", "resources/lumen.manifest")
-    copy(ROOT / "native-dock/target/debug/music-bridge.cjs", "runtime/music-bridge.cjs")
     # runtime/ is allowed by the original portable updater, preserving upgrades.
     copy(ROOT / "scripts/portable_python/launch_lumen.py", "runtime/launch_lumen.py")
     copy(ROOT / "scripts/portable_python/Launch Lumen.pyw", "runtime/Launch Lumen.pyw")
-    node = Path(shutil.which("node"))
-    copy(node, "runtime/node.exe")
-    node_version = subprocess.check_output([str(node), "--version"], text=True).strip()
-    # Node's distribution LICENSE includes its bundled third-party notices.
-    with urllib.request.urlopen(f"https://raw.githubusercontent.com/nodejs/node/{node_version}/LICENSE", timeout=30) as response:
-        license_bytes = response.read(4 * 1024 * 1024)
     (destination / "LICENSES").mkdir(exist_ok=True)
-    (destination / "LICENSES/Node-LICENSE.txt").write_bytes(license_bytes)
-    for name in ["koffi", "@koromix/koffi-win32-x64"]:
-        source = ROOT / "node_modules" / name
-        for file in source.rglob("*"):
-            if file.is_file() and not set(file.relative_to(source).parts) & {"doc", "vendor", "build"} and file.suffix.lower() in {".js", ".cjs", ".json", ".node", ".txt", ".md"}:
-                copy(file, "runtime/node_modules/" + name + "/" + file.relative_to(source).as_posix())
     # Include Rust dependency license texts rather than removing third-party notices.
     metadata = json.loads(subprocess.check_output([cargo, "metadata", "--locked", "--format-version", "1", "--manifest-path", str(native.MANIFEST)], env=env))
     from third_party import collect
-    collect(destination/"LICENSES",metadata=metadata,node_license=destination/"LICENSES/Node-LICENSE.txt")
+    collect(destination/"LICENSES",metadata=metadata)
     for manifest in (ROOT / "widgets").glob("*/widget.json"):
         copy(manifest, manifest.relative_to(ROOT).as_posix())
-    readme = """# Lumen portable\n\nExtract the entire ZIP to a writable folder, then double-click Lumen.exe.\nNo Python, Rust, Visual Studio or Node installation is needed. Node for the\noptional Music adapter is included; browser playback requires installed Chrome\nor Edge and internet access. Other widgets do not require a browser.\n\nTarget: Windows 10/11 x64. ARM64 native and 32-bit builds are not provided.\nThis build has not yet been certified on a clean Windows VM or other PCs.\n\nKeep the full folder together. User data is stored in config/ next to Lumen.exe.\nUse a folder you can write to, such as Downloads or your user tools folder,\nnot Program Files. Settings enable Start with Windows by default; you can turn\nit off. Moving the folder requires launching Lumen once to refresh that entry.\n\nGeneral Settings > Updates checks official GitHub Releases. Download update\nthen Restart and apply update. Settings, notes, browser profile and geometry\nare preserved. All six native widget implementations update with the app.\nIndependent downloadable native plugins are not implemented yet.\n\nThe package is not code-signed. Windows may show an unknown-publisher warning.\nSource and release notes: https://github.com/nhatnguyends/Lumen\n"""
+    readme = """# Lumen portable\n\nExtract the entire ZIP to a writable folder, then double-click Lumen.exe.\nNo Python, Rust, Visual Studio or Node installation is needed. Music playback\nruns natively in Rust and requires installed Chrome or Edge and internet access.\nOther widgets do not require a browser.\n\nTarget: Windows 10/11 x64. ARM64 native and 32-bit builds are not provided.\nThis build has not yet been certified on a clean Windows VM or other PCs.\n\nKeep the full folder together. User data is stored in config/ next to Lumen.exe.\nUse a folder you can write to, such as Downloads or your user tools folder,\nnot Program Files. Settings enable Start with Windows by default; you can turn\nit off. Moving the folder requires launching Lumen once to refresh that entry.\n\nGeneral Settings > Updates checks official GitHub Releases. Download update\nthen Restart and apply update. Settings, notes, browser profile and geometry\nare preserved. All six native widget implementations update with the app.\nIndependent downloadable native plugins are not implemented yet.\n\nThe package is not code-signed. Windows may show an unknown-publisher warning.\nSource and release notes: https://github.com/nhatnguyends/Lumen\n"""
     readme += "\nOptional Python entry point (requires installed Python 3.10+):\nRun `python runtime/launch_lumen.py`, or double-click `runtime/Launch Lumen.pyw`\nif .pyw files are associated with Python. This starts the same Lumen.exe; keep\nit and all runtime files. It does not change Defender or company security policy.\nLogs: config/logs/python-launcher.log. No pip packages or source build required.\n"
     readme += "\nLumen by Nhat Ng — copyright 2026 Nhat Ng. MIT License: LICENSE.txt.\nThanks to all upstream developers. General Settings > Credits & licenses opens\nthe acknowledgements; full third-party license texts and inventory are in LICENSES/.\nLibraries/assets retain their own licenses, independently of Lumen's MIT license.\n"
     (destination / "README.md").write_text(readme, encoding="utf-8")
