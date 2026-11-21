@@ -1,10 +1,12 @@
-Lumen 0.1.7 polishes Liquid Glass rendering, 120Hz responsiveness, and widget reliability across the native Rust desktop host:
+Lumen 0.1.8 refines fused Liquid Glass corner transparency, adds live update progress and post-update notifications, and keeps 120Hz responsiveness across the native Rust desktop host:
 
+- **Smooth Fused Rounded Corners at `0%` Opacity**: Eliminated faint rectangular corner underlap artifacts when a transparent (`opacity = 0%`) widget fuses with an opaque neighbor, and unified seam-distance weighting across CPU and Direct3D 11 / DirectComposition shaders for smooth corner handovers.
+- **In-App Update Progress & Notifications**: Added a live progress bar in General Settings during update download/staging, direct Update Now staging, and tray/status confirmation after applying an update.
 - **Liquid Glass & Fused-Pane Polish**: Softened Liquid Glass edge refraction and chromatic dispersion without rim stretching, added seamless fused-pane chrome/frost blending, Direct2D text/run layout acceleration, and refined DirectComposition/GPU compositor lifecycle handling.
 - **120Hz Scroll, Animation & Timer Responsiveness**: Improved 120Hz frame pacing across widgets and pumped low-priority `WM_TIMER` messages during high-frequency animation frames so background polling never stalls.
 - **Sticky Notes Unified Rich Text**: Matched non-editing Sticky Notes card typography pixel-for-pixel with the RichEdit editor via Direct2D/RichEdit rasterization.
-- **YouTube Music Live Sync & Coverflow Cache**: Replaced the Node.js music runtime/adapter with native Rust Chrome/Edge CDP integration, added instant push notifications on track/playback updates, Video-mode support, SMTC fallback improvements, and an expanded Coverflow artwork cache (`40` covers).
-- **Control Center, Clock & App Dock**: Added fast Control Center device snapshots without blocking on DDC/CI I2C queries, asynchronous wakeups, and UI/layout refinements.
+- **YouTube Music Live Sync & Coverflow Cache**: Native Rust Chrome/Edge CDP integration with instant push notifications on track/playback updates, Video-mode support, SMTC fallback improvements, and an expanded Coverflow artwork cache (`40` covers).
+- **Control Center, Clock & App Dock**: Fast Control Center device snapshots without blocking on DDC/CI I2C queries, asynchronous wakeups, and UI/layout refinements.
 
 Optional Python entry points remain available:
 
@@ -16,7 +18,7 @@ build tools are needed. Both entry points launch the same native `Lumen.exe`;
 keep the full ZIP extracted. This does not change Defender or enterprise policy.
 Direct `Lumen.exe` launch remains available without installing Python.
 
-**Portable:** download `Lumen-0.1.7-windows-x86_64.zip`, extract the complete ZIP
+**Portable:** download `Lumen-0.1.8-windows-x86_64.zip`, extract the complete ZIP
 to a writable user folder and run `Lumen.exe`. Python, Node, Rust and Visual
 Studio do not need to be installed. The Music runtime is included; playback
 requires installed Chrome or Edge and an internet connection.

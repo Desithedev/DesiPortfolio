@@ -60,11 +60,17 @@ pub fn installed_version(root: &Path) -> String {
         .map(|m| m.version)
         .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").into())
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Release {
     pub version: String,
     pub url: String,
     pub digest: String,
+    pub size: u64,
+}
+#[derive(Clone, Debug)]
+pub struct Progress {
+    pub label: String,
+    pub fraction: f32,
 }
 struct Internet(*mut std::ffi::c_void);
 impl Drop for Internet {
@@ -103,6 +109,14 @@ fn url_parts(url: &str) -> Result<(&str, &str)> {
     Ok((host, path))
 }
 fn get(url: &str, limit: usize) -> Result<(u32, Vec<u8>)> {
+    get_with_progress(url, limit, 0, &mut |_, _| {})
+}
+fn get_with_progress(
+    url: &str,
+    limit: usize,
+    expected_total: usize,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<(u32, Vec<u8>)> {
     let mut location = url.to_string();
     for _ in 0..5 {
         let (host, path) = url_parts(&location)?;
@@ -180,7 +194,23 @@ fn get(url: &str, limit: usize) -> Result<(u32, Vec<u8>)> {
             if status != 200 {
                 return Ok((status, Vec::new()));
             }
-            let mut body = Vec::new();
+            let mut content_len = 0u32;
+            let mut cl_size = 4u32;
+            let total = if WinHttpQueryHeaders(
+                request.0,
+                WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+                null(),
+                &mut content_len as *mut _ as _,
+                &mut cl_size,
+                null_mut(),
+            ) != 0
+                && content_len > 0
+            {
+                content_len as usize
+            } else {
+                expected_total
+            };
+            let mut body = Vec::with_capacity(total.min(limit));
             let mut chunk = [0u8; 65536];
             loop {
                 let mut read = 0;
@@ -200,6 +230,7 @@ fn get(url: &str, limit: usize) -> Result<(u32, Vec<u8>)> {
                     return Err("Update exceeds download limit".into());
                 }
                 body.extend_from_slice(&chunk[..read as usize]);
+                on_progress(body.len(), total.max(body.len()));
             }
             return Ok((status, body));
         }
@@ -243,9 +274,10 @@ fn parse_release(bytes: &[u8], current: &str) -> Result<Option<Release>> {
         .as_str()
         .and_then(|s| s.strip_prefix("sha256:"))
         .ok_or("Release asset is missing its SHA-256 digest")?;
+    let size = asset["size"].as_u64().unwrap_or(u64::MAX);
     if digest.len() != 64
         || !digest.bytes().all(|c| c.is_ascii_hexdigit())
-        || asset["size"].as_u64().unwrap_or(u64::MAX) > MAX_DOWNLOAD as u64
+        || size > MAX_DOWNLOAD as u64
     {
         return Err("Invalid release asset metadata".into());
     }
@@ -253,6 +285,7 @@ fn parse_release(bytes: &[u8], current: &str) -> Result<Option<Release>> {
         version: ver.into(),
         url: url.into(),
         digest: digest.to_lowercase(),
+        size,
     }))
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,15 +397,25 @@ fn json_write(path: &Path, value: &impl Serialize) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn unpack(bytes: &[u8], stage: &Path, expected: &str) -> Result<Manifest> {
+    unpack_with_progress(bytes, stage, expected, &mut |_, _| {})
+}
+fn unpack_with_progress(
+    bytes: &[u8],
+    stage: &Path,
+    expected: &str,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Result<Manifest> {
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).map_err(err)?;
-    if zip.len() > 10001 {
+    let count = zip.len();
+    if count > 10001 {
         return Err("Too many archive entries".into());
     }
     let mut seen = HashSet::new();
     let mut total = 0;
     // Validate the complete directory before writing anything.
-    for i in 0..zip.len() {
+    for i in 0..count {
         let f = zip.by_index(i).map_err(err)?;
         safe_path(f.name())?;
         if f.is_dir()
@@ -386,7 +429,7 @@ fn unpack(bytes: &[u8], stage: &Path, expected: &str) -> Result<Manifest> {
             return Err("Archive exceeds expanded size limit".into());
         }
     }
-    for i in 0..zip.len() {
+    for i in 0..count {
         let mut f = zip.by_index(i).map_err(err)?;
         let target = stage.join(safe_path(f.name())?);
         no_links(&target)?;
@@ -397,6 +440,7 @@ fn unpack(bytes: &[u8], stage: &Path, expected: &str) -> Result<Manifest> {
             .open(target)
             .map_err(err)?;
         std::io::copy(&mut f.by_ref().take(MAX_EXPANDED + 1), &mut out).map_err(err)?;
+        on_progress(i + 1, count);
     }
     let m = read_manifest(&stage.join(MARKER))?;
     if m.version != expected || m.files.len() + 1 != seen.len() {
@@ -417,11 +461,20 @@ struct Pending {
 fn updates(root: &Path) -> PathBuf {
     root.join("config/updates")
 }
+#[cfg(test)]
 pub fn stage(root: &Path, release: &Release) -> Result<()> {
-    if !portable(root) {
-        return Err("Source builds cannot overwrite themselves with a portable update. Download the portable edition from GitHub Releases.".into());
-    }
-    let existing = read_manifest(&root.join(MARKER))?;
+    stage_with_progress(root, release, &mut |_| {})
+}
+pub fn stage_with_progress(
+    root: &Path,
+    release: &Release,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<()> {
+    let existing = if portable(root) {
+        Some(read_manifest(&root.join(MARKER))?)
+    } else {
+        None
+    };
     let base = updates(root);
     no_links(&base)?;
     fs::create_dir_all(&base).map_err(err)?;
@@ -430,27 +483,75 @@ pub fn stage(root: &Path, release: &Release) -> Result<()> {
     }
     let staging = base.join("staged");
     if staging.exists() {
-        return Err(
-            "Old staging directory exists; close Lumen and inspect config/updates before retrying"
-                .into(),
-        );
+        let _ = fs::remove_dir_all(&staging);
+        if staging.exists() {
+            return Err(
+                "Old staging directory exists; close Lumen and inspect config/updates before retrying"
+                    .into(),
+            );
+        }
     }
-    let (status, body) = get(&release.url, MAX_DOWNLOAD)?;
+    on_progress(Progress {
+        label: format!("Downloading Lumen v{}…", release.version),
+        fraction: 0.02,
+    });
+    let ver = release.version.clone();
+    let expected_total = release.size as usize;
+    let (status, body) = get_with_progress(
+        &release.url,
+        MAX_DOWNLOAD,
+        expected_total,
+        &mut |downloaded, total| {
+            let ratio = if total > 0 {
+                (downloaded as f32 / total as f32).clamp(0., 1.)
+            } else {
+                0.5
+            };
+            let mb_done = downloaded as f32 / (1024. * 1024.);
+            let label = if total > 0 {
+                let mb_total = total as f32 / (1024. * 1024.);
+                format!("Downloading Lumen v{ver} ({mb_done:.1} / {mb_total:.1} MB)…")
+            } else {
+                format!("Downloading Lumen v{ver} ({mb_done:.1} MB)…")
+            };
+            on_progress(Progress {
+                label,
+                fraction: 0.02 + ratio * 0.63,
+            });
+        },
+    )?;
     if status != 200 {
         return Err(format!("Download returned HTTP {status}"));
     }
+    on_progress(Progress {
+        label: format!("Verifying Lumen v{} package…", release.version),
+        fraction: 0.68,
+    });
     if hash(&body) != release.digest {
         return Err("Downloaded archive SHA-256 does not match GitHub release metadata".into());
     }
     fs::create_dir(&staging).map_err(err)?;
     let result = (|| {
-        let m = unpack(&body, &staging, &release.version)?;
-        let mut names: HashSet<_> = m
-            .files
-            .keys()
-            .chain(existing.files.keys())
-            .cloned()
-            .collect();
+        let ver = release.version.clone();
+        let m = unpack_with_progress(&body, &staging, &release.version, &mut |done, count| {
+            let ratio = if count > 0 {
+                (done as f32 / count as f32).clamp(0., 1.)
+            } else {
+                1.
+            };
+            on_progress(Progress {
+                label: format!("Extracting Lumen v{ver} ({done}/{count} files)…"),
+                fraction: 0.70 + ratio * 0.22,
+            });
+        })?;
+        on_progress(Progress {
+            label: format!("Preparing Lumen v{} update transaction…", release.version),
+            fraction: 0.94,
+        });
+        let mut names: HashSet<_> = m.files.keys().cloned().collect();
+        if let Some(ex) = &existing {
+            names.extend(ex.files.keys().cloned());
+        }
         names.insert(MARKER.into());
         let mut baseline = BTreeMap::new();
         for name in names {
@@ -462,12 +563,14 @@ pub fn stage(root: &Path, release: &Release) -> Result<()> {
                 None
             };
             if name != MARKER {
-                if let Some(expected) = existing.files.get(&name) {
-                    if current.as_ref() != Some(expected) {
-                        return Err(format!("Local app file was changed: {name}; keep this copy and install the new ZIP separately"));
+                if let Some(ex) = &existing {
+                    if let Some(expected) = ex.files.get(&name) {
+                        if current.as_ref() != Some(expected) {
+                            return Err(format!("Local app file was changed: {name}; keep this copy and install the new ZIP separately"));
+                        }
+                    } else if current.is_some() {
+                        return Err(format!("Update would overwrite an unowned file: {name}"));
                     }
-                } else if current.is_some() {
-                    return Err(format!("Update would overwrite an unowned file: {name}"));
                 }
             }
             baseline.insert(name, current);
@@ -478,10 +581,15 @@ pub fn stage(root: &Path, release: &Release) -> Result<()> {
                 manifest: m,
                 baseline,
             },
-        )
+        )?;
+        on_progress(Progress {
+            label: format!("Lumen v{} ready! Restarting to apply…", release.version),
+            fraction: 1.0,
+        });
+        Ok(())
     })();
     if result.is_err() {
-        fs::remove_dir_all(&staging).map_err(err)?;
+        let _ = fs::remove_dir_all(&staging);
     }
     result
 }
@@ -588,25 +696,41 @@ pub fn apply(root: &Path) -> Result<()> {
             )),
         };
     }
+    let _ = fs::write(base.join("applied-version.txt"), &p.manifest.version);
     fs::remove_file(base.join("journal.json")).map_err(err)?;
     fs::remove_file(base.join("pending.json")).map_err(err)?;
     fs::remove_dir_all(base.join("staged")).map_err(err)?;
     Ok(())
 }
+pub fn take_applied_version(root: &Path) -> Option<String> {
+    let path = updates(root).join("applied-version.txt");
+    let ver = fs::read_to_string(&path).ok()?.trim().to_string();
+    let _ = fs::remove_file(path);
+    if ver.is_empty() {
+        None
+    } else {
+        Some(ver)
+    }
+}
 pub fn pending(root: &Path) -> bool {
     updates(root).join("pending.json").is_file()
 }
 pub fn restart(root: &Path) -> Result<()> {
-    if !portable(root) || (!pending(root) && !updates(root).join("journal.json").exists()) {
-        return Err("No portable update is ready".into());
+    if !pending(root) && !updates(root).join("journal.json").exists() {
+        return Err("No update is ready".into());
     }
-    let helper = updates(root).join("Lumen-updater.exe");
+    let base = updates(root);
+    no_links(&base)?;
+    fs::create_dir_all(&base).map_err(err)?;
+    let helper = base.join("Lumen-updater.exe");
     no_links(&helper)?;
-    fs::copy(std::env::current_exe().map_err(err)?, &helper).map_err(err)?;
+    let current = std::env::current_exe().map_err(err)?;
+    fs::copy(&current, &helper).map_err(err)?;
     Command::new(helper)
         .arg("--apply-update")
         .arg(root)
         .arg(std::process::id().to_string())
+        .arg(&current)
         .creation_flags(0x08000000)
         .spawn()
         .map_err(err)?;
@@ -660,17 +784,32 @@ pub fn dispatch() -> bool {
                 .ok_or("Missing parent PID")?
                 .parse()
                 .map_err(err)?;
+            let expected_parent = args
+                .get(4)
+                .map(PathBuf::from)
+                .and_then(|p| p.canonicalize().ok())
+                .or_else(|| root.join("Lumen.exe").canonicalize().ok());
             unsafe {
                 let parent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x00100000, 0, pid);
                 if !parent.is_null() {
                     let mut name = vec![0u16; 32768];
                     let mut len = name.len() as u32;
-                    let valid = QueryFullProcessImageNameW(parent, 0, name.as_mut_ptr(), &mut len)
-                        != 0
-                        && PathBuf::from(String::from_utf16_lossy(&name[..len as usize]))
+                    let parent_path = if QueryFullProcessImageNameW(
+                        parent,
+                        0,
+                        name.as_mut_ptr(),
+                        &mut len,
+                    ) != 0
+                    {
+                        PathBuf::from(String::from_utf16_lossy(&name[..len as usize]))
                             .canonicalize()
                             .ok()
-                            == root.join("Lumen.exe").canonicalize().ok();
+                    } else {
+                        None
+                    };
+                    let valid = parent_path.is_some()
+                        && (parent_path == expected_parent
+                            || parent_path == root.join("Lumen.exe").canonicalize().ok());
                     if !valid {
                         CloseHandle(parent);
                         return Err("Update parent does not match Lumen.exe".into());
@@ -681,6 +820,17 @@ pub fn dispatch() -> bool {
                         return Err(
                             "Lumen is still running; close it before applying the update".into(),
                         );
+                    }
+                } else {
+                    for _ in 0..120 {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let target = args
+                            .get(4)
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| root.join("Lumen.exe"));
+                        if fs::OpenOptions::new().write(true).open(&target).is_ok() {
+                            break;
+                        }
                     }
                 }
             }
@@ -694,9 +844,25 @@ pub fn dispatch() -> bool {
                     )
                     .map_err(err)?;
                 }
+            } else if let Some(parent_exe) = args.get(4).map(PathBuf::from) {
+                if let (Ok(p1), Ok(p2)) = (
+                    parent_exe.canonicalize(),
+                    root.join("Lumen.exe").canonicalize(),
+                ) {
+                    if p1 != p2 {
+                        let _ = fs::copy(&p2, &p1);
+                    }
+                }
             }
             if !updates(&root).join("journal.json").exists() {
-                Command::new(root.join("Lumen.exe"))
+                let launch = if root.join("Lumen.exe").is_file() {
+                    root.join("Lumen.exe")
+                } else {
+                    args.get(4)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| root.join("Lumen.exe"))
+                };
+                Command::new(launch)
                     .current_dir(&root)
                     .spawn()
                     .map_err(err)?;
@@ -716,7 +882,7 @@ pub fn dispatch() -> bool {
         return true;
     }
     let root = crate::model::root();
-    if portable(&root) && (pending(&root) || updates(&root).join("journal.json").exists()) {
+    if pending(&root) || updates(&root).join("journal.json").exists() {
         if let Err(e) = restart(&root) {
             unsafe {
                 MessageBoxW(
@@ -878,6 +1044,11 @@ mod tests {
         fs::write(&user, "private notes").unwrap();
         apply(&temp.0).unwrap();
         assert_eq!(installed_version(&temp.0), "0.2.0");
+        assert_eq!(
+            take_applied_version(&temp.0).as_deref(),
+            Some("0.2.0")
+        );
+        assert!(take_applied_version(&temp.0).is_none());
         assert_eq!(fs::read_to_string(user).unwrap(), "private notes");
         assert_eq!(
             fs::read(updates(&temp.0).join("backup/Lumen.exe")).unwrap(),

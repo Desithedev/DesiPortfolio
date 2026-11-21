@@ -93,6 +93,11 @@ pub enum Row {
         text: String,
         color: u32,
     },
+    Progress {
+        label: String,
+        fraction: f32,
+        color: u32,
+    },
 }
 impl Row {
     pub fn section(label: impl Into<String>) -> Self {
@@ -156,6 +161,13 @@ impl Row {
     pub fn highlight_note(text: impl Into<String>, color: u32) -> Self {
         Self::HighlightNote {
             text: text.into(),
+            color,
+        }
+    }
+    pub fn progress(label: impl Into<String>, fraction: f32, color: u32) -> Self {
+        Self::Progress {
+            label: label.into(),
+            fraction: fraction.clamp(0., 1.),
             color,
         }
     }
@@ -421,6 +433,7 @@ fn height(row: &Row, columns: usize) -> f32 {
         Row::Button { .. } => 40.,
         Row::Note(_) => 30.,
         Row::HighlightNote { .. } => 38.,
+        Row::Progress { .. } => 56.,
     }
 }
 /// Shared geometry drives painting, scrolling and hit regions, including odd grid tails.
@@ -1080,6 +1093,38 @@ impl State {
                     c.round(r, 9., *color, 44, false, false);
                     c.round(r, 9., *color, 170, true, false);
                     c.text(text, r, 10.5, true, 0xffffff, 1);
+                }
+                Row::Progress {
+                    label,
+                    fraction,
+                    color,
+                } => {
+                    let frac = fraction.clamp(0., 1.);
+                    let pct = format!("{}%", (frac * 100.).round() as u32);
+                    c.text(
+                        label,
+                        shift([28., y + 6., w - 76., y + 28.]),
+                        10.5,
+                        true,
+                        white,
+                        0,
+                    );
+                    c.text(
+                        &pct,
+                        shift([w - 76., y + 6., w - 28., y + 28.]),
+                        10.5,
+                        true,
+                        *color,
+                        2,
+                    );
+                    let bar = shift([28., y + 34., w - 28., y + 44.]);
+                    c.round(bar, 5., white, 22, false, false);
+                    c.round(bar, 5., white, 40, true, false);
+                    let fill_w = ((w - 56.) * frac).max(if frac > 0.005 { 10. } else { 0. });
+                    if fill_w > 0. {
+                        let fill = shift([28., y + 34., (28. + fill_w).min(w - 28.), y + 44.]);
+                        c.round(fill, 5., *color, 255, false, false);
+                    }
                 }
             }
                     if !matches!(

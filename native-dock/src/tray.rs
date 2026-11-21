@@ -138,6 +138,20 @@ impl Tray {
         SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon_normal as isize);
         Some(tray)
     }
+    pub unsafe fn notify(&mut self, title: &str, body: &str) {
+        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID | NIF_INFO;
+        self.data.dwInfoFlags = NIIF_INFO;
+        self.data.szInfoTitle.fill(0);
+        let t = crate::model::wide(title);
+        let t_len = t.len().min(self.data.szInfoTitle.len() - 1);
+        self.data.szInfoTitle[..t_len].copy_from_slice(&t[..t_len]);
+        self.data.szInfo.fill(0);
+        let b = crate::model::wide(body);
+        let b_len = b.len().min(self.data.szInfo.len() - 1);
+        self.data.szInfo[..b_len].copy_from_slice(&b[..b_len]);
+        Shell_NotifyIconW(NIM_MODIFY, &self.data);
+        self.data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_GUID;
+    }
     pub unsafe fn set_update_available(&mut self, available: bool) {
         if self.update_available == available {
             return;

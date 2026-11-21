@@ -648,8 +648,15 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
     uint wc = min(fb_counts.y, 16u);
     bool in_window = false;
     bool in_deep_window = false;
+    bool in_deep_opaque_window = false;
+    bool uniform_op = true;
+    float op0 = (fb_counts.x > 0u) ? fb_pane_meta[0].y : 1.0;
     [loop]
     for (uint wi = 0u; wi < wc; wi++) {
+        float w_op = fb_pane_meta[wi].y;
+        if (abs(w_op - op0) > 1e-4) {
+            uniform_op = false;
+        }
         float4 mw = fb_member_windows[wi];
         if (local_px.x >= mw.x && local_px.x < mw.z && local_px.y >= mw.y && local_px.y < mw.w) {
             in_window = true;
@@ -657,21 +664,30 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
                 && local_px.y >= mw.y + underlap && local_px.y < mw.w - underlap)
             {
                 in_deep_window = true;
-                break;
+                if (w_op >= 0.999) {
+                    in_deep_opaque_window = true;
+                }
             }
         }
     }
-    if ((in_window && d >= -1.0 && coverage > 0.0) || (in_deep_window && d < -1.0)) {
+    if ((in_window && d >= -1.0 && coverage > 0.0)
+        || (in_deep_opaque_window && d < -1.0)
+        || (in_deep_window && d < -1.0 && uniform_op))
+    {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
     float alpha = 1.0;
+    float fg_alpha = 1.0;
     float3 delta_rgb = float3(0.0, 0.0, 0.0);
     float frost_mix = 1.0;
     uint pc = min(fb_counts.x, 16u);
     if (pc > 0u) {
         float sum_w = 0.0;
         float sum_a = 0.0;
+        float sum_fg_w = 0.0;
+        float sum_fg_a = 0.0;
+        float reach = 120.0 * fb_dpi;
         float3 sum_delta = float3(0.0, 0.0, 0.0);
         float sum_wf = 0.0;
         float sum_sharp = 0.0;
@@ -688,12 +704,25 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
 
             float pdpi = max(fb_pane_meta[pi].z, 1.0);
             float srad = min(4.0 * pdpi, min(ph.x, ph.y));
-            float d_seam = sd_round_rect(local_px - pcen, ph, srad);
-            float wf = exp(-max(d_seam, 0.0) / (96.0 * pdpi));
+            float d_seam = max(sd_round_rect(local_px - pcen, ph, srad), 0.0);
+            if (d_seam < reach) {
+                float t_fg = 1.0 - d_seam / reach;
+                float w_fg = t_fg * t_fg;
+                sum_fg_w += w_fg;
+                sum_fg_a += w_fg * fb_pane_meta[pi].y;
+            }
+            float wf = exp(-d_seam / (96.0 * pdpi));
             sum_wf += wf;
             sum_sharp += wf * fb_pane_meta[pi].w;
         }
         alpha = (sum_w > 0.0) ? (sum_a / sum_w) : 0.0;
+        if (uniform_op) {
+            fg_alpha = alpha;
+        } else if (in_window) {
+            fg_alpha = 0.0;
+        } else {
+            fg_alpha = (sum_fg_w > 0.0) ? (sum_fg_a / sum_fg_w) : 0.0;
+        }
         delta_rgb = (sum_w > 0.0) ? (sum_delta / sum_w) : float3(0.0, 0.0, 0.0);
         frost_mix = 1.0 - ((sum_wf > 0.0) ? saturate(sum_sharp / sum_wf) : 0.0);
     }
@@ -796,7 +825,7 @@ float4 fusion_bridge_ps(VSOut i) : SV_Target {
     }
 
     float3 lit = min(wall + (1.0 - wall) * rim_edge + liquid_spec, 1.0);
-    float fg_a = coverage * alpha;
+    float fg_a = coverage * fg_alpha;
     float out_a = fg_a + shadow_a * (1.0 - fg_a);
     return float4(lit * fg_a, out_a);
 }

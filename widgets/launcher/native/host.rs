@@ -63,6 +63,7 @@ const SEARCH_ID: usize = 100;
 const PIN_TIMER: usize = 1;
 const SMOKE_TIMER: usize = 2;
 const UPDATE_CHECK_TIMER: usize = 6;
+const UPDATE_PROGRESS_TIMER: usize = 7;
 const CMD_ADD: u32 = 10;
 const CMD_PC: u32 = 11;
 const CMD_BIN: u32 = 12;
@@ -2226,6 +2227,21 @@ unsafe extern "system" fn wndproc(
             } else {
                 // One-shot update check ~5 minutes after startup or restart.
                 SetTimer(hwnd, UPDATE_CHECK_TIMER, 5 * 60 * 1000, None);
+                if let Some(version) = crate::update::take_applied_version(&app.root) {
+                    crate::logger::info("update", format!("applied update to v{version}"));
+                    app.status = format!("Updated to Lumen v{version}!");
+                    app.status_ticks = 0;
+                    if let Some(tray) = &mut app.tray {
+                        tray.notify(
+                            "Lumen Updated",
+                            &format!("Successfully updated to Lumen v{version}."),
+                        );
+                    }
+                    if let Some(host) = app.ensure_general() {
+                        host.announce_applied_update(&version);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
             }
             0
         }
@@ -2254,11 +2270,14 @@ unsafe extern "system" fn wndproc(
             0
         }
         message if message == crate::general::ACTION_MESSAGE => {
-            let actions = app
+            let (actions, updating) = app
                 .general
                 .as_mut()
-                .map(|h| h.take_actions())
+                .map(|h| (h.take_actions(), h.is_updating()))
                 .unwrap_or_default();
+            if updating {
+                SetTimer(hwnd, UPDATE_PROGRESS_TIMER, 50, None);
+            }
             for action in actions {
                 if let Err(error) = app.manage(action) {
                     eprintln!("native-general: {error}");
@@ -2309,16 +2328,21 @@ unsafe extern "system" fn wndproc(
             }
             if action == 11 {
                 KillTimer(hwnd, UPDATE_CHECK_TIMER);
-                let actions = if let Some(host) = app.ensure_general() {
-                    if host.has_update() {
+                app.show_general();
+                let (actions, updating) = if let Some(host) = app.ensure_general() {
+                    let acts = if host.has_update() {
                         host.trigger_update_now()
                     } else {
                         host.start_update_check();
                         Vec::new()
-                    }
+                    };
+                    (acts, host.is_updating())
                 } else {
-                    Vec::new()
+                    (Vec::new(), false)
                 };
+                if updating {
+                    SetTimer(hwnd, UPDATE_PROGRESS_TIMER, 50, None);
+                }
                 for act in actions {
                     if let Err(error) = app.manage(act) {
                         if let Some(host) = &mut app.general {
@@ -2867,6 +2891,30 @@ unsafe extern "system" fn wndproc(
                 if let Some(host) = app.ensure_general() {
                     if !host.has_update() {
                         host.start_update_check();
+                        if host.is_updating() {
+                            SetTimer(hwnd, UPDATE_PROGRESS_TIMER, 50, None);
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_TIMER if wparam == UPDATE_PROGRESS_TIMER => {
+            let (update_actions, has_update, updating) = if let Some(host) = &mut app.general {
+                (host.poll_update(), host.has_update(), host.is_updating())
+            } else {
+                (Vec::new(), false, false)
+            };
+            if !updating {
+                KillTimer(hwnd, UPDATE_PROGRESS_TIMER);
+            }
+            if let Some(tray) = &mut app.tray {
+                tray.set_update_available(has_update);
+            }
+            for action in update_actions {
+                if let Err(error) = app.manage(action) {
+                    if let Some(host) = &mut app.general {
+                        host.report_error(&error);
                     }
                 }
             }
@@ -2874,11 +2922,14 @@ unsafe extern "system" fn wndproc(
         }
         WM_TIMER if wparam == PIN_TIMER => {
             app.sync_desktop_items(hwnd);
-            let (update_actions, has_update) = if let Some(host) = &mut app.general {
-                (host.poll_update(), host.has_update())
+            let (update_actions, has_update, updating) = if let Some(host) = &mut app.general {
+                (host.poll_update(), host.has_update(), host.is_updating())
             } else {
-                (Vec::new(), false)
+                (Vec::new(), false, false)
             };
+            if updating {
+                SetTimer(hwnd, UPDATE_PROGRESS_TIMER, 50, None);
+            }
             if let Some(tray) = &mut app.tray {
                 tray.set_update_available(has_update);
             }
@@ -2971,6 +3022,7 @@ unsafe extern "system" fn wndproc(
             KillTimer(hwnd, PIN_TIMER);
             KillTimer(hwnd, SMOKE_TIMER);
             KillTimer(hwnd, UPDATE_CHECK_TIMER);
+            KillTimer(hwnd, UPDATE_PROGRESS_TIMER);
             for id in [MOTION_TIMER, LAUNCH_TIMER, CARET_TIMER] {
                 KillTimer(hwnd, id);
             }

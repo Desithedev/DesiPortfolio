@@ -1700,10 +1700,24 @@ pub(crate) unsafe fn refresh() {
                                 && gy >= w[1] as f32 + underlap
                                 && gy < w[3] as f32 - underlap
                         });
+                    let in_opaque_window = windows
+                        .iter()
+                        .zip(&opacities)
+                        .any(|(w, &op)| {
+                            op >= 0.999 && lx >= w[0] && lx < w[2] && ly >= w[1] && ly < w[3]
+                        });
+                    let in_deep_opaque_window = in_opaque_window
+                        && windows.iter().zip(&opacities).any(|(w, &op)| {
+                            op >= 0.999
+                                && gx >= w[0] as f32 + underlap
+                                && gx < w[2] as f32 - underlap
+                                && gy >= w[1] as f32 + underlap
+                                && gy < w[3] as f32 - underlap
+                        });
                     let coverage = outline.coverage_with_distance(gx, gy, d);
                     // Keep a 3dp opaque member underlap band gated strictly on d < -1.0
                     // so the outer rounded AA border never double-blends while inner joins never leak.
-                    if (in_window && d >= -1.0 && coverage > 0.) || (in_deep_window && d < -1.0) {
+                    if (in_window && d >= -1.0 && coverage > 0.) || (in_deep_opaque_window && d < -1.0) || (in_deep_window && d < -1.0 && uniform_opacity.is_some()) {
                         if !has_opaque_material {
                             pixels[row + (x as usize * 4)..row + (span_end_x as usize * 4)].fill(0);
                         }
@@ -1714,6 +1728,35 @@ pub(crate) unsafe fn refresh() {
                     // Blend the local members' opacity continuously near the junction.
                     let alpha = if let Some(a) = uniform_opacity {
                         a
+                    } else if coverage > 0. {
+                        let reach = 120. * dpi;
+                        let mut sum_w = 0.0f32;
+                        let mut sum_a = 0.0f32;
+                        for (p, &a) in ps.iter().zip(&opacities) {
+                            let [pl, pt, pr, pb] = p.rect;
+                            let rad = (4.0 * p.dpi).min((pr - pl).min(pb - pt) * 0.5);
+                            let dp = crate::compositor::distance(
+                                gx - pl,
+                                gy - pt,
+                                pr - pl,
+                                pb - pt,
+                                rad,
+                                0.,
+                            )
+                            .max(0.);
+                            if dp < reach {
+                                let t = dp / reach;
+                                let weight = (1. - t) * (1. - t);
+                                sum_w += weight;
+                                sum_a += weight * a;
+                            }
+                        }
+                        let blended = if sum_w > 0. { sum_a / sum_w } else { 0. };
+                        if in_window {
+                            0.
+                        } else {
+                            blended
+                        }
                     } else {
                         let mut sum = 0.;
                         let mut alpha = 0.;
@@ -3911,6 +3954,141 @@ mod tests {
             assert!(
                 max_seam_kink <= 8,
                 "frost seam transition must have no abrupt discontinuity (max_seam_kink={max_seam_kink})"
+            );
+
+            for hwnd in windows {
+                DestroyWindow(hwnd);
+            }
+            shutdown();
+        }
+    }
+
+    #[test]
+    fn mixed_opacity_zero_neighbor_has_smooth_rounded_outer_corners_and_concave_handover() {
+        let _ui = crate::native_ui_test_lock();
+        unsafe {
+            let _cap = crate::compositor::test_capture::start();
+            init(Rc::new(RefCell::new(Glass::new(0., 1.))));
+            let instance = GetModuleHandleW(null());
+            let (ox, oy) = (-15000, -8400);
+            // Dock (255 opacity) below Music (0 opacity), forming a concave L-junction corner
+            // on the left of Music's bottom-left rounded corner.
+            let specs = [
+                ([ox, oy + 374, 848, 391], 255u8),
+                ([ox + 391, oy + 8, 457, 374], 0u8),
+            ];
+            let mut windows = Vec::new();
+            for (rect, op) in &specs {
+                let hwnd = CreateWindowExW(
+                    WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                    wide("STATIC").as_ptr(),
+                    wide("Mixed opacity corner verify").as_ptr(),
+                    WS_POPUP,
+                    rect[0],
+                    rect[1],
+                    rect[2],
+                    rect[3],
+                    null_mut(),
+                    null_mut(),
+                    instance,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                register_widget(hwnd);
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                prepare(hwnd, 34.0);
+                opacity(hwnd, *op);
+                windows.push(hwnd);
+            }
+
+            let paint_all = || {
+                for (&hwnd, (rect, op)) in windows.iter().zip(specs.iter()) {
+                    let [_, _, w, h] = *rect;
+                    let mut frame = Buffer::new(w, h, 1.0, 34.0).unwrap();
+                    let brush = CreateSolidBrush(0x405060);
+                    FillRect(
+                        frame.dc,
+                        &RECT {
+                            left: 0,
+                            top: 0,
+                            right: w,
+                            bottom: h,
+                        },
+                        brush,
+                    );
+                    DeleteObject(brush);
+                    frame.background_alpha_for(hwnd, *op);
+                    frame.bevel_for(hwnd);
+                    assert!(frame.present_with_alpha(hwnd, true));
+                }
+            };
+
+            paint_all();
+            refresh();
+            assert!(windows.iter().all(|&h| fused(h)));
+            paint_all();
+            refresh();
+
+            let bridge_hwnd = MANAGER.with(|m| {
+                let guard = m.borrow();
+                let s = guard.as_ref().unwrap();
+                assert_eq!(s.bridges.len(), 1);
+                s.bridges[0].hwnd
+            });
+            let bridge_cap =
+                crate::compositor::test_capture::get(bridge_hwnd).expect("bridge upload");
+            let dock_cap =
+                crate::compositor::test_capture::get(windows[0]).expect("dock upload");
+            let music_cap =
+                crate::compositor::test_capture::get(windows[1]).expect("music upload");
+
+            // 1. Inside Music's bottom-left rounded corner (local x=4..25, y=345..369):
+            // Bridge must NOT draw a square 3px underlap box under the transparent member!
+            for ly in 340..370 {
+                for lx in 0..30 {
+                    let gx = specs[1].0[0] + lx;
+                    let gy = specs[1].0[1] + ly;
+                    let bx = gx - bridge_cap.rect[0];
+                    let by = gy - bridge_cap.rect[1];
+                    let bi = ((by * bridge_cap.w + bx) * 4) as usize;
+                    assert_eq!(
+                        bridge_cap.bgra[bi + 2],
+                        0,
+                        "bridge must not leak visible foreground underlap inside transparent member corner at local ({lx}, {ly})"
+                    );
+                }
+            }
+
+            // 2. Across the seam between Dock (y=378) and Music (y=378) near Music's left edge (lx=6..45),
+            // Dock's top row and Music's bottom row must agree within <= 4 alpha units (no 87->50 corner notch).
+            for lx in 6..45 {
+                let gx = specs[1].0[0] + lx;
+                let gy_music = specs[1].0[1] + 369; // Music local y = 369 (gy = oy + 377)
+                let gy_dock = specs[0].0[1] + 4;    // Dock local y = 4 (gy = oy + 378)
+                let mx = gx - music_cap.rect[0];
+                let my = gy_music - music_cap.rect[1];
+                let dx = gx - dock_cap.rect[0];
+                let dy = gy_dock - dock_cap.rect[1];
+                let ma = music_cap.bgra[((my * music_cap.w + mx) * 4 + 3) as usize] as i32;
+                let da = dock_cap.bgra[((dy * dock_cap.w + dx) * 4 + 3) as usize] as i32;
+                assert!(
+                    (ma - da).abs() <= 6,
+                    "opacity across seam near rounded corner must match smoothly without corner notch at lx={lx}: music_a={ma}, dock_a={da}"
+                );
+            }
+
+            // 3. Handover from Bridge concave fillet (gx = ox + 390) into Music left edge (gx = ox + 395)
+            // at gy = oy + 365 must have smooth alpha without a sudden jump.
+            let gy = oy + 365;
+            let bx = (ox + 390) - bridge_cap.rect[0];
+            let by = gy - bridge_cap.rect[1];
+            let ba = bridge_cap.bgra[((by * bridge_cap.w + bx) * 4 + 3) as usize] as i32;
+            let mx = (ox + 395) - music_cap.rect[0];
+            let my = gy - music_cap.rect[1];
+            let ma = music_cap.bgra[((my * music_cap.w + mx) * 4 + 3) as usize] as i32;
+            assert!(
+                (ba - ma).abs() <= 16,
+                "concave fillet to member edge alpha handover must be smooth: bridge_a={ba}, music_a={ma}"
             );
 
             for hwnd in windows {

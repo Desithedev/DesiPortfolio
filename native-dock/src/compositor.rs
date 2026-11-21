@@ -1133,7 +1133,9 @@ impl Buffer {
                     let mut sum_w = 0.0f32;
                     let mut sum_a = 0.0f32;
                     for (p, &op) in panes.iter().zip(&opacities) {
-                        let d = p.distance(gx, gy).max(0.);
+                        let [l, t, r_pane, b] = p.rect;
+                        let rad = (4.0 * p.dpi).min((r_pane - l).min(b - t) * 0.5);
+                        let d = distance(gx - l, gy - t, r_pane - l, b - t, rad, 0.).max(0.);
                         if d < reach {
                             let t = d / reach;
                             let weight = (1. - t) * (1. - t);

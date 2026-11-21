@@ -113,6 +113,11 @@ pub fn load_preferences(root: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+#[derive(Clone, Debug)]
+pub enum UpdateMessage {
+    Progress(crate::update::Progress),
+    Done(Result<Option<crate::update::Release>, String>),
+}
 pub struct Host {
     ui: settings_ui::Host,
     root: PathBuf,
@@ -122,9 +127,10 @@ pub struct Host {
     pinned: Vec<String>,
     error: String,
     smoke: bool,
-    update_rx: Option<std::sync::mpsc::Receiver<Result<Option<crate::update::Release>, String>>>,
+    update_rx: Option<std::sync::mpsc::Receiver<UpdateMessage>>,
     update_candidate: Option<crate::update::Release>,
     update_status: String,
+    update_progress: Option<f32>,
     auto_apply_update: bool,
 }
 impl Host {
@@ -155,6 +161,7 @@ impl Host {
             update_rx: None,
             update_candidate: None,
             update_status: String::new(),
+            update_progress: None,
             auto_apply_update: false,
         };
         host.update_rows();
@@ -229,7 +236,7 @@ impl Host {
         if self.update_rx.is_none() {
             rows.push(Row::button(7, "Check for updates"));
             if let Some(release) = &self.update_candidate {
-                if crate::update::portable(&self.root) && !crate::update::pending(&self.root) {
+                if !crate::update::pending(&self.root) {
                     rows.push(Row::accent_button(
                         8,
                         format!("Update Now · v{}", release.version),
@@ -238,12 +245,6 @@ impl Host {
                     rows.push(Row::button(
                         14,
                         format!("Download v{} Package", release.version),
-                    ));
-                } else if !crate::update::portable(&self.root) {
-                    rows.push(Row::accent_button(
-                        14,
-                        format!("Download v{} Package", release.version),
-                        UPDATE_ACCENT,
                     ));
                 }
             }
@@ -256,7 +257,14 @@ impl Host {
             }
             rows.push(Row::button(10, "Open GitHub Releases"));
         }
-        if !self.update_status.is_empty() {
+        if let Some(progress) = self.update_progress {
+            let label = if self.update_status.is_empty() {
+                "Updating Lumen…"
+            } else {
+                self.update_status.as_str()
+            };
+            rows.push(Row::progress(label, progress, UPDATE_ACCENT));
+        } else if !self.update_status.is_empty() {
             if self.update_candidate.is_some()
                 || crate::update::pending(&self.root)
                 || self.update_rx.is_some()
@@ -483,6 +491,14 @@ impl Host {
     pub unsafe fn refresh(&mut self) {
         self.ui.refresh();
     }
+    pub fn is_updating(&self) -> bool {
+        self.update_rx.is_some()
+    }
+    pub fn announce_applied_update(&mut self, version: &str) {
+        self.update_progress = None;
+        self.update_status = format!("Updated to Lumen v{version} successfully!");
+        self.update_rows();
+    }
     pub fn has_update(&self) -> bool {
         self.update_candidate.is_some() || crate::update::pending(&self.root)
     }
@@ -494,10 +510,11 @@ impl Host {
         let root = self.root.clone();
         self.update_rx = Some(rx);
         self.update_candidate = None;
+        self.update_progress = None;
         self.auto_apply_update = false;
         self.update_status = "Checking GitHub…".into();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::update::check(&root));
+            let _ = tx.send(UpdateMessage::Done(crate::update::check(&root)));
         });
         self.update_rows();
     }
@@ -509,70 +526,88 @@ impl Host {
             return vec![Action::RestartUpdate];
         }
         if let Some(candidate) = self.update_candidate.clone() {
-            if crate::update::portable(&self.root) {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let root = self.root.clone();
-                self.update_rx = Some(rx);
-                self.auto_apply_update = true;
-                self.update_status =
-                    format!("Downloading and extracting Lumen {}…", candidate.version);
-                std::thread::spawn(move || {
-                    let _ = tx.send(crate::update::stage(&root, &candidate).map(|_| None));
-                });
-                self.update_rows();
-            } else {
-                unsafe {
-                    crate::update::open_download(&candidate.url);
-                }
-            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            let root = self.root.clone();
+            self.update_rx = Some(rx);
+            self.auto_apply_update = true;
+            self.update_progress = Some(0.01);
+            self.update_status = format!("Downloading Lumen v{}…", candidate.version);
+            std::thread::spawn(move || {
+                let mut last_pct = 0u32;
+                let res = crate::update::stage_with_progress(&root, &candidate, &mut |p| {
+                    let pct = (p.fraction * 100.).round() as u32;
+                    if pct != last_pct || p.fraction >= 1.0 || p.fraction <= 0.03 {
+                        last_pct = pct;
+                        let _ = tx.send(UpdateMessage::Progress(p));
+                    }
+                })
+                .map(|_| None);
+                let _ = tx.send(UpdateMessage::Done(res));
+            });
+            self.update_rows();
         }
         Vec::new()
     }
     pub fn poll_update(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
-        let result = self.update_rx.as_ref().map(|rx| rx.try_recv());
-        match result {
-            Some(Ok(value)) => {
-                self.update_rx = None;
-                match value {
-                    Ok(Some(release)) => {
-                        self.auto_apply_update = false;
-                        self.update_status =
-                            format!("New version Lumen {} is available!", release.version);
-                        self.update_candidate = Some(release);
-                    }
-                    Ok(None) => {
-                        self.update_candidate = None;
-                        if crate::update::pending(&self.root) {
-                            if self.auto_apply_update {
-                                self.auto_apply_update = false;
-                                self.update_status =
-                                    "Update extracted. Restarting Lumen to apply…".into();
-                                actions.push(Action::RestartUpdate);
-                            } else {
-                                self.update_status =
-                                    "Verified update ready. Restart to apply.".into();
-                            }
-                        } else {
+        let mut changed = false;
+        loop {
+            let result = self.update_rx.as_ref().map(|rx| rx.try_recv());
+            match result {
+                Some(Ok(UpdateMessage::Progress(p))) => {
+                    self.update_status = p.label;
+                    self.update_progress = Some(p.fraction);
+                    changed = true;
+                }
+                Some(Ok(UpdateMessage::Done(value))) => {
+                    self.update_rx = None;
+                    self.update_progress = None;
+                    match value {
+                        Ok(Some(release)) => {
                             self.auto_apply_update = false;
                             self.update_status =
-                                "No newer compatible stable release is published.".into();
+                                format!("New version Lumen {} is available!", release.version);
+                            self.update_candidate = Some(release);
+                        }
+                        Ok(None) => {
+                            self.update_candidate = None;
+                            if crate::update::pending(&self.root) {
+                                if self.auto_apply_update {
+                                    self.auto_apply_update = false;
+                                    self.update_status =
+                                        "Update extracted. Restarting Lumen to apply…".into();
+                                    actions.push(Action::RestartUpdate);
+                                } else {
+                                    self.update_status =
+                                        "Verified update ready. Restart to apply.".into();
+                                }
+                            } else {
+                                self.auto_apply_update = false;
+                                self.update_status =
+                                    "No newer compatible stable release is published.".into();
+                            }
+                        }
+                        Err(error) => {
+                            self.auto_apply_update = false;
+                            self.update_status = error;
                         }
                     }
-                    Err(error) => {
-                        self.auto_apply_update = false;
-                        self.update_status = error;
-                    }
+                    changed = true;
+                    break;
                 }
-                self.update_rows();
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.update_rx = None;
+                    self.update_progress = None;
+                    self.auto_apply_update = false;
+                    self.update_status = "Update worker stopped. Try again.".into();
+                    changed = true;
+                    break;
+                }
+                _ => break,
             }
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                self.update_rx = None;
-                self.auto_apply_update = false;
-                self.update_status = "Update worker stopped. Try again.".into();
-                self.update_rows();
-            }
-            _ => {}
+        }
+        if changed {
+            self.update_rows();
         }
         actions
     }
@@ -608,11 +643,26 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             host.update_rx = Some(rx);
             assert!(!has(&host.rows(), 7));
-            tx.send(Ok(Some(crate::update::Release {
+            tx.send(UpdateMessage::Progress(crate::update::Progress {
+                label: "Downloading Lumen v0.2.0 (1.0 / 2.0 MB)…".into(),
+                fraction: 0.5,
+            }))
+            .unwrap();
+            assert!(host.poll_update().is_empty());
+            assert!(host.rows().iter().any(|row| matches!(
+                row,
+                Row::Progress {
+                    label,
+                    fraction,
+                    ..
+                } if label.contains("0.2.0") && (*fraction - 0.5).abs() < 1e-4
+            )));
+            tx.send(UpdateMessage::Done(Ok(Some(crate::update::Release {
                 version: "0.2.0".into(),
                 url: String::new(),
                 digest: String::new(),
-            })))
+                size: 0,
+            }))))
             .unwrap();
             assert!(host.poll_update().is_empty());
             assert!(host.update_status.contains("0.2.0"));
@@ -621,20 +671,14 @@ mod tests {
                 .iter()
                 .any(|row| matches!(row, Row::HighlightNote { text, .. } if text.contains("0.2.0"))));
             assert!(has(&host.rows(), 7));
-            assert!(
-                !has(&host.rows(), 8),
-                "source builds must not install portable updates over source"
-            );
-            assert!(
-                has(&host.rows(), 14),
-                "source builds should offer a direct Download Package button"
-            );
+            assert!(has(&host.rows(), 8));
+            assert!(has(&host.rows(), 14));
             std::fs::write(root.join("lumen-portable.json"), "{}").unwrap();
             assert!(has(&host.rows(), 8));
             assert!(has(&host.rows(), 14));
             let (tx, rx) = std::sync::mpsc::channel();
             host.update_rx = Some(rx);
-            tx.send(Err("offline".into())).unwrap();
+            tx.send(UpdateMessage::Done(Err("offline".into()))).unwrap();
             assert!(host.poll_update().is_empty());
             assert_eq!(host.update_status, "offline");
             assert!(has(&host.rows(), 7));
