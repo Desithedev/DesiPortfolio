@@ -951,12 +951,13 @@ impl Glass {
         natural_w: f32,
         tile: bool,
     ) -> (Vec<u8>, i32, i32) {
-        // Non-tiled small thumbnails (e.g. 224x224 Wallpaper Engine previews) are stretched
-        // across the desktop, so scale sigma relative to at least 1920px to avoid over-blurring.
-        let ref_w = if tile {
-            natural_w.max(1.0)
-        } else {
+        // Only scale against a 1920px desktop reference when a tiny thumbnail was upscaled
+        // in `decode_small`, keeping unit-test fixtures and normal wallpapers exact.
+        let upscaled_preview = (small.width() as f32) > natural_w * 1.5;
+        let ref_w = if !tile && upscaled_preview {
             natural_w.max(1920.0)
+        } else {
+            natural_w.max(1.0)
         };
         let sigma = (blur * dpi * small.width() as f32 / ref_w).clamp(0.0, 100.0);
         let mut blurred = if sigma <= 0.05 {
