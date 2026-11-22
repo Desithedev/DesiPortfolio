@@ -2,7 +2,7 @@ Lumen 0.1.9 adds Google Calendar & Tasks OAuth 2.0 integration, Wallpaper Engine
 
 - **Google Calendar & Tasks (OAuth 2.0 + iCal)**: Sign in directly with Google (PKCE loopback) or paste an iCal `.ics` URL. Hover or click any day to view events and tasks, click tasks to mark complete, quick-add tasks or timed events (`+ Add`), scroll long days, toggle individual calendars, and see an upcoming-event reminder pill.
 - **Wallpaper Engine & Blur Polish**: Added `scene.pkg` / `project.json` / `.gif` preview support, registry fallback for elevated Wallpaper Engine, synchronized global blur across all widgets, and raised max blur to `160 px`.
-- **Portable Updates (`Desithedev/DesiPortfolio`)**: In-app update checks and portable ZIP staging now pull from `Desithedev/DesiPortfolio` GitHub Releases.
+- **Portable Updates (`Desithedev/WidgetLumi`)**: In-app update checks and portable ZIP staging now pull from `Desithedev/WidgetLumi` GitHub Releases.
 
 - **Smooth Fused Rounded Corners at `0%` Opacity**: Eliminated faint rectangular corner underlap artifacts when a transparent (`opacity = 0%`) widget fuses with an opaque neighbor, and unified seam-distance weighting across CPU and Direct3D 11 / DirectComposition shaders for smooth corner handovers.
 - **In-App Update Progress & Notifications**: Added a live progress bar in General Settings during update download/staging, direct Update Now staging, and tray/status confirmation after applying an update.
