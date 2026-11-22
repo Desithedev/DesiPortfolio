@@ -27,12 +27,21 @@ struct State {
     brush: HBRUSH,
 }
 pub unsafe fn choose(owner: HWND, title: &str, initial: &str) -> Option<String> {
-    choose_impl(owner, title, initial, None)
+    choose_impl(owner, title, initial, 80, None)
+}
+pub unsafe fn choose_long(
+    owner: HWND,
+    title: &str,
+    initial: &str,
+    max_chars: usize,
+) -> Option<String> {
+    choose_impl(owner, title, initial, max_chars.max(80), None)
 }
 unsafe fn choose_impl(
     owner: HWND,
     title: &str,
     initial: &str,
+    max_chars: usize,
     test_action: Option<bool>,
 ) -> Option<String> {
     let class = wide("LumenNativeTextPrompt");
@@ -130,7 +139,7 @@ unsafe fn choose_impl(
         null(),
     );
     SendMessageW(state.edit, WM_SETFONT, state.font as usize, 1);
-    SendMessageW(state.edit, EM_LIMITTEXT, 80, 0);
+    SendMessageW(state.edit, EM_LIMITTEXT, max_chars, 0);
     SendMessageW(state.edit, EM_SETSEL, 0, -1);
     let enabled = IsWindowEnabled(owner) != 0;
     EnableWindow(owner, 0);
@@ -183,8 +192,9 @@ unsafe fn choose_impl(
     state.result.take()
 }
 unsafe fn commit(s: &mut State) {
-    let mut text = [0u16; 256];
-    let n = GetWindowTextW(s.edit, text.as_mut_ptr(), 256).max(0) as usize;
+    let len = GetWindowTextLengthW(s.edit).max(0) as usize;
+    let mut text = vec![0u16; len + 1];
+    let n = GetWindowTextW(s.edit, text.as_mut_ptr(), text.len() as i32).max(0) as usize;
     let value = String::from_utf16_lossy(&text[..n]).trim().to_string();
     if !value.is_empty() {
         s.result = Some(value);
@@ -305,13 +315,23 @@ mod tests {
             );
             assert!(!owner.is_null());
             assert_eq!(
-                choose_impl(owner, "Rename control", "Volume", Some(false)),
+                choose_impl(owner, "Rename control", "Volume", 80, Some(false)),
                 None
             );
             assert!(IsWindowEnabled(owner) != 0);
             assert_eq!(
-                choose_impl(owner, "Rename control", "Volume", Some(true)),
+                choose_impl(owner, "Rename control", "Volume", 80, Some(true)),
                 Some("Volume".into())
+            );
+            let long_url = format!(
+                "https://calendar.google.com/calendar/ical/{}/private-{}/basic.ics",
+                "user.name.example%40gmail.com",
+                "0123456789abcdef0123456789abcdef0123456789abcdef"
+            );
+            assert!(long_url.len() > 120);
+            assert_eq!(
+                choose_impl(owner, "Google Calendar iCal URL", &long_url, 2048, Some(true)),
+                Some(long_url)
             );
             assert!(IsWindowEnabled(owner) != 0);
             DestroyWindow(owner);

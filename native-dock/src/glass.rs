@@ -31,6 +31,13 @@ fn vertical_offset(viewport: f32, drawn: f32, style: u32, tile: bool) -> f32 {
 }
 
 fn decode_wallpaper(path: &Path) -> Option<DynamicImage> {
+    if let Some(img) = decode_wallpaper_image_crate(path) {
+        return Some(img);
+    }
+    decode_wallpaper_gdiplus(path)
+}
+
+fn decode_wallpaper_image_crate(path: &Path) -> Option<DynamicImage> {
     let mut reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(256 * 1024 * 1024);
@@ -42,6 +49,125 @@ fn decode_wallpaper(path: &Path) -> Option<DynamicImage> {
     let mut source = DynamicImage::from_decoder(decoder).ok()?;
     source.apply_orientation(orientation);
     Some(source)
+}
+
+/// Decodes formats not enabled in the `image` crate (e.g. GIF/WebP previews) via Windows GDI+.
+fn decode_wallpaper_gdiplus(path: &Path) -> Option<DynamicImage> {
+    #[repr(C)]
+    struct Startup {
+        version: u32,
+        callback: usize,
+        no_thread: i32,
+        no_codecs: i32,
+    }
+    #[repr(C)]
+    struct GpRect {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    }
+    #[repr(C)]
+    struct BitmapData {
+        width: u32,
+        height: u32,
+        stride: i32,
+        pixel_format: i32,
+        scan0: *mut u8,
+        reserved: usize,
+    }
+    #[link(name = "gdiplus")]
+    extern "system" {
+        fn GdiplusStartup(token: *mut usize, input: *const Startup, output: *mut u8) -> i32;
+        fn GdiplusShutdown(token: usize);
+        fn GdipCreateBitmapFromFile(filename: *const u16, bitmap: *mut *mut u8) -> i32;
+        fn GdipDisposeImage(image: *mut u8) -> i32;
+        fn GdipGetImageWidth(image: *mut u8, width: *mut u32) -> i32;
+        fn GdipGetImageHeight(image: *mut u8, height: *mut u32) -> i32;
+        fn GdipBitmapLockBits(
+            bitmap: *mut u8,
+            rect: *const GpRect,
+            flags: u32,
+            format: i32,
+            locked: *mut BitmapData,
+        ) -> i32;
+        fn GdipBitmapUnlockBits(bitmap: *mut u8, locked: *mut BitmapData) -> i32;
+    }
+    const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x26200A;
+    const IMAGE_LOCK_MODE_READ: u32 = 1;
+
+    unsafe {
+        let mut token = 0usize;
+        let input = Startup {
+            version: 1,
+            callback: 0,
+            no_thread: 0,
+            no_codecs: 0,
+        };
+        if GdiplusStartup(&mut token, &input, null_mut()) != 0 {
+            return None;
+        }
+        let result = (|| {
+            let mut bitmap: *mut u8 = null_mut();
+            let wpath = wide(path);
+            if GdipCreateBitmapFromFile(wpath.as_ptr(), &mut bitmap) != 0 || bitmap.is_null() {
+                return None;
+            }
+            let mut w = 0u32;
+            let mut h = 0u32;
+            let ok_dim = GdipGetImageWidth(bitmap, &mut w) == 0
+                && GdipGetImageHeight(bitmap, &mut h) == 0
+                && w > 0
+                && h > 0
+                && (w as u64) * (h as u64) <= 64_000_000;
+            if !ok_dim {
+                GdipDisposeImage(bitmap);
+                return None;
+            }
+            let rect = GpRect {
+                x: 0,
+                y: 0,
+                w: w as i32,
+                h: h as i32,
+            };
+            let mut data: BitmapData = zeroed();
+            if GdipBitmapLockBits(
+                bitmap,
+                &rect,
+                IMAGE_LOCK_MODE_READ,
+                PIXEL_FORMAT_32BPP_ARGB,
+                &mut data,
+            ) != 0
+                || data.scan0.is_null()
+            {
+                GdipDisposeImage(bitmap);
+                return None;
+            }
+            let row_bytes = w as usize * 4;
+            let mut rgba = vec![0u8; row_bytes * h as usize];
+            let src_stride = data.stride;
+            for y in 0..h as usize {
+                let src_ptr = if src_stride >= 0 {
+                    data.scan0.add(y * src_stride as usize)
+                } else {
+                    data.scan0.offset((y as isize) * (src_stride as isize))
+                };
+                let src_row = std::slice::from_raw_parts(src_ptr, row_bytes);
+                let dst_row = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+                for (dst, src) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+                    dst[0] = src[2];
+                    dst[1] = src[1];
+                    dst[2] = src[0];
+                    dst[3] = src[3];
+                }
+            }
+            GdipBitmapUnlockBits(bitmap, &mut data);
+            GdipDisposeImage(bitmap);
+            image::RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)
+        })();
+        GdiplusShutdown(token);
+        result
+    }
 }
 
 struct OwnedBitmap(HBITMAP);
@@ -172,6 +298,7 @@ pub(crate) fn trim_working_set() {
 static LIQUID_GLASS: AtomicBool = AtomicBool::new(false);
 static FROSTED_GLASS: AtomicBool = AtomicBool::new(true);
 static GLOBAL_BLUR_TENTHS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(130);
+static GLOBAL_BLUR_SET: AtomicBool = AtomicBool::new(false);
 static LIQUID_GLASS_REVISION: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_liquid_glass(enabled: bool) {
@@ -191,7 +318,8 @@ pub fn frosted_glass() -> bool {
     FROSTED_GLASS.load(Ordering::Relaxed)
 }
 pub fn set_global_blur(blur: f32) {
-    let tenths = (blur.clamp(0.0, 80.0) * 10.0).round() as i32;
+    GLOBAL_BLUR_SET.store(true, Ordering::Relaxed);
+    let tenths = (blur.clamp(0.0, 160.0) * 10.0).round() as i32;
     if GLOBAL_BLUR_TENTHS.swap(tenths, Ordering::Relaxed) != tenths {
         LIQUID_GLASS_REVISION.fetch_add(1, Ordering::Relaxed);
     }
@@ -488,7 +616,7 @@ impl Glass {
         self.dpi = dpi;
         if let Some(source) = &self.source {
             if let Some((bitmap, bw, bh)) =
-                Self::get_or_build_blurred(&self.path, self.modified, source, blur, dpi)
+                Self::get_or_build_blurred(&self.path, self.modified, source, blur, dpi, self.tile)
             {
                 self.bitmap = Some(bitmap);
                 self.blur_width = bw;
@@ -554,6 +682,12 @@ impl Glass {
             Some((cw, ch)) if decoded.width() > cw || decoded.height() > ch => {
                 decoded.thumbnail(cw, ch).to_rgba8()
             }
+            Some(_) if decoded.width() > 0 && decoded.height() > 0 && decoded.width() < 960 && decoded.height() < 960 => {
+                let scale = (1024.0 / decoded.width().max(decoded.height()) as f32).max(1.0);
+                let nw = (decoded.width() as f32 * scale).round() as u32;
+                let nh = (decoded.height() as f32 * scale).round() as u32;
+                decoded.resize_exact(nw, nh, imageops::FilterType::Triangle).to_rgba8()
+            }
             _ => decoded.to_rgba8(),
         };
         Some((small, natural))
@@ -561,6 +695,12 @@ impl Glass {
     /// Non-blocking startup refresh: decodes and blurs the wallpaper on a background
     /// thread and posts `message` to `notify` when ready.
     pub unsafe fn refresh_async(&mut self, notify: HWND, message: u32) -> bool {
+        if GLOBAL_BLUR_SET.load(Ordering::Relaxed) {
+            let gb = global_blur();
+            if (self.blur - gb).abs() >= 0.01 {
+                self.set_blur(gb, self.dpi);
+            }
+        }
         let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
             return false;
         };
@@ -599,7 +739,7 @@ impl Glass {
                 let palette = imageops::thumbnail(&small, 128, 128);
                 let accent = crate::accent::dominant(palette.as_raw());
                 let (blurred_bytes, blur_w, blur_h) =
-                    Self::prepare_blurred_bytes(&small, blur, dpi, natural[0]);
+                    Self::prepare_blurred_bytes(&small, blur, dpi, natural[0], tile);
                 Some(PendingWallpaper {
                     path,
                     modified,
@@ -679,6 +819,7 @@ impl Glass {
             &source,
             self.blur,
             self.dpi,
+            pending.tile,
         ) {
             built
         } else {
@@ -712,8 +853,16 @@ impl Glass {
     /// Windows writes into our owned UTF-16 buffer. We only read the returned
     /// wallpaper file and two desktop appearance values; no registry writes.
     pub unsafe fn refresh(&mut self) -> bool {
+        let mut blur_changed = false;
+        if GLOBAL_BLUR_SET.load(Ordering::Relaxed) {
+            let gb = global_blur();
+            if (self.blur - gb).abs() >= 0.01 {
+                self.set_blur(gb, self.dpi);
+                blur_changed = true;
+            }
+        }
         let Some((path, modified, style, tile)) = Self::query_wallpaper() else {
-            return false;
+            return blur_changed;
         };
         if self.bitmap.is_some()
             && path == self.path
@@ -722,7 +871,7 @@ impl Glass {
             && tile == self.tile
             && self.low_power == crate::motion::low_power()
         {
-            return false;
+            return blur_changed;
         }
         let key: SourceKey = (path.clone(), modified);
         if LOADING_KEY
@@ -766,6 +915,7 @@ impl Glass {
         source: &WallpaperSource,
         blur: f32,
         dpi: f32,
+        tile: bool,
     ) -> Option<(Rc<OwnedBitmap>, i32, i32)> {
         let key: BlurKey = (
             path.to_path_buf(),
@@ -777,12 +927,12 @@ impl Glass {
             return Some(hit);
         }
         let (bitmap, bw, bh) = if let Some(small) = source.small.borrow().as_ref() {
-            Self::build_blurred(small, blur, dpi, source.natural[0])?
+            Self::build_blurred(small, blur, dpi, source.natural[0], tile)?
         } else if blur > 0.05 || source.has_full_preview() {
-            Self::build_blurred(&source.preview, blur, dpi, source.natural[0])?
+            Self::build_blurred(&source.preview, blur, dpi, source.natural[0], tile)?
         } else {
             let (decoded, _) = Self::decode_small(&source.path, Self::wallpaper_cap())?;
-            Self::build_blurred(&decoded, blur, dpi, source.natural[0])?
+            Self::build_blurred(&decoded, blur, dpi, source.natural[0], tile)?
         };
         let owned = Rc::new(OwnedBitmap(bitmap));
         BLURRED_CACHE.with(|cache| {
@@ -799,8 +949,16 @@ impl Glass {
         blur: f32,
         dpi: f32,
         natural_w: f32,
+        tile: bool,
     ) -> (Vec<u8>, i32, i32) {
-        let sigma = (blur * dpi * small.width() as f32 / natural_w.max(1.0)).clamp(0.0, 40.0);
+        // Non-tiled small thumbnails (e.g. 224x224 Wallpaper Engine previews) are stretched
+        // across the desktop, so scale sigma relative to at least 1920px to avoid over-blurring.
+        let ref_w = if tile {
+            natural_w.max(1.0)
+        } else {
+            natural_w.max(1920.0)
+        };
+        let sigma = (blur * dpi * small.width() as f32 / ref_w).clamp(0.0, 100.0);
         let mut blurred = if sigma <= 0.05 {
             small.clone()
         } else if sigma < 3.5 {
@@ -830,8 +988,9 @@ impl Glass {
         blur: f32,
         dpi: f32,
         natural_w: f32,
+        tile: bool,
     ) -> Option<(HBITMAP, i32, i32)> {
-        let (bytes, w, h) = Self::prepare_blurred_bytes(small, blur, dpi, natural_w);
+        let (bytes, w, h) = Self::prepare_blurred_bytes(small, blur, dpi, natural_w, tile);
         let bitmap = dib(w, h, &bytes)?;
         Some((bitmap, w, h))
     }
@@ -871,8 +1030,14 @@ impl Glass {
             });
             source
         };
-        let (bitmap, blur_w, blur_h) =
-            Self::get_or_build_blurred(&self.path, self.modified, &source, self.blur, self.dpi)?;
+        let (bitmap, blur_w, blur_h) = Self::get_or_build_blurred(
+            &self.path,
+            self.modified,
+            &source,
+            self.blur,
+            self.dpi,
+            self.tile,
+        )?;
         source.release_large();
         Some((bitmap, blur_w, blur_h, source))
     }
@@ -2502,7 +2667,7 @@ fn is_supported_image(path: &Path) -> bool {
         .is_some_and(|e| {
             matches!(
                 e.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "bmp"
+                "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp"
             )
         })
         && path.is_file()
@@ -2592,6 +2757,22 @@ unsafe fn process_image_path(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
 }
 
+fn find_preview_in_dir(dir: &Path) -> Option<PathBuf> {
+    for fallback in [
+        "preview.jpg",
+        "preview.png",
+        "preview.bmp",
+        "preview.gif",
+        "preview.webp",
+    ] {
+        let full = dir.join(fallback);
+        if full.is_file() {
+            return Some(full);
+        }
+    }
+    None
+}
+
 fn resolve_project_json_image(project_path: &Path) -> Option<PathBuf> {
     let dir = project_path.parent()?;
     let raw = std::fs::read_to_string(project_path).ok()?;
@@ -2609,13 +2790,7 @@ fn resolve_project_json_image(project_path: &Path) -> Option<PathBuf> {
             }
         }
     }
-    for fallback in ["preview.jpg", "preview.png", "preview.bmp"] {
-        let full = dir.join(fallback);
-        if full.is_file() {
-            return Some(full);
-        }
-    }
-    None
+    find_preview_in_dir(dir)
 }
 
 fn resolve_wallpaper_engine_image(exe_dir: &Path) -> Option<PathBuf> {
@@ -2651,9 +2826,36 @@ fn resolve_wallpaper_engine_image(exe_dir: &Path) -> Option<PathBuf> {
             if let Some(img) = resolve_project_json_image(&file_path) {
                 return Some(img);
             }
+        } else if let Some(dir) = file_path.parent() {
+            // Scene packages (scene.pkg), videos, or web wallpapers store preview metadata in sibling project.json.
+            if let Some(img) = resolve_project_json_image(&dir.join("project.json"))
+                .or_else(|| find_preview_in_dir(dir))
+            {
+                return Some(img);
+            }
         }
     }
     None
+}
+
+unsafe fn wallpaper_engine_registry_dir() -> Option<PathBuf> {
+    let mut buffer = [0u16; 1024];
+    let mut bytes = (buffer.len() * 2) as u32;
+    if RegGetValueW(
+        HKEY_CURRENT_USER,
+        wide("Software\\WallpaperEngine").as_ptr(),
+        wide("installPath").as_ptr(),
+        RRF_RT_REG_SZ,
+        null_mut(),
+        buffer.as_mut_ptr() as _,
+        &mut bytes,
+    ) != 0
+    {
+        return None;
+    }
+    let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..len]));
+    path.parent().map(Path::to_path_buf)
 }
 
 fn resolve_lively_image() -> Option<PathBuf> {
@@ -2698,26 +2900,25 @@ unsafe fn resolve_live_wallpaper_file() -> Option<PathBuf> {
     }
     let resolved = (|| {
         let pid = find_live_wallpaper_pid()?;
-        let exe_path = process_image_path(pid)?;
-        let exe_name = exe_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        if exe_name.contains("wallpaper32") || exe_name.contains("wallpaper64") {
+        if let Some(exe_path) = process_image_path(pid) {
+            let exe_name = exe_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_default();
+            if exe_name.contains("lively") || exe_name.contains("cefsharp") {
+                if let Some(img) = resolve_lively_image() {
+                    return Some(img);
+                }
+            }
             if let Some(dir) = exe_path.parent() {
                 if let Some(img) = resolve_wallpaper_engine_image(dir) {
                     return Some(img);
                 }
             }
         }
-        if exe_name.contains("lively") || exe_name.contains("cefsharp") {
-            if let Some(img) = resolve_lively_image() {
-                return Some(img);
-            }
-        }
-        if let Some(dir) = exe_path.parent() {
-            if let Some(img) = resolve_wallpaper_engine_image(dir) {
+        if let Some(dir) = wallpaper_engine_registry_dir() {
+            if let Some(img) = resolve_wallpaper_engine_image(&dir) {
                 return Some(img);
             }
         }
@@ -3621,5 +3822,53 @@ mod tests {
                 "liquid glass rim must remain active while resizing outside low-power mode (rim_diff={rim_diff})"
             );
         }
+    }
+
+    #[test]
+    fn wallpaper_engine_scene_pkg_resolves_and_decodes_gif_preview() {
+        let root = std::env::temp_dir().join(format!(
+            "lumen-we-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let item_dir = root.join("workshop").join("1139304621");
+        std::fs::create_dir_all(&item_dir).unwrap();
+        let pkg_path = item_dir.join("scene.pkg");
+        std::fs::write(&pkg_path, b"pkg").unwrap();
+        let gif_path = item_dir.join("preview.gif");
+        // Minimal 1x1 red GIF89a.
+        let gif_bytes: &[u8] = &[
+            0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xFF,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
+            0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3B,
+        ];
+        std::fs::write(&gif_path, gif_bytes).unwrap();
+        std::fs::write(
+            item_dir.join("project.json"),
+            r#"{"file":"scene.json","preview":"preview.gif"}"#,
+        )
+        .unwrap();
+        let cfg = serde_json::json!({
+            "User": {
+                "general": {
+                    "wallpaperconfig": {
+                        "selectedwallpapers": {
+                            "Monitor0": {
+                                "file": pkg_path.to_string_lossy()
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(root.join("config.json"), cfg.to_string()).unwrap();
+
+        let resolved = resolve_wallpaper_engine_image(&root).expect("must resolve preview.gif");
+        assert_eq!(resolved, gif_path);
+        let decoded = decode_wallpaper(&resolved).expect("must decode GIF preview via GDI+");
+        assert_eq!((decoded.width(), decoded.height()), (1, 1));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

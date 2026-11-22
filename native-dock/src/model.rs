@@ -253,7 +253,7 @@ impl Dock {
             return Err("Unsupported native dock config version; file left untouched.".into());
         }
         dock.columns = dock.columns.clamp(3, 12);
-        dock.blur = dock.blur.clamp(0.0, 80.0);
+        dock.blur = dock.blur.clamp(0.0, 160.0);
         dock.tint = dock.tint.clamp(0.0, 100.0);
         dock.frost_strength = dock.frost_strength.clamp(0.0, 100.0);
         dock.opacity = dock.opacity.clamp(0.0, 100.0);

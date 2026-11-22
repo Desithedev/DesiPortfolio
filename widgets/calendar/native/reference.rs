@@ -419,6 +419,19 @@ impl State {
                 self.artwork
                     .border(dc, self.dpi, box_rect, radius, accent, 0.7, 1.);
             }
+            if self.gcal.has_events(*date) {
+                let x = (box_rect[0] + box_rect[2]) * 0.5;
+                let dot_color = if current { 0xffffff } else { accent };
+                let alpha = if outside && !weekly { 110 } else { 235 };
+                c.round(
+                    [x - 1.5, box_rect[3] - 5.5, x + 1.5, box_rect[3] - 2.5],
+                    1.5,
+                    dot_color,
+                    alpha,
+                    false,
+                    false,
+                );
+            }
             if current && self.keyboard_day {
                 self.artwork.border(
                     dc,

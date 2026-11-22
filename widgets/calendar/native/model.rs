@@ -21,7 +21,7 @@ pub const MONTHS: [&str; 12] = [
     "December",
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Date {
     pub year: i32,
     pub month: i32,
@@ -110,6 +110,12 @@ pub struct Config {
     pub mist_weekly: bool,
     pub position: Option<[i32; 2]>,
     pub size: [i32; 2],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_calendar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_oauth_client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google_oauth_client_secret: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -129,6 +135,9 @@ impl Default for Config {
             mist_weekly: true,
             position: None,
             size: [345, 446],
+            google_calendar_url: None,
+            google_oauth_client_id: None,
+            google_oauth_client_secret: None,
         }
     }
 }

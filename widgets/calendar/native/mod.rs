@@ -1,7 +1,10 @@
 //! Calendar shares the dock's UI thread, wallpaper source and native compositor.
 mod artwork;
+mod gcal;
+mod gcal_oauth;
 mod layout;
 mod model;
+mod popover;
 mod reference;
 mod typography;
 mod view;
@@ -48,6 +51,11 @@ enum Action {
 const APPLY_MODE: u32 = WM_APP + 82;
 const SETTINGS_CHANGED: u32 = WM_APP + 84;
 const WALLPAPER_READY: u32 = WM_APP + 85;
+const GCAL_SYNCED: u32 = WM_APP + 86;
+const PROMPT_GCAL_URL: u32 = WM_APP + 87;
+const GCAL_OAUTH_DONE: u32 = WM_APP + 88;
+const PROMPT_OAUTH_CREDS: u32 = WM_APP + 89;
+const START_OAUTH_SIGNIN: u32 = WM_APP + 90;
 struct Button {
     rect: [f32; 4],
     action: Action,
@@ -87,6 +95,9 @@ struct State {
     frame_queued: bool,
     drag: Option<Drag>,
     ink: Option<u32>,
+    gcal: gcal::GcalStore,
+    popover: popover::EventPopover,
+    pinned_event_day: Option<Date>,
 }
 pub struct Host {
     state: Box<RefCell<State>>,
@@ -149,6 +160,9 @@ impl Host {
             frame_queued: false,
             drag: None,
             ink: None,
+            gcal: gcal::GcalStore::default(),
+            popover: popover::EventPopover::default(),
+            pinned_event_day: None,
         }));
         let c = &state.borrow().config.clone();
         let mut work: RECT = zeroed();
@@ -206,6 +220,11 @@ impl Host {
             s.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
             if !smoke {
                 s.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
+                if s.config.google_calendar_url.is_some() {
+                    let root = s.root.clone();
+                    s.gcal.load_cache(&root);
+                    s.start_gcal_sync();
+                }
             }
         }
         Ok(Self { state })
@@ -361,8 +380,78 @@ impl State {
                     Choice::new("sunday", "Sunday", None),
                 ],
             ),
+            Row::section("Google Calendar"),
+            if let Some(err) = &self.gcal.last_error {
+                Row::HighlightNote {
+                    text: format!("Sync error: {err}"),
+                    color: color(235, 92, 92),
+                }
+            } else if self.gcal.oauth_signing_in {
+                Row::note("Waiting for Google sign-in in browser...")
+            } else if self.gcal.syncing {
+                Row::note("Syncing Google Calendar events...")
+            } else if self.gcal_oauth_connected() {
+                Row::note(format!(
+                    "Signed in with Google · {} event{} loaded",
+                    self.gcal.total_events(),
+                    if self.gcal.total_events() == 1 { "" } else { "s" }
+                ))
+            } else if c.google_calendar_url.is_some() {
+                Row::note(format!(
+                    "Connected (iCal) · {} event{} loaded",
+                    self.gcal.total_events(),
+                    if self.gcal.total_events() == 1 { "" } else { "s" }
+                ))
+            } else {
+                Row::note("Sign in with Google (OAuth 2.0) or paste an iCal (.ics) URL.")
+            },
+            Row::button(
+                14,
+                if self.gcal.oauth_signing_in {
+                    "Cancel sign-in (waiting for browser...)"
+                } else if self.gcal_oauth_connected() {
+                    "Re-authenticate Google"
+                } else {
+                    "Sign in with Google (OAuth 2.0)"
+                },
+            ),
+            Row::button(
+                15,
+                if c.google_oauth_client_id.is_some() {
+                    "Change OAuth Client ID"
+                } else {
+                    "Set OAuth Client ID"
+                },
+            ),
+            Row::button(
+                10,
+                if c.google_calendar_url.is_some() {
+                    "Change iCal URL"
+                } else {
+                    "Use iCal URL (.ics)"
+                },
+            ),
+            Row::button(16, "Google Cloud Console (get Client ID)"),
+            Row::button(12, "Open Google Calendar settings"),
             Row::section("Window"),
         ];
+        if self.gcal_configured() {
+            let mut with_gcal = rows;
+            let insert_at = with_gcal.len() - 2;
+            with_gcal.insert(insert_at, Row::button(13, "Disconnect"));
+            with_gcal.insert(
+                insert_at,
+                Row::button(
+                    11,
+                    if self.gcal.syncing {
+                        "Syncing..."
+                    } else {
+                        "Sync now"
+                    },
+                ),
+            );
+            return with_gcal;
+        }
         rows
     }
     unsafe fn open_settings(&mut self) {
@@ -436,6 +525,53 @@ impl State {
                     PostMessageW(self.hwnd, APPLY_MODE, 0, 0);
                     structural = true;
                 }
+                (10, Value::Action) => {
+                    PostMessageW(self.hwnd, PROMPT_GCAL_URL, 0, 0);
+                }
+                (11, Value::Action) => {
+                    self.start_gcal_sync();
+                    structural = true;
+                }
+                (12, Value::Action) => {
+                    windows_sys::Win32::UI::Shell::ShellExecuteW(
+                        self.hwnd,
+                        wide("open").as_ptr(),
+                        wide("https://calendar.google.com/calendar/u/0/r/settings").as_ptr(),
+                        null(),
+                        null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
+                (13, Value::Action) => {
+                    self.config.google_calendar_url = None;
+                    self.gcal.clear(&self.root);
+                    self.pinned_event_day = None;
+                    self.popover.hide();
+                    structural = true;
+                }
+                (14, Value::Action) => {
+                    if self.gcal.oauth_signing_in {
+                        self.gcal.cancel_oauth_login();
+                        structural = true;
+                    } else if self.config.google_oauth_client_id.is_some() {
+                        PostMessageW(self.hwnd, START_OAUTH_SIGNIN, 0, 0);
+                    } else {
+                        PostMessageW(self.hwnd, PROMPT_OAUTH_CREDS, 1, 0);
+                    }
+                }
+                (15, Value::Action) => {
+                    PostMessageW(self.hwnd, PROMPT_OAUTH_CREDS, 0, 0);
+                }
+                (16, Value::Action) => {
+                    windows_sys::Win32::UI::Shell::ShellExecuteW(
+                        self.hwnd,
+                        wide("open").as_ptr(),
+                        wide("https://console.cloud.google.com/apis/credentials").as_ptr(),
+                        null(),
+                        null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
                 _ => {}
             }
         }
@@ -449,7 +585,132 @@ impl State {
             }
             host.set_surface(surface, crate::contrast::luminance(surface) > 0.42);
         }
+        self.sync_popover();
         InvalidateRect(self.hwnd, null(), 0);
+    }
+    fn gcal_oauth_connected(&self) -> bool {
+        self.config.google_oauth_client_id.is_some() && gcal_oauth::has_tokens(&self.root)
+    }
+    fn gcal_configured(&self) -> bool {
+        self.gcal_oauth_connected() || self.config.google_calendar_url.is_some()
+    }
+    fn expected_sync_source(&self) -> Option<String> {
+        if self.gcal_oauth_connected() {
+            Some("oauth://google".into())
+        } else {
+            self.config.google_calendar_url.clone()
+        }
+    }
+    fn start_gcal_sync(&mut self) {
+        if let Some(cid) = self
+            .config
+            .google_oauth_client_id
+            .clone()
+            .filter(|_| gcal_oauth::has_tokens(&self.root))
+        {
+            self.gcal.start_oauth_sync(
+                &cid,
+                self.config.google_oauth_client_secret.as_deref(),
+                self.hwnd,
+                GCAL_SYNCED,
+                &self.root,
+            );
+        } else if let Some(url) = self.config.google_calendar_url.clone() {
+            self.gcal.start_sync(&url, self.hwnd, GCAL_SYNCED, &self.root);
+        }
+    }
+    unsafe fn day_rect_for_action(&self, action: Action) -> Option<(Date, [f32; 4])> {
+        let [w, h] = self.size();
+        let l = layout::Layout::new(&self.config.theme, w, h);
+        let monday = self.config.week_starts_on == 1;
+        match action {
+            Action::Day(i) => Some((self.cursor.matrix(monday)[i], l.day(i))),
+            Action::WeekDay(i) if self.config.theme == "mist" && !layout::tiny(w, h) => {
+                let r = layout::ReferenceLayout::new(&self.config.theme, w, h);
+                Some((self.selected.week(monday)[i], r.week_day(i)))
+            }
+            _ => None,
+        }
+    }
+    unsafe fn sync_popover(&mut self) {
+        if self.smoke || IsWindowVisible(self.hwnd) == 0 {
+            self.popover.hide();
+            return;
+        }
+        let target: Option<(Date, [f32; 4])> = match self.hover {
+            Some(a @ (Action::Day(_) | Action::WeekDay(_))) => {
+                self.day_rect_for_action(a)
+            }
+            _ => self.pinned_event_day.and_then(|pinned| {
+                let [w, h] = self.size();
+                let monday = self.config.week_starts_on == 1;
+                if self.config.theme == "mist" && self.config.mist_weekly && !layout::tiny(w, h) {
+                    let r = layout::ReferenceLayout::new(&self.config.theme, w, h);
+                    self.selected
+                        .week(monday)
+                        .iter()
+                        .position(|&d| d == pinned)
+                        .map(|i| (pinned, r.week_day(i)))
+                } else {
+                    let l = layout::Layout::new(&self.config.theme, w, h);
+                    self.cursor
+                        .matrix(monday)
+                        .iter()
+                        .position(|&d| d == pinned)
+                        .map(|i| (pinned, l.day(i)))
+                }
+            }),
+        };
+
+        let Some((date, day_rect)) = target else {
+            self.popover.hide();
+            return;
+        };
+        let is_pinned = self.pinned_event_day == Some(date);
+        let events = self.gcal.events_for(date);
+        let connected = self.gcal_configured();
+        if events.is_empty() && !(is_pinned && connected) {
+            self.popover.hide();
+            return;
+        }
+
+        let theme = self.config.theme.as_str();
+        let wallpaper_accent = self.glass.borrow().wallpaper_accent();
+        let ambient = if self.config.palette == crate::accent::THEME {
+            wallpaper_accent
+        } else {
+            crate::accent::vivid(crate::surface::color(&self.config.palette, wallpaper_accent))
+        };
+        let accent = match theme {
+            "blocks" => color(255, 144, 41),
+            "pop" => color(255, 75, 50),
+            "prism" => color(245, 100, 180),
+            "grove" => color(180, 237, 56),
+            "mist" => color(101, 137, 172),
+            "agenda" | "soft" => color(235, 82, 79),
+            _ => ambient,
+        };
+        let light_surface = matches!(theme, "almanac" | "agenda" | "soft");
+        let glass = self.glass.borrow();
+        self.popover.show_for_day(
+            self.hwnd,
+            date,
+            self.today,
+            events,
+            day_rect,
+            self.dpi,
+            popover::PopoverAppearance {
+                glass: &glass,
+                frosted: self.config.frosted,
+                frost_strength: self.config.frost_strength,
+                tint: self.config.tint,
+                opacity: self.config.opacity,
+                palette: &self.config.palette,
+                accent,
+                light_surface,
+            },
+            self.smoke,
+        );
     }
     fn save(&self) {
         if !self.smoke {
@@ -565,6 +826,7 @@ impl State {
                         };
                     }
                 }
+                self.sync_popover();
             }
             Action::Today => {
                 self.today = Date::today();
@@ -573,6 +835,10 @@ impl State {
                     day: 1,
                     ..self.today
                 };
+                if self.pinned_event_day.is_some() {
+                    self.pinned_event_day = Some(self.selected);
+                    self.sync_popover();
+                }
             }
             Action::Day(i) => {
                 self.selected = self.cursor.matrix(self.config.week_starts_on == 1)[i];
@@ -582,6 +848,10 @@ impl State {
                         ..self.selected
                     };
                 }
+                if self.gcal_configured() || self.gcal.has_events(self.selected) {
+                    self.pinned_event_day = Some(self.selected);
+                    self.sync_popover();
+                }
             }
             Action::WeekDay(i) => {
                 self.selected = self.selected.week(self.config.week_starts_on == 1)[i];
@@ -589,14 +859,22 @@ impl State {
                     day: 1,
                     ..self.selected
                 };
+                if self.gcal_configured() || self.gcal.has_events(self.selected) {
+                    self.pinned_event_day = Some(self.selected);
+                    self.sync_popover();
+                }
             }
-            Action::Weekly(weekly) => self.config.mist_weekly = weekly,
+            Action::Weekly(weekly) => {
+                self.config.mist_weekly = weekly;
+                self.sync_popover();
+            }
             Action::Month(month) => {
                 self.cursor.month = month;
                 self.selected = Date {
                     day: self.selected.day.min(self.cursor.days_in_month()),
                     ..self.cursor
                 };
+                self.sync_popover();
             }
             Action::Settings => {
                 self.open_settings();
@@ -613,6 +891,8 @@ impl State {
                 self.pressed = None;
                 self.hover = None;
                 self.drag = None;
+                self.pinned_event_day = None;
+                self.popover.hide();
                 crate::glass::set_resizing(self.hwnd, false);
                 self.save();
                 ShowWindow(self.hwnd, SW_HIDE);
@@ -900,6 +1180,130 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             s.settings_changed();
             0
         }
+        GCAL_SYNCED => {
+            let expected = s.expected_sync_source();
+            if !s.gcal.finish_sync(expected.as_deref()) && expected.is_some() {
+                s.start_gcal_sync();
+            }
+            let rows = s.settings_rows();
+            if let Some(host) = &mut s.settings_host {
+                host.set_rows(rows);
+            }
+            s.sync_popover();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        GCAL_OAUTH_DONE => {
+            if let Some(Ok(())) = s.gcal.finish_oauth_login() {
+                s.start_gcal_sync();
+            }
+            let rows = s.settings_rows();
+            if let Some(host) = &mut s.settings_host {
+                host.set_rows(rows);
+            }
+            s.sync_popover();
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        PROMPT_OAUTH_CREDS => {
+            let start_after = wp != 0;
+            let owner = s.settings_host.as_ref().map(|h| h.hwnd()).unwrap_or(hwnd);
+            let initial = match (
+                &s.config.google_oauth_client_id,
+                &s.config.google_oauth_client_secret,
+            ) {
+                (Some(id), Some(sec)) => format!("{id}|{sec}"),
+                (Some(id), None) => id.clone(),
+                _ => String::new(),
+            };
+            drop(s);
+            if let Some(raw) = crate::text_prompt::choose_long(
+                owner,
+                "Google OAuth Client ID (or JSON / id|secret)",
+                &initial,
+                4096,
+            ) {
+                if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                    match gcal_oauth::parse_oauth_credentials(&raw) {
+                        Ok((id, secret)) => {
+                            s.gcal.cancel_oauth_login();
+                            s.config.google_oauth_client_id = Some(id);
+                            s.config.google_oauth_client_secret = secret;
+                            s.gcal.last_error = None;
+                            s.save();
+                            if start_after {
+                                PostMessageW(hwnd, START_OAUTH_SIGNIN, 0, 0);
+                            }
+                        }
+                        Err(e) => {
+                            s.gcal.last_error = Some(e);
+                        }
+                    }
+                    let rows = s.settings_rows();
+                    if let Some(host) = &mut s.settings_host {
+                        host.set_rows(rows);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            0
+        }
+        START_OAUTH_SIGNIN => {
+            if let Some(cid) = s.config.google_oauth_client_id.clone() {
+                if !s.gcal.oauth_signing_in {
+                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    s.gcal.oauth_signing_in = true;
+                    s.gcal.oauth_cancel = Some(cancel.clone());
+                    s.gcal.last_error = None;
+                    if let Err(e) = gcal_oauth::start_oauth_login(
+                        cid,
+                        s.config.google_oauth_client_secret.clone(),
+                        s.root.clone(),
+                        hwnd,
+                        GCAL_OAUTH_DONE,
+                        s.gcal.pending_oauth.clone(),
+                        cancel,
+                    ) {
+                        s.gcal.cancel_oauth_login();
+                        s.gcal.last_error = Some(e);
+                    }
+                    let rows = s.settings_rows();
+                    if let Some(host) = &mut s.settings_host {
+                        host.set_rows(rows);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            0
+        }
+        PROMPT_GCAL_URL => {
+            let owner = s.settings_host.as_ref().map(|h| h.hwnd()).unwrap_or(hwnd);
+            let initial = s.config.google_calendar_url.clone().unwrap_or_default();
+            drop(s);
+            if let Some(raw) =
+                crate::text_prompt::choose_long(owner, "Google Calendar iCal URL", &initial, 2048)
+            {
+                if let Ok(mut s) = (*ptr).try_borrow_mut() {
+                    match gcal::normalize_url(&raw) {
+                        Ok(url) => {
+                            s.config.google_calendar_url = Some(url);
+                            s.gcal.last_error = None;
+                            s.save();
+                            s.start_gcal_sync();
+                        }
+                        Err(e) => {
+                            s.gcal.last_error = Some(e);
+                        }
+                    }
+                    let rows = s.settings_rows();
+                    if let Some(host) = &mut s.settings_host {
+                        host.set_rows(rows);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            0
+        }
         WM_GETMINMAXINFO => {
             let p = &mut *(lp as *mut MINMAXINFO);
             p.ptMinTrackSize = POINT {
@@ -1038,6 +1442,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         s.hover_clock = Some(crate::motion::FrameClock::start());
                     }
                     SetTimer(hwnd, 2, crate::motion::frame_interval_ms(), None);
+                    s.sync_popover();
                     InvalidateRect(hwnd, null(), 0);
                 }
                 let mut track = TRACKMOUSEEVENT {
@@ -1058,6 +1463,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if moved {
                 s.key.clear();
                 s.bounds();
+                s.sync_popover();
             } else if let Some(a) = a {
                 if s.hit(point(lp)) == Some(a) {
                     s.activate(a);
@@ -1084,6 +1490,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             s.hover_alpha = 0.;
             KillTimer(hwnd, 2);
             s.hover_clock = None;
+            s.sync_popover();
             InvalidateRect(hwnd, null(), 0);
             0
         }
@@ -1135,6 +1542,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 s.key.clear();
                 InvalidateRect(hwnd, null(), 0);
             }
+            if !s.smoke
+                && s.gcal_configured()
+                && s.gcal
+                    .last_sync
+                    .is_none_or(|t| t.elapsed().as_secs() >= gcal::SYNC_INTERVAL_SECS)
+            {
+                s.start_gcal_sync();
+            }
             if !s.config.floating && !s.inspect && IsWindowVisible(hwnd) != 0 {
                 crate::window::pin_to_desktop(hwnd);
             }
@@ -1144,6 +1559,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match wp as u32 {
                 0x1B => {
                     s.pressed = None;
+                    s.pinned_event_day = None;
+                    s.popover.hide();
 
                     if let Some(d) = s.drag.take() {
                         crate::glass::set_resizing(hwnd, false);
@@ -1169,6 +1586,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             ..s.cursor
                         };
                     }
+                    s.sync_popover();
                 }
                 0x24 => {
                     s.keyboard_day = true;
@@ -1186,6 +1604,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         day: 1,
                         ..s.selected
                     };
+                    if s.pinned_event_day.is_some() {
+                        s.pinned_event_day = Some(s.selected);
+                        s.sync_popover();
+                    }
                 }
                 _ => {}
             }
@@ -1547,6 +1969,72 @@ mod tests {
                 .save(root.join(".scratch/calendar-native-themes.png"))
                 .unwrap();
         }
+    }
+    #[test]
+    fn gcal_events_pin_on_day_click_clear_on_hide_and_render_popover() {
+        let _ui = crate::native_ui_test_lock();
+        let _runtime = render::Runtime::start().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("lumen-calendar-gcal-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe {
+            let glass = Rc::new(RefCell::new(Glass::new(13., 1.)));
+            let host = Host::create(&root, glass, true, true).unwrap();
+            let mut s = host.state.borrow_mut();
+            let target_date = s.cursor.matrix(s.config.week_starts_on == 1)[15];
+            let ics = format!(
+                "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nDTSTART:{:04}{:02}{:02}T093000\r\nDTEND:{:04}{:02}{:02}T103000\r\nSUMMARY:Design Review\r\nLOCATION:Room A\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+                target_date.year, target_date.month, target_date.day,
+                target_date.year, target_date.month, target_date.day
+            );
+            s.gcal.events = gcal::parse_ics(&ics, target_date.add_days(-1), target_date.add_days(1));
+            assert!(s.gcal.has_events(target_date));
+            s.config.google_calendar_url = Some("https://calendar.google.com/calendar/ical/test/basic.ics".into());
+            s.paint();
+            s.activate(Action::Day(15));
+            assert_eq!(s.pinned_event_day, Some(target_date));
+
+            // Clicking an empty day while still hovering it must keep the popover visible.
+            let empty_date = s.cursor.matrix(s.config.week_starts_on == 1)[16];
+            assert!(!s.gcal.has_events(empty_date));
+            s.hover = Some(Action::Day(16));
+            s.smoke = false;
+            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+            s.activate(Action::Day(16));
+            assert_eq!(s.pinned_event_day, Some(empty_date));
+            assert!(s.popover.is_visible());
+            s.smoke = true;
+            ShowWindow(s.hwnd, SW_HIDE);
+
+            // Exercise popover rendering directly on an off-screen window
+            let st = &mut *s;
+            let glass = st.glass.borrow();
+            st.popover.show_for_day(
+                st.hwnd,
+                target_date,
+                st.today,
+                st.gcal.events_for(target_date),
+                [100., 100., 140., 140.],
+                st.dpi,
+                popover::PopoverAppearance {
+                    glass: &glass,
+                    frosted: st.config.frosted,
+                    frost_strength: st.config.frost_strength,
+                    tint: st.config.tint,
+                    opacity: st.config.opacity,
+                    palette: &st.config.palette,
+                    accent: color(80, 140, 240),
+                    light_surface: false,
+                },
+                false,
+            );
+            drop(glass);
+            st.popover.hide();
+
+            s.activate(Action::Hide);
+            assert!(s.pinned_event_day.is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

@@ -238,6 +238,18 @@ impl State {
             }
             self.typo
                 .draw(dc, self.dpi, &date.day.to_string(), r, style, 1);
+            if self.gcal.has_events(*date) && !(today && !selected && (t == "lumen" || t == "almanac") && r[3] - r[1] >= 16.) {
+                let x = (r[0] + r[2]) / 2.;
+                let dot_color = if selected { fg } else { accent };
+                c.round(
+                    [x - 1., r[3] - 3.5, x + 1., r[3] - 1.5],
+                    1.,
+                    dot_color,
+                    (230. * opacity) as u8,
+                    false,
+                    false,
+                );
+            }
             if selected && self.keyboard_day {
                 let focus_rect = if circular {
                     [r[0] - 1., r[1] - 1., r[2] + 1., r[3] + 1.]
@@ -840,6 +852,18 @@ impl State {
                     }
                     self.typo
                         .draw(dc, self.dpi, &date.day.to_string(), r, style, 1);
+                    if self.gcal.has_events(date) && !(today && !selected && (t == "lumen" || t == "almanac")) {
+                        let x = (r[0] + r[2]) / 2.;
+                        let dot_color = if selected { fg } else { accent };
+                        c.round(
+                            [x - 1.5, r[3] - 7., x + 1.5, r[3] - 4.],
+                            1.5,
+                            dot_color,
+                            (235. * opacity) as u8,
+                            false,
+                            false,
+                        );
+                    }
                     if circular && selected && self.keyboard_day {
                         let pad = if r[3] - r[1] < 26. { 1. } else { 3. };
                         self.artwork.border(

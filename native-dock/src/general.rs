@@ -70,7 +70,7 @@ impl Config {
         }
         c.opacity = c.opacity.clamp(0., 100.);
         c.blur = if c.blur.is_finite() {
-            c.blur.clamp(0., 80.)
+            c.blur.clamp(0., 160.)
         } else {
             13.
         };
@@ -229,7 +229,7 @@ impl Host {
                 "Blend widget backgrounds with the desktop wallpaper",
                 self.config.frosted_glass,
             ),
-            Row::slider(17, "Blur size", self.config.blur, 0., 80., "px"),
+            Row::slider(17, "Blur size", self.config.blur, 0., 160., "px"),
         ]);
         const UPDATE_ACCENT: u32 = 0xe5881e;
         rows.push(Row::section("Updates"));
@@ -427,7 +427,7 @@ impl Host {
                     dirty = true;
                 }
                 (17, Value::Number(v)) => {
-                    self.config.blur = v.clamp(0., 80.);
+                    self.config.blur = v.clamp(0., 160.);
                     crate::glass::set_global_blur(self.config.blur);
                     actions.push(Action::RefreshGlass);
                     dirty = true;

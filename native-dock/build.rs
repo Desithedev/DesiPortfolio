@@ -74,13 +74,14 @@ fn embed_windows_icon(widgets_root: &std::path::Path, out: &std::path::Path) {
     };
     let rc_file = out.join("lumen.rc");
     let res_file = out.join("lumen.res");
-    let escaped = ico.to_string_lossy().replace('\\', "\\\\");
-    fs::write(&rc_file, format!("1 ICON \"{escaped}\"\r\n")).unwrap();
+    fs::copy(&ico, out.join("lumen.ico")).expect("copy lumen.ico");
+    fs::write(&rc_file, "1 ICON \"lumen.ico\"\r\n").unwrap();
     let status = std::process::Command::new(rc)
+        .current_dir(out)
         .arg("/nologo")
         .arg("/fo")
-        .arg(&res_file)
-        .arg(&rc_file)
+        .arg("lumen.res")
+        .arg("lumen.rc")
         .status()
         .expect("run rc.exe");
     assert!(status.success(), "rc.exe failed compiling lumen.rc");
