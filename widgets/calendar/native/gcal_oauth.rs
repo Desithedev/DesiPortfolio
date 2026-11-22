@@ -1,5 +1,5 @@
 //! Google OAuth 2.0 (Desktop PKCE loopback) and Google Calendar API v3 client.
-use super::gcal::{CalendarEvent, MAX_ICS_BYTES};
+use super::gcal::{CalendarEvent, CalendarListEntry, EventKind, MAX_ICS_BYTES};
 use super::model::Date;
 use crate::model::wide;
 use sha2::{Digest, Sha256};
@@ -27,6 +27,7 @@ use windows_sys::Win32::{
 const OAUTH_TOKENS_FILE: &str = "config/native-calendar-oauth.json";
 const OAUTH_CACHE_FILE: &str = "config/native-calendar-gcal-api.json";
 const OAUTH_TASKS_CACHE_FILE: &str = "config/native-calendar-gcal-tasks.json";
+const OAUTH_CALS_CACHE_FILE: &str = "config/native-calendar-gcal-cals.json";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OAuthTokens {
@@ -61,18 +62,26 @@ pub fn clear_oauth_data(root: &Path) {
     let _ = fs::remove_file(root.join(OAUTH_TOKENS_FILE));
     let _ = fs::remove_file(root.join(OAUTH_CACHE_FILE));
     let _ = fs::remove_file(root.join(OAUTH_TASKS_CACHE_FILE));
+    let _ = fs::remove_file(root.join(OAUTH_CALS_CACHE_FILE));
 }
 
-pub fn load_cached_events(root: &Path) -> Option<BTreeMap<Date, Vec<CalendarEvent>>> {
+pub fn load_cached_events(
+    root: &Path,
+    disabled_calendars: &[String],
+) -> Option<(BTreeMap<Date, Vec<CalendarEvent>>, Vec<CalendarListEntry>)> {
     let raw = fs::read_to_string(root.join(OAUTH_CACHE_FILE)).ok()?;
     let today = Date::today();
     let min_d = today.add_days(-180);
     let max_d = today.add_days(365);
-    let mut map = parse_google_events_json(&raw, min_d, max_d);
+    let cals = fs::read_to_string(root.join(OAUTH_CALS_CACHE_FILE))
+        .ok()
+        .map(|s| parse_calendar_list_json(&s))
+        .unwrap_or_default();
+    let mut map = parse_google_events_json_filtered(&raw, min_d, max_d, disabled_calendars);
     if let Ok(tasks_raw) = fs::read_to_string(root.join(OAUTH_TASKS_CACHE_FILE)) {
         merge_events(&mut map, parse_google_tasks_json(&tasks_raw, min_d, max_d));
     }
-    Some(map)
+    Some((map, cals))
 }
 
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -383,7 +392,7 @@ pub fn start_oauth_login(
     let verifier = random_token("pkce", 48);
     let challenge = pkce_challenge(&verifier);
     let state = random_token("state", 24);
-    let scope = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/tasks.readonly";
+    let scope = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/tasks";
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&code_challenge={}&code_challenge_method=S256&access_type=offline&prompt=consent&state={}",
         url_encode(&client_id),
@@ -529,11 +538,11 @@ fn run_oauth_loopback(
     Ok(tokens)
 }
 
-pub fn fetch_google_calendar_events(
+fn ensure_valid_token(
     client_id: &str,
     client_secret: Option<&str>,
     root: &Path,
-) -> Result<(String, BTreeMap<Date, Vec<CalendarEvent>>), String> {
+) -> Result<String, String> {
     let mut tokens =
         load_tokens(root).ok_or_else(|| "Not signed in to Google Calendar.".to_string())?;
     if now_unix().saturating_add(60) >= tokens.expires_at_unix {
@@ -565,39 +574,67 @@ pub fn fetch_google_calendar_events(
         tokens.expires_at_unix = now_unix().saturating_add(expires_in);
         save_tokens(root, &tokens)?;
     }
+    Ok(tokens.access_token)
+}
 
+fn parse_hex_color(s: &str) -> Option<u32> {
+    let hex = s.trim().strip_prefix('#').unwrap_or(s.trim());
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()? as u32;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()? as u32;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()? as u32;
+    Some(r | (g << 8) | (b << 16))
+}
+
+pub fn parse_calendar_list_json(raw: &str) -> Vec<CalendarListEntry> {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(items) = json.get("items").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|cal| {
+            let id = cal.get("id").and_then(|v| v.as_str())?.to_string();
+            let summary = cal
+                .get("summaryOverride")
+                .or_else(|| cal.get("summary"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let color = cal
+                .get("backgroundColor")
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex_color);
+            let primary = cal.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(CalendarListEntry {
+                id,
+                summary,
+                color,
+                primary,
+            })
+        })
+        .collect()
+}
+
+pub fn fetch_google_calendar_events(
+    client_id: &str,
+    client_secret: Option<&str>,
+    disabled_calendars: &[String],
+    root: &Path,
+) -> Result<(BTreeMap<Date, Vec<CalendarEvent>>, Vec<CalendarListEntry>), String> {
+    let access_token = ensure_valid_token(client_id, client_secret, root)?;
     let today = Date::today();
     let min_d = today.add_days(-180);
     let max_d = today.add_days(365);
     let time_min = format!("{:04}-{:02}-{:02}T00:00:00Z", min_d.year, min_d.month, min_d.day);
     let time_max = format!("{:04}-{:02}-{:02}T23:59:59Z", max_d.year, max_d.month, max_d.day);
-    let path = format!(
-        "/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=2500&timeMin={}&timeMax={}",
-        url_encode(&time_min),
-        url_encode(&time_max),
-    );
-    let auth_header = format!("Authorization: Bearer {}\r\n", tokens.access_token);
-    let (status, bytes) = https_request(
-        "GET",
-        "www.googleapis.com",
-        &path,
-        Some(&auth_header),
-        None,
-    )?;
-    if status >= 400 {
-        let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
-            .unwrap_or_else(|| format!("Google Calendar API HTTP {status}"));
-        return Err(msg);
-    }
-    let raw = String::from_utf8(bytes).map_err(|_| "Calendar response is not UTF-8.".to_string())?;
-    let mut all_items = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
-        .unwrap_or_default();
+    let auth_header = format!("Authorization: Bearer {access_token}\r\n");
 
-    // Fetch any additional selected calendars (e.g. secondary/shared calendars).
+    let mut cals = Vec::new();
     if let Ok((200, list_bytes)) = https_request(
         "GET",
         "www.googleapis.com",
@@ -605,31 +642,57 @@ pub fn fetch_google_calendar_events(
         Some(&auth_header),
         None,
     ) {
-        if let Ok(list_json) = serde_json::from_slice::<serde_json::Value>(&list_bytes) {
-            if let Some(cals) = list_json.get("items").and_then(|v| v.as_array()) {
-                for cal in cals {
-                    let is_primary = cal.get("primary").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let selected = cal.get("selected").and_then(|v| v.as_bool()).unwrap_or(false);
-                    let Some(cal_id) = cal.get("id").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    if is_primary || !selected {
-                        continue;
-                    }
-                    let sec_path = format!(
-                        "/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=1000&timeMin={}&timeMax={}",
-                        url_encode(cal_id),
-                        url_encode(&time_min),
-                        url_encode(&time_max),
-                    );
-                    if let Ok((200, sec_bytes)) =
-                        https_request("GET", "www.googleapis.com", &sec_path, Some(&auth_header), None)
-                    {
-                        if let Ok(sec_json) = serde_json::from_slice::<serde_json::Value>(&sec_bytes) {
-                            if let Some(items) = sec_json.get("items").and_then(|v| v.as_array()) {
-                                all_items.extend(items.iter().cloned());
+        if let Ok(list_raw) = String::from_utf8(list_bytes) {
+            let _ = write_atomic(&root.join(OAUTH_CALS_CACHE_FILE), list_raw.as_bytes());
+            cals = parse_calendar_list_json(&list_raw);
+        }
+    }
+
+    let mut all_items = Vec::new();
+    if cals.is_empty() {
+        let path = format!(
+            "/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&maxResults=2500&timeMin={}&timeMax={}",
+            url_encode(&time_min),
+            url_encode(&time_max),
+        );
+        let (status, bytes) =
+            https_request("GET", "www.googleapis.com", &path, Some(&auth_header), None)?;
+        if status >= 400 {
+            let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+                .unwrap_or_else(|| format!("Google Calendar API HTTP {status}"));
+            return Err(msg);
+        }
+        let raw = String::from_utf8(bytes).map_err(|_| "Calendar response is not UTF-8.".to_string())?;
+        if let Some(items) = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("items").and_then(|i| i.as_array()).cloned())
+        {
+            all_items.extend(items);
+        }
+    } else {
+        for cal in &cals {
+            let cal_path = format!(
+                "/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=1500&timeMin={}&timeMax={}",
+                url_encode(&cal.id),
+                url_encode(&time_min),
+                url_encode(&time_max),
+            );
+            if let Ok((200, cal_bytes)) =
+                https_request("GET", "www.googleapis.com", &cal_path, Some(&auth_header), None)
+            {
+                if let Ok(mut cal_json) = serde_json::from_slice::<serde_json::Value>(&cal_bytes) {
+                    if let Some(items) = cal_json.get_mut("items").and_then(|v| v.as_array_mut()) {
+                        for item in items.iter_mut() {
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("_lumen_cal_id".into(), serde_json::json!(cal.id));
+                                if let Some(c) = cal.color {
+                                    obj.insert("_lumen_cal_color".into(), serde_json::json!(c));
+                                }
                             }
                         }
+                        all_items.extend(items.drain(..));
                     }
                 }
             }
@@ -638,14 +701,13 @@ pub fn fetch_google_calendar_events(
 
     let merged_raw = serde_json::json!({ "items": all_items }).to_string();
     let _ = write_atomic(&root.join(OAUTH_CACHE_FILE), merged_raw.as_bytes());
-    let mut events = parse_google_events_json(&merged_raw, min_d, max_d);
+    let mut events = parse_google_events_json_filtered(&merged_raw, min_d, max_d, disabled_calendars);
 
-    // Fetch Google Tasks (if tasks.readonly scope and Google Tasks API are enabled).
     if let Some((tasks_raw, task_events)) = fetch_google_tasks(&auth_header, min_d, max_d) {
         let _ = write_atomic(&root.join(OAUTH_TASKS_CACHE_FILE), tasks_raw.as_bytes());
         merge_events(&mut events, task_events);
     }
-    Ok((merged_raw, events))
+    Ok((events, cals))
 }
 
 fn fetch_google_tasks(
@@ -678,9 +740,14 @@ fn fetch_google_tasks(
         if let Ok((200, task_bytes)) =
             https_request("GET", "tasks.googleapis.com", &path, Some(auth_header), None)
         {
-            if let Ok(task_json) = serde_json::from_slice::<serde_json::Value>(&task_bytes) {
-                if let Some(items) = task_json.get("items").and_then(|v| v.as_array()) {
-                    all_tasks.extend(items.iter().cloned());
+            if let Ok(mut task_json) = serde_json::from_slice::<serde_json::Value>(&task_bytes) {
+                if let Some(items) = task_json.get_mut("items").and_then(|v| v.as_array_mut()) {
+                    for item in items.iter_mut() {
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert("_lumen_list_id".into(), serde_json::json!(list_id));
+                        }
+                    }
+                    all_tasks.extend(items.drain(..));
                 }
             }
         }
@@ -688,6 +755,161 @@ fn fetch_google_tasks(
     let raw = serde_json::json!({ "items": all_tasks }).to_string();
     let map = parse_google_tasks_json(&raw, range_start, range_end);
     Some((raw, map))
+}
+
+pub fn toggle_google_task(
+    client_id: &str,
+    client_secret: Option<&str>,
+    root: &Path,
+    list_id: &str,
+    task_id: &str,
+    completed: bool,
+) -> Result<(), String> {
+    let access_token = ensure_valid_token(client_id, client_secret, root)?;
+    let auth_header = format!("Authorization: Bearer {access_token}\r\nContent-Type: application/json\r\n");
+    let path = format!(
+        "/tasks/v1/lists/{}/tasks/{}",
+        url_encode(list_id),
+        url_encode(task_id)
+    );
+    let body = serde_json::json!({
+        "status": if completed { "completed" } else { "needsAction" }
+    })
+    .to_string();
+    let (status, bytes) = https_request(
+        "PATCH",
+        "tasks.googleapis.com",
+        &path,
+        Some(&auth_header),
+        Some(body.as_bytes()),
+    )?;
+    if status >= 400 {
+        let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| format!("Google Tasks API HTTP {status}"));
+        return Err(msg);
+    }
+    Ok(())
+}
+
+/// Parses `"14:30 Meeting"` as `(Some(870), "Meeting")`, or plain text as `(None, title)`.
+pub fn parse_quick_add(raw: &str) -> (Option<u16>, String) {
+    let trimmed = raw.trim();
+    if let Some((first, rest)) = trimmed.split_once(char::is_whitespace) {
+        if let Some((hh_s, mm_s)) = first.split_once(':') {
+            if let (Ok(hh), Ok(mm)) = (hh_s.parse::<u16>(), mm_s.parse::<u16>()) {
+                if hh < 24 && mm < 60 && !rest.trim().is_empty() {
+                    return (Some(hh * 60 + mm), rest.trim().to_string());
+                }
+            }
+        }
+    }
+    (None, trimmed.to_string())
+}
+
+pub fn create_google_task(
+    client_id: &str,
+    client_secret: Option<&str>,
+    root: &Path,
+    date: Date,
+    title: &str,
+) -> Result<(), String> {
+    let access_token = ensure_valid_token(client_id, client_secret, root)?;
+    let auth_header = format!("Authorization: Bearer {access_token}\r\nContent-Type: application/json\r\n");
+    let due = format!("{:04}-{:02}-{:02}T00:00:00.000Z", date.year, date.month, date.day);
+    let body = serde_json::json!({
+        "title": title.trim(),
+        "due": due,
+        "status": "needsAction",
+    })
+    .to_string();
+    let (status, bytes) = https_request(
+        "POST",
+        "tasks.googleapis.com",
+        "/tasks/v1/lists/@default/tasks",
+        Some(&auth_header),
+        Some(body.as_bytes()),
+    )?;
+    if status >= 400 {
+        let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| format!("Google Tasks API HTTP {status}"));
+        return Err(msg);
+    }
+    Ok(())
+}
+
+pub fn create_google_event(
+    client_id: &str,
+    client_secret: Option<&str>,
+    root: &Path,
+    date: Date,
+    start_minutes: u16,
+    title: &str,
+) -> Result<(), String> {
+    let access_token = ensure_valid_token(client_id, client_secret, root)?;
+    let auth_header = format!("Authorization: Bearer {access_token}\r\nContent-Type: application/json\r\n");
+    let end_minutes = (start_minutes + 60).min(23 * 60 + 59);
+    // Use local timezone offset from Windows TIME_ZONE_INFORMATION.
+    let offset_str = local_tz_offset_string();
+    let start_dt = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:00{offset_str}",
+        date.year,
+        date.month,
+        date.day,
+        start_minutes / 60,
+        start_minutes % 60,
+    );
+    let end_dt = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:00{offset_str}",
+        date.year,
+        date.month,
+        date.day,
+        end_minutes / 60,
+        end_minutes % 60,
+    );
+    let body = serde_json::json!({
+        "summary": title.trim(),
+        "start": { "dateTime": start_dt },
+        "end": { "dateTime": end_dt },
+    })
+    .to_string();
+    let (status, bytes) = https_request(
+        "POST",
+        "www.googleapis.com",
+        "/calendar/v3/calendars/primary/events",
+        Some(&auth_header),
+        Some(body.as_bytes()),
+    )?;
+    if status >= 400 {
+        let msg = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.pointer("/error/message").and_then(|m| m.as_str()).map(str::to_string))
+            .unwrap_or_else(|| format!("Google Calendar API HTTP {status}"));
+        return Err(msg);
+    }
+    Ok(())
+}
+
+fn local_tz_offset_string() -> String {
+    unsafe {
+        let mut tzi: windows_sys::Win32::System::Time::TIME_ZONE_INFORMATION = std::mem::zeroed();
+        let mode = windows_sys::Win32::System::Time::GetTimeZoneInformation(&mut tzi);
+        let bias = tzi.Bias
+            + if mode == 2 {
+                tzi.DaylightBias
+            } else if mode == 1 {
+                tzi.StandardBias
+            } else {
+                0
+            };
+        let total = -bias;
+        let sign = if total >= 0 { '+' } else { '-' };
+        let abs = total.abs();
+        format!("{sign}{:02}:{:02}", abs / 60, abs % 60)
+    }
 }
 
 fn merge_events(
@@ -751,12 +973,29 @@ pub fn parse_google_tasks_json(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let list_id = item
+            .get("_lumen_list_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("@default")
+            .to_string();
+        let task_id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         map.entry(date).or_default().push(CalendarEvent {
             summary,
             location: notes,
             all_day: true,
             start_minutes: None,
             end_minutes: None,
+            color: None,
+            kind: EventKind::Task {
+                list_id,
+                task_id,
+                completed,
+            },
+            html_link: None,
         });
     }
     map
@@ -848,6 +1087,15 @@ pub fn parse_google_events_json(
     range_start: Date,
     range_end: Date,
 ) -> BTreeMap<Date, Vec<CalendarEvent>> {
+    parse_google_events_json_filtered(raw, range_start, range_end, &[])
+}
+
+pub fn parse_google_events_json_filtered(
+    raw: &str,
+    range_start: Date,
+    range_end: Date,
+    disabled_calendars: &[String],
+) -> BTreeMap<Date, Vec<CalendarEvent>> {
     let mut map: BTreeMap<Date, Vec<CalendarEvent>> = BTreeMap::new();
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return map;
@@ -859,6 +1107,15 @@ pub fn parse_google_events_json(
         if item.get("status").and_then(|v| v.as_str()) == Some("cancelled") {
             continue;
         }
+        if let Some(cal_id) = item.get("_lumen_cal_id").and_then(|v| v.as_str()) {
+            if disabled_calendars.iter().any(|d| d == cal_id) {
+                continue;
+            }
+        }
+        let color = item
+            .get("_lumen_cal_color")
+            .and_then(|v| v.as_u64())
+            .map(|c| c as u32);
         let summary = item
             .get("summary")
             .and_then(|v| v.as_str())
@@ -872,6 +1129,17 @@ pub fn parse_google_events_json(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let html_link = item
+            .get("hangoutLink")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("https://"))
+            .map(str::to_string)
+            .or_else(|| {
+                location
+                    .as_deref()
+                    .and_then(|loc| loc.split_whitespace().find(|w| w.starts_with("https://")))
+                    .map(str::to_string)
+            });
 
         let Some(start) = item.get("start") else {
             continue;
@@ -898,6 +1166,9 @@ pub fn parse_google_events_json(
                     all_day: true,
                     start_minutes: None,
                     end_minutes: None,
+                    color,
+                    kind: EventKind::Event,
+                    html_link: html_link.clone(),
                 });
                 d = d.add_days(1);
                 guard += 1;
@@ -934,6 +1205,9 @@ pub fn parse_google_events_json(
                     all_day: false,
                     start_minutes: Some(day_start),
                     end_minutes: Some(day_end),
+                    color,
+                    kind: EventKind::Event,
+                    html_link: html_link.clone(),
                 });
                 d = d.add_days(1);
                 guard += 1;
@@ -1046,5 +1320,17 @@ mod tests {
         assert_eq!(tasks[0].summary, "☐ Submit report");
         assert_eq!(tasks[0].location.as_deref(), Some("Q4 deck"));
         assert_eq!(tasks[1].summary, "✓ Pay bill");
+    }
+
+    #[test]
+    fn parse_quick_add_and_calendar_list_work() {
+        assert_eq!(parse_quick_add("14:30 Standup"), (Some(14 * 60 + 30), "Standup".into()));
+        assert_eq!(parse_quick_add("Buy milk"), (None, "Buy milk".into()));
+        let cal_json = r##"{"items":[{"id":"primary@gmail.com","summary":"Personal","backgroundColor":"#0b8043","primary":true}]}"##;
+        let cals = parse_calendar_list_json(cal_json);
+        assert_eq!(cals.len(), 1);
+        assert_eq!(cals[0].summary, "Personal");
+        assert!(cals[0].primary);
+        assert!(cals[0].color.is_some());
     }
 }

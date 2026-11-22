@@ -21,12 +21,33 @@ const CACHE_FILE: &str = "config/native-calendar-gcal.ics";
 pub const SYNC_INTERVAL_SECS: u64 = 15 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Event,
+    Task {
+        list_id: String,
+        task_id: String,
+        completed: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalendarListEntry {
+    pub id: String,
+    pub summary: String,
+    pub color: Option<u32>,
+    pub primary: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CalendarEvent {
     pub summary: String,
     pub location: Option<String>,
     pub all_day: bool,
     pub start_minutes: Option<u16>,
     pub end_minutes: Option<u16>,
+    pub color: Option<u32>,
+    pub kind: EventKind,
+    pub html_link: Option<String>,
 }
 
 impl CalendarEvent {
@@ -44,11 +65,12 @@ impl CalendarEvent {
 
 pub struct SyncResult {
     pub url: String,
-    pub outcome: Result<(String, BTreeMap<Date, Vec<CalendarEvent>>), String>,
+    pub outcome: Result<(BTreeMap<Date, Vec<CalendarEvent>>, Vec<CalendarListEntry>), String>,
 }
 
 pub struct GcalStore {
     pub events: BTreeMap<Date, Vec<CalendarEvent>>,
+    pub calendars: Vec<CalendarListEntry>,
     pub syncing: bool,
     pub oauth_signing_in: bool,
     pub last_sync: Option<Instant>,
@@ -56,12 +78,14 @@ pub struct GcalStore {
     pending: Arc<Mutex<Option<SyncResult>>>,
     pub pending_oauth: Arc<Mutex<Option<Result<super::gcal_oauth::OAuthTokens, String>>>>,
     pub oauth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub pending_mutation: Arc<Mutex<Option<Result<(), String>>>>,
 }
 
 impl Default for GcalStore {
     fn default() -> Self {
         Self {
             events: BTreeMap::new(),
+            calendars: Vec::new(),
             syncing: false,
             oauth_signing_in: false,
             last_sync: None,
@@ -69,6 +93,7 @@ impl Default for GcalStore {
             pending: Arc::new(Mutex::new(None)),
             pending_oauth: Arc::new(Mutex::new(None)),
             oauth_cancel: None,
+            pending_mutation: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -86,10 +111,28 @@ impl GcalStore {
         self.events.values().map(|v| v.len()).sum()
     }
 
-    pub fn load_cache(&mut self, root: &Path) {
+    /// Returns `(minutes_until_start, summary)` for the next timed event today within `0..=60` min.
+    pub fn upcoming_today(&self, today: Date, now_minutes: u16) -> Option<(u16, &str)> {
+        self.events.get(&today)?.iter().find_map(|ev| {
+            if ev.all_day {
+                return None;
+            }
+            let start = ev.start_minutes?;
+            if start >= now_minutes && start - now_minutes <= 60 {
+                Some((start - now_minutes, ev.summary.as_str()))
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn load_cache(&mut self, root: &Path, disabled_calendars: &[String]) {
         if super::gcal_oauth::has_tokens(root) {
-            if let Some(events) = super::gcal_oauth::load_cached_events(root) {
+            if let Some((events, cals)) =
+                super::gcal_oauth::load_cached_events(root, disabled_calendars)
+            {
                 self.events = events;
+                self.calendars = cals;
                 return;
             }
         }
@@ -112,6 +155,7 @@ impl GcalStore {
 
     pub fn clear(&mut self, root: &Path) {
         self.events.clear();
+        self.calendars.clear();
         self.syncing = false;
         self.cancel_oauth_login();
         self.last_sync = None;
@@ -130,6 +174,7 @@ impl GcalStore {
         &mut self,
         client_id: &str,
         client_secret: Option<&str>,
+        disabled_calendars: &[String],
         hwnd: HWND,
         msg: u32,
         root: &Path,
@@ -139,6 +184,7 @@ impl GcalStore {
         }
         let cid = client_id.to_string();
         let csec = client_secret.map(str::to_string);
+        let disabled = disabled_calendars.to_vec();
         let root = root.to_path_buf();
         let pending = self.pending.clone();
         let hwnd_val = hwnd as isize;
@@ -148,6 +194,7 @@ impl GcalStore {
             let outcome = super::gcal_oauth::fetch_google_calendar_events(
                 &cid,
                 csec.as_deref(),
+                &disabled,
                 &root,
             );
             if let Ok(mut guard) = pending.lock() {
@@ -193,7 +240,7 @@ impl GcalStore {
                 let today = Date::today();
                 let parsed = parse_ics(&ics, today.add_days(-365), today.add_days(365));
                 let _ = save_cache(&root, &ics);
-                (ics, parsed)
+                (parsed, Vec::new())
             });
             if let Ok(mut guard) = pending.lock() {
                 *guard = Some(SyncResult { url, outcome });
@@ -215,8 +262,11 @@ impl GcalStore {
             return false;
         }
         match res.outcome {
-            Ok((_ics, parsed)) => {
+            Ok((parsed, cals)) => {
                 self.events = parsed;
+                if !cals.is_empty() {
+                    self.calendars = cals;
+                }
                 self.last_error = None;
             }
             Err(e) => {
@@ -941,6 +991,9 @@ fn insert_raw_event(
                 all_day: dtstart.all_day,
                 start_minutes: s_min,
                 end_minutes: e_min,
+                color: None,
+                kind: EventKind::Event,
+                html_link: None,
             });
         }
     }

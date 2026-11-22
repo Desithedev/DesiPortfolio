@@ -56,6 +56,7 @@ const PROMPT_GCAL_URL: u32 = WM_APP + 87;
 const GCAL_OAUTH_DONE: u32 = WM_APP + 88;
 const PROMPT_OAUTH_CREDS: u32 = WM_APP + 89;
 const START_OAUTH_SIGNIN: u32 = WM_APP + 90;
+const GCAL_MUTATION_DONE: u32 = WM_APP + 94;
 struct Button {
     rect: [f32; 4],
     action: Action,
@@ -98,6 +99,9 @@ struct State {
     gcal: gcal::GcalStore,
     popover: popover::EventPopover,
     pinned_event_day: Option<Date>,
+    suppressed_hover_day: Option<Date>,
+    popover_date: Option<Date>,
+    popover_scroll: usize,
 }
 pub struct Host {
     state: Box<RefCell<State>>,
@@ -163,6 +167,9 @@ impl Host {
             gcal: gcal::GcalStore::default(),
             popover: popover::EventPopover::default(),
             pinned_event_day: None,
+            suppressed_hover_day: None,
+            popover_date: None,
+            popover_scroll: 0,
         }));
         let c = &state.borrow().config.clone();
         let mut work: RECT = zeroed();
@@ -220,9 +227,10 @@ impl Host {
             s.dpi = GetDpiForWindow(hwnd) as f32 / 96.;
             if !smoke {
                 s.glass.borrow_mut().refresh_async(hwnd, WALLPAPER_READY);
-                if s.config.google_calendar_url.is_some() {
+                if s.gcal_configured() {
                     let root = s.root.clone();
-                    s.gcal.load_cache(&root);
+                    let disabled = s.config.disabled_calendars.clone();
+                    s.gcal.load_cache(&root, &disabled);
                     s.start_gcal_sync();
                 }
             }
@@ -437,7 +445,22 @@ impl State {
         ];
         if self.gcal_configured() {
             let mut with_gcal = rows;
-            let insert_at = with_gcal.len() - 2;
+            let mut insert_at = with_gcal.len() - 2;
+            if self.gcal_oauth_connected() {
+                for (i, cal) in self.gcal.calendars.iter().enumerate() {
+                    let enabled = !self.config.disabled_calendars.iter().any(|d| d == &cal.id);
+                    with_gcal.insert(
+                        insert_at,
+                        Row::toggle(
+                            100 + i as u32,
+                            &cal.summary,
+                            if cal.primary { "Primary calendar" } else { "Google Calendar" },
+                            enabled,
+                        ),
+                    );
+                    insert_at += 1;
+                }
+            }
             with_gcal.insert(insert_at, Row::button(13, "Disconnect"));
             with_gcal.insert(
                 insert_at,
@@ -572,6 +595,19 @@ impl State {
                         SW_SHOWNORMAL,
                     );
                 }
+                (id, Value::Bool(v)) if id >= 100 => {
+                    let idx = (id - 100) as usize;
+                    if let Some(cal) = self.gcal.calendars.get(idx) {
+                        let cal_id = cal.id.clone();
+                        self.config.disabled_calendars.retain(|d| d != &cal_id);
+                        if !v {
+                            self.config.disabled_calendars.push(cal_id);
+                        }
+                        let root = self.root.clone();
+                        let disabled = self.config.disabled_calendars.clone();
+                        self.gcal.load_cache(&root, &disabled);
+                    }
+                }
                 _ => {}
             }
         }
@@ -611,6 +647,7 @@ impl State {
             self.gcal.start_oauth_sync(
                 &cid,
                 self.config.google_oauth_client_secret.as_deref(),
+                &self.config.disabled_calendars,
                 self.hwnd,
                 GCAL_SYNCED,
                 &self.root,
@@ -663,15 +700,29 @@ impl State {
         };
 
         let Some((date, day_rect)) = target else {
+            self.popover_date = None;
+            self.popover_scroll = 0;
             self.popover.hide();
             return;
         };
         let is_pinned = self.pinned_event_day == Some(date);
+        if !is_pinned && self.suppressed_hover_day == Some(date) {
+            self.popover_date = None;
+            self.popover_scroll = 0;
+            self.popover.hide();
+            return;
+        }
         let events = self.gcal.events_for(date);
         let connected = self.gcal_configured();
         if events.is_empty() && !(is_pinned && connected) {
+            self.popover_date = None;
+            self.popover_scroll = 0;
             self.popover.hide();
             return;
+        }
+        if self.popover_date != Some(date) {
+            self.popover_date = Some(date);
+            self.popover_scroll = 0;
         }
 
         let theme = self.config.theme.as_str();
@@ -691,6 +742,8 @@ impl State {
             _ => ambient,
         };
         let light_surface = matches!(theme, "almanac" | "agenda" | "soft");
+        let oauth_connected = self.gcal_oauth_connected();
+        let scroll = self.popover_scroll;
         let glass = self.glass.borrow();
         self.popover.show_for_day(
             self.hwnd,
@@ -708,6 +761,8 @@ impl State {
                 palette: &self.config.palette,
                 accent,
                 light_surface,
+                oauth_connected,
+                scroll,
             },
             self.smoke,
         );
@@ -799,6 +854,19 @@ impl State {
             .find(|b| contains(b.rect, [p.x as f32 / self.dpi, p.y as f32 / self.dpi]))
             .map(|b| b.action)
     }
+    unsafe fn toggle_pin_day(&mut self, day: Date) {
+        if !(self.gcal_configured() || self.gcal.has_events(day)) {
+            return;
+        }
+        if self.pinned_event_day == Some(day) {
+            self.pinned_event_day = None;
+            self.suppressed_hover_day = Some(day);
+        } else {
+            self.suppressed_hover_day = None;
+            self.pinned_event_day = Some(day);
+        }
+        self.sync_popover();
+    }
     unsafe fn activate(&mut self, a: Action) {
         match a {
             Action::Previous | Action::Next => {
@@ -848,10 +916,7 @@ impl State {
                         ..self.selected
                     };
                 }
-                if self.gcal_configured() || self.gcal.has_events(self.selected) {
-                    self.pinned_event_day = Some(self.selected);
-                    self.sync_popover();
-                }
+                self.toggle_pin_day(self.selected);
             }
             Action::WeekDay(i) => {
                 self.selected = self.selected.week(self.config.week_starts_on == 1)[i];
@@ -859,10 +924,7 @@ impl State {
                     day: 1,
                     ..self.selected
                 };
-                if self.gcal_configured() || self.gcal.has_events(self.selected) {
-                    self.pinned_event_day = Some(self.selected);
-                    self.sync_popover();
-                }
+                self.toggle_pin_day(self.selected);
             }
             Action::Weekly(weekly) => {
                 self.config.mist_weekly = weekly;
@@ -1136,6 +1198,32 @@ impl State {
             }
             crate::settings_ui::retain_header_backing(&mut frame, bg, self.hwnd, w);
         }
+        if !layout::tiny(w, h) && w >= 260. {
+            let mut lt: windows_sys::Win32::Foundation::SYSTEMTIME = zeroed();
+            windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut lt);
+            let now_min = lt.wHour * 60 + lt.wMinute;
+            if let Some((mins, summary)) = self.gcal.upcoming_today(self.today, now_min) {
+                let label = if mins == 0 {
+                    format!("Now: {summary}")
+                } else {
+                    format!("In {mins}m: {summary}")
+                };
+                let pill = [20., h - 24., w - 20., h - 6.];
+                let _batch = render::AlphaBatch::new(frame.dc, self.dpi);
+                let c = Canvas::new(frame.dc, self.dpi);
+                c.round(pill, 9., accent, 52, false, false);
+                c.round(pill, 9., accent, 120, true, false);
+                let fg = self.ink.unwrap_or(color(244, 246, 250));
+                self.typo.draw(
+                    frame.dc,
+                    self.dpi,
+                    &label,
+                    [28., h - 23., w - 28., h - 7.],
+                    typography::Style::new(9.5, 600, fg),
+                    1,
+                );
+            }
+        }
         frame.present_with_alpha(self.hwnd, true);
         self.frame = Some(frame);
         if let Some(shadow) = &mut self.shadow {
@@ -1274,6 +1362,125 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     InvalidateRect(hwnd, null(), 0);
                 }
             }
+            0
+        }
+        popover::POPOVER_SCROLL => {
+            s.popover_scroll = wp;
+            s.sync_popover();
+            0
+        }
+        popover::POPOVER_TOGGLE_TASK => {
+            if let (Some(date), Some(cid)) =
+                (s.popover_date, s.config.google_oauth_client_id.clone())
+            {
+                let csec = s.config.google_oauth_client_secret.clone();
+                let root = s.root.clone();
+                let pending = s.gcal.pending_mutation.clone();
+                let target = s.gcal.events.get_mut(&date).and_then(|list| {
+                    let ev = list.get_mut(wp)?;
+                    if let gcal::EventKind::Task {
+                        list_id,
+                        task_id,
+                        completed,
+                    } = &mut ev.kind
+                    {
+                        *completed = !*completed;
+                        let new_done = *completed;
+                        let title = ev
+                            .summary
+                            .strip_prefix("☐ ")
+                            .or_else(|| ev.summary.strip_prefix("✓ "))
+                            .unwrap_or(&ev.summary)
+                            .to_string();
+                        ev.summary = if new_done {
+                            format!("✓ {title}")
+                        } else {
+                            format!("☐ {title}")
+                        };
+                        Some((list_id.clone(), task_id.clone(), new_done))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((list_id, task_id, completed)) = target {
+                    s.sync_popover();
+                    InvalidateRect(hwnd, null(), 0);
+                    let hwnd_val = hwnd as usize;
+                    std::thread::spawn(move || {
+                        let res = gcal_oauth::toggle_google_task(
+                            &cid,
+                            csec.as_deref(),
+                            &root,
+                            &list_id,
+                            &task_id,
+                            completed,
+                        );
+                        if let Ok(mut g) = pending.lock() {
+                            *g = Some(res);
+                        }
+                        PostMessageW(hwnd_val as HWND, GCAL_MUTATION_DONE, 0, 0);
+                    });
+                }
+            }
+            0
+        }
+        popover::POPOVER_ADD_EVENT => {
+            if let (Some(date), Some(cid)) =
+                (s.popover_date, s.config.google_oauth_client_id.clone())
+            {
+                let csec = s.config.google_oauth_client_secret.clone();
+                let root = s.root.clone();
+                let pending = s.gcal.pending_mutation.clone();
+                drop(s);
+                if let Some(raw) = crate::text_prompt::choose_long(
+                    hwnd,
+                    "New Task or Event (e.g. 14:30 Meeting)",
+                    "",
+                    512,
+                ) {
+                    let (start_min, title) = gcal_oauth::parse_quick_add(&raw);
+                    if !title.is_empty() {
+                        let hwnd_val = hwnd as usize;
+                        std::thread::spawn(move || {
+                            let res = match start_min {
+                                Some(m) => gcal_oauth::create_google_event(
+                                    &cid,
+                                    csec.as_deref(),
+                                    &root,
+                                    date,
+                                    m,
+                                    &title,
+                                ),
+                                None => gcal_oauth::create_google_task(
+                                    &cid,
+                                    csec.as_deref(),
+                                    &root,
+                                    date,
+                                    &title,
+                                ),
+                            };
+                            if let Ok(mut g) = pending.lock() {
+                                *g = Some(res);
+                            }
+                            PostMessageW(hwnd_val as HWND, GCAL_MUTATION_DONE, 0, 0);
+                        });
+                    }
+                }
+            }
+            0
+        }
+        GCAL_MUTATION_DONE => {
+            if let Some(Err(e)) = s.gcal.pending_mutation.lock().ok().and_then(|mut g| g.take()) {
+                s.gcal.last_error = Some(e);
+            } else {
+                s.start_gcal_sync();
+            }
+            let rows = s.settings_rows();
+            if let Some(host) = &mut s.settings_host {
+                host.set_rows(rows);
+            }
+            s.sync_popover();
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         PROMPT_GCAL_URL => {
@@ -1436,6 +1643,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let hover = s.hit(p);
                 if hover != s.hover {
                     s.hover = hover;
+                    s.suppressed_hover_day = None;
                     s.hover_alpha = 0.;
                     s.hover_updated = std::time::Instant::now();
                     if s.hover_clock.is_none() {
@@ -1487,6 +1695,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSELEAVE => {
             s.hover = None;
+            s.suppressed_hover_day = None;
             s.hover_alpha = 0.;
             KillTimer(hwnd, 2);
             s.hover_clock = None;
@@ -2003,6 +2212,10 @@ mod tests {
             s.activate(Action::Day(16));
             assert_eq!(s.pinned_event_day, Some(empty_date));
             assert!(s.popover.is_visible());
+            // Clicking the same day a second time unpins and hides the popover even while hovering.
+            s.activate(Action::Day(16));
+            assert!(s.pinned_event_day.is_none());
+            assert!(!s.popover.is_visible());
             s.smoke = true;
             ShowWindow(s.hwnd, SW_HIDE);
 
@@ -2025,6 +2238,8 @@ mod tests {
                     palette: &st.config.palette,
                     accent: color(80, 140, 240),
                     light_surface: false,
+                    oauth_connected: false,
+                    scroll: 0,
                 },
                 false,
             );

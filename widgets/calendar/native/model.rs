@@ -116,6 +116,8 @@ pub struct Config {
     pub google_oauth_client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_oauth_client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_calendars: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -138,6 +140,7 @@ impl Default for Config {
             google_calendar_url: None,
             google_oauth_client_id: None,
             google_oauth_client_secret: None,
+            disabled_calendars: Vec::new(),
         }
     }
 }

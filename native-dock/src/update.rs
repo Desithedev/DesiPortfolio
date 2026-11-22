@@ -16,8 +16,8 @@ use windows_sys::Win32::{
     System::Threading::*,
     UI::{Shell::ShellExecuteW, WindowsAndMessaging::*},
 };
-const API: &str = "https://api.github.com/repos/nhatnguyends/Lumen/releases/latest";
-pub const RELEASES: &str = "https://github.com/nhatnguyends/Lumen/releases";
+const API: &str = "https://api.github.com/repos/Desithedev/DesiPortfolio/releases/latest";
+pub const RELEASES: &str = "https://github.com/Desithedev/DesiPortfolio/releases";
 const MAX_DOWNLOAD: usize = 256 * 1024 * 1024;
 const MAX_EXPANDED: u64 = 768 * 1024 * 1024;
 const MARKER: &str = "lumen-portable.json";
@@ -266,7 +266,7 @@ fn parse_release(bytes: &[u8], current: &str) -> Result<Option<Release>> {
         .as_str()
         .ok_or("Missing asset URL")?;
     if !url.starts_with(&format!(
-        "https://github.com/nhatnguyends/Lumen/releases/download/{tag}/"
+        "https://github.com/Desithedev/DesiPortfolio/releases/download/{tag}/"
     )) {
         return Err("Release asset belongs to an unexpected repository".into());
     }
@@ -740,7 +740,7 @@ pub unsafe fn open_releases() {
     open_download(RELEASES);
 }
 pub unsafe fn open_download(url: &str) {
-    let target = if url.starts_with("https://github.com/nhatnguyends/Lumen/releases")
+    let target = if url.starts_with("https://github.com/Desithedev/DesiPortfolio/releases")
         && !url.bytes().any(|c| c <= 32 || c == 127)
     {
         url
@@ -1008,7 +1008,7 @@ mod tests {
     }
     #[test]
     fn release_requires_the_official_compatible_asset_and_digest() {
-        let mut json = serde_json::json!({"tag_name":"v0.2.0","draft":false,"prerelease":false,"assets":[{"name":"Lumen-0.2.0-windows-x86_64.zip","browser_download_url":"https://github.com/nhatnguyends/Lumen/releases/download/v0.2.0/Lumen-0.2.0-windows-x86_64.zip","size":100,"digest":format!("sha256:{}",hash(b"zip"))}]});
+        let mut json = serde_json::json!({"tag_name":"v0.2.0","draft":false,"prerelease":false,"assets":[{"name":"Lumen-0.2.0-windows-x86_64.zip","browser_download_url":"https://github.com/Desithedev/DesiPortfolio/releases/download/v0.2.0/Lumen-0.2.0-windows-x86_64.zip","size":100,"digest":format!("sha256:{}",hash(b"zip"))}]});
         assert!(parse_release(&serde_json::to_vec(&json).unwrap(), "0.1.0")
             .unwrap()
             .is_some());
